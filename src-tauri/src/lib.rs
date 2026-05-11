@@ -230,15 +230,24 @@ fn take_pending_mailto_urls(state: tauri::State<PendingMailtoUrls>) -> Vec<Strin
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Prefer native Wayland when a compositor is available and no backend
-    // has been explicitly configured.  The AppImage GTK plugin hardcodes
-    // GDK_BACKEND=x11 in its AppRun hook (see tauri#8541); in that case
-    // the variable is already set so we won't override it.
+    // Prefer native Wayland when a Wayland compositor is available.
+    //
+    // Two cases:
+    // 1. No GDK_BACKEND set at all — safe to default to wayland.
+    // 2. AppImage: the bundled GTK plugin hardcodes GDK_BACKEND=x11 in
+    //    its AppRun hook (see tauri#8541).  Detect this via the APPDIR
+    //    env var and override the AppImage default so the app actually
+    //    runs on Wayland when a compositor is present.
+    // We do NOT override any other explicit GDK_BACKEND value (e.g. a
+    // user who intentionally set GDK_BACKEND=x11 outside of AppImage).
     #[cfg(target_os = "linux")]
-    if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty())
-        && std::env::var_os("GDK_BACKEND").is_none()
-    {
-        std::env::set_var("GDK_BACKEND", "wayland");
+    if std::env::var_os("WAYLAND_DISPLAY").is_some_and(|v| !v.is_empty()) {
+        let gdk_backend = std::env::var_os("GDK_BACKEND");
+        let is_appimage_x11 = std::env::var_os("APPDIR").is_some()
+            && gdk_backend.as_deref() == Some(std::ffi::OsStr::new("x11"));
+        if gdk_backend.is_none() || is_appimage_x11 {
+            std::env::set_var("GDK_BACKEND", "wayland");
+        }
     }
 
     let mut builder = tauri::Builder::default();

@@ -23,6 +23,7 @@ impl KeyStore {
             Ok(secret) if secret.len() == DEK_LEN => {
                 // Legacy raw 32-byte DEK — migrate to hex encoding so the
                 // key can round-trip through string-based keychain backends.
+                let secret = Zeroizing::new(secret);
                 let mut key = Zeroizing::new([0u8; DEK_LEN]);
                 key.copy_from_slice(&secret);
                 let hex_key = Zeroizing::new(hex::encode(&*key));
