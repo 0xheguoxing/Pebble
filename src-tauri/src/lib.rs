@@ -246,7 +246,7 @@ pub fn run() {
         let is_appimage_x11 = std::env::var_os("APPDIR").is_some()
             && gdk_backend.as_deref() == Some(std::ffi::OsStr::new("x11"));
         if gdk_backend.is_none() || is_appimage_x11 {
-            std::env::set_var("GDK_BACKEND", "wayland");
+            std::env::set_var("GDK_BACKEND", "wayland,x11");
         }
     }
 

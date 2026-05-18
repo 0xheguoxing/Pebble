@@ -26,8 +26,10 @@ impl KeyStore {
                 let secret = Zeroizing::new(secret);
                 let mut key = Zeroizing::new([0u8; DEK_LEN]);
                 key.copy_from_slice(&secret);
-                let hex_key = Zeroizing::new(hex::encode(&*key));
-                let _ = entry.set_secret(hex_key.as_bytes());
+                let hex_key = Zeroizing::new(hex::encode(&key[..]));
+                if let Err(e) = entry.set_secret(hex_key.as_bytes()) {
+                    warn!("Failed to migrate legacy DEK to hex encoding: {e}");
+                }
                 return Ok(key);
             }
             Ok(hex_secret) => {
@@ -50,7 +52,7 @@ impl KeyStore {
         info!("No usable DEK found, generating new one");
         let mut key = Zeroizing::new([0u8; DEK_LEN]);
         rand::thread_rng().fill_bytes(&mut *key);
-        let hex_key = Zeroizing::new(hex::encode(&*key));
+        let hex_key = Zeroizing::new(hex::encode(&key[..]));
         entry
             .set_secret(hex_key.as_bytes())
             .map_err(|e| PebbleError::Auth(format!("Failed to store DEK: {e}")))?;
