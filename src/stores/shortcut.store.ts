@@ -1,4 +1,5 @@
 import { create } from "zustand";
+import { profileLocalStorage } from "@/lib/profileStorage";
 
 export interface ShortcutBinding {
   actionId: string;
@@ -41,7 +42,7 @@ const STORAGE_KEY = "pebble-shortcuts";
 
 function loadBindings(): Record<string, string> {
   try {
-    const saved = localStorage.getItem(STORAGE_KEY);
+    const saved = profileLocalStorage.getItem(STORAGE_KEY);
     if (saved) return { ...DEFAULT_BINDINGS, ...JSON.parse(saved) };
   } catch {
     // ignore parse errors
@@ -54,11 +55,11 @@ export const useShortcutStore = create<ShortcutState>((set, get) => ({
   recording: null,
   updateShortcut: (actionId, keys) => {
     const newBindings = { ...get().bindings, [actionId]: keys };
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(newBindings));
+    profileLocalStorage.setItem(STORAGE_KEY, JSON.stringify(newBindings));
     set({ bindings: newBindings, recording: null });
   },
   resetToDefaults: () => {
-    localStorage.removeItem(STORAGE_KEY);
+    profileLocalStorage.removeItem(STORAGE_KEY);
     set({ bindings: { ...DEFAULT_BINDINGS } });
   },
   startRecording: (actionId) => set({ recording: actionId }),

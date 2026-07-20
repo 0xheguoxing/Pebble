@@ -1,7 +1,7 @@
 import { useEffect } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useUIStore } from "@/stores/ui.store";
-import { startSync, stopSync } from "@/lib/api";
+import { startSync } from "@/lib/api";
 import { useAccountsQuery } from "@/hooks/queries";
 
 export function useCloseToBackground() {
@@ -23,13 +23,6 @@ export function useCloseToBackground() {
         event.preventDefault();
         void appWindow
           .hide()
-          .then(() => {
-            // Lightweight mode: stop all sync workers to reduce resource usage
-            const ids = accounts?.map((a) => a.id) ?? [];
-            for (const id of ids) {
-              stopSync(id).catch(() => {});
-            }
-          })
           .catch((err) => console.warn("Failed to hide window on close", err));
       })
       .then((fn) => {
@@ -45,7 +38,7 @@ export function useCloseToBackground() {
       disposed = true;
       unlisten?.();
     };
-  }, [accounts]);
+  }, []);
 
   // Resume sync workers when window regains visibility after being hidden to tray
   useEffect(() => {

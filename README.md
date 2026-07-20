@@ -73,7 +73,7 @@ Pebble currently supports Gmail, IMAP, POP3, and experimental Outlook accounts.
 
 - Native macOS traffic-light window controls.
 - Register as default email client on Windows (Settings > General).
-- Lightweight tray mode: sync workers pause when the window is hidden, resume on focus.
+- Tray mode keeps mail sync running while the window is hidden.
 - Start hidden to system tray option.
 - `mailto:` protocol handler for composing mail from external apps.
 
@@ -123,6 +123,18 @@ paru -S pebble-bin
 - Node.js 18 or newer
 - pnpm 8 or newer
 - Tauri system dependencies for your platform
+
+### Profile Storage
+
+By default, Pebble stores the database, search index, attachments, logs, imported backgrounds, and local interface preferences under the system app data directory.
+
+You can opt into a custom or portable profile directory before Pebble starts:
+
+- Set `PEBBLE_PROFILE_DIR` to an absolute path.
+- Put `pebble-profile.txt` next to `pebble.exe`; the first line can be an absolute path or a path relative to the executable directory.
+- Create a `pebble-profile` directory next to `pebble.exe` to store Pebble data beside the app.
+
+The selected directory is used on the next app launch.
 
 ### Development Setup
 

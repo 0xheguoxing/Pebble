@@ -74,7 +74,7 @@ describe("useCloseToBackground", () => {
     expect(mocks.hide).not.toHaveBeenCalled();
   });
 
-  it("hides the window to tray instead of closing when background mode is enabled", async () => {
+  it("keeps sync workers running when hiding the window to tray", async () => {
     mocks.uiState.keepRunningInBackground = true;
     render(<Harness />);
 
@@ -84,8 +84,7 @@ describe("useCloseToBackground", () => {
 
     expect(preventDefault).toHaveBeenCalledOnce();
     expect(mocks.hide).toHaveBeenCalledOnce();
-    await waitFor(() => expect(stopSync).toHaveBeenCalledWith("account-1"));
-    expect(stopSync).toHaveBeenCalledWith("account-2");
+    expect(stopSync).not.toHaveBeenCalled();
   });
 
   it("resumes sync when the hidden window regains focus", async () => {

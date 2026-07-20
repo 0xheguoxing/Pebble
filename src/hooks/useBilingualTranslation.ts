@@ -4,6 +4,7 @@ import { sanitizeHtml } from "@/lib/sanitizeHtml";
 import type { Message, RenderedHtml, TranslateResult } from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
+import { profileLocalStorage } from "@/lib/profileStorage";
 
 // Translation cache: avoids re-translating on toggle or revisit (capped at 20 entries)
 const translationCache = new Map<string, TranslateResult & { _isHtml?: boolean }>();
@@ -27,7 +28,7 @@ export function useBilingualTranslation(
     }
     if (!message || !messageId) return;
 
-    const uiLang = localStorage.getItem("pebble-language") || "zh";
+    const uiLang = profileLocalStorage.getItem("pebble-language") || "zh";
     const cacheKey = `${messageId}:${uiLang}`;
 
     // Check cache first

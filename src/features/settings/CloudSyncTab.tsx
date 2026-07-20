@@ -20,6 +20,7 @@ import {
   type BackupPreview,
 } from "../../lib/api";
 import { extractErrorMessage as errorMessage } from "@/lib/extractErrorMessage";
+import { profileLocalStorage } from "@/lib/profileStorage";
 
 const LAST_BACKUP_KEY = "pebble-cloud-sync-last-backup";
 
@@ -65,7 +66,7 @@ export default function CloudSyncTab() {
   const [restoring, setRestoring] = useState(false);
 
   const [lastBackup, setLastBackup] = useState<string | null>(() =>
-    localStorage.getItem(LAST_BACKUP_KEY),
+    profileLocalStorage.getItem(LAST_BACKUP_KEY),
   );
 
   const [autoEnabled, setAutoEnabled] = useState(false);
@@ -156,7 +157,7 @@ export default function CloudSyncTab() {
         includeSecrets ? secretPassphrase : undefined,
       );
       const now = new Date().toLocaleString();
-      localStorage.setItem(LAST_BACKUP_KEY, now);
+      profileLocalStorage.setItem(LAST_BACKUP_KEY, now);
       setLastBackup(now);
       setStatusMsg(t("cloudSync.backupSuccess"));
       setStatusType("success");
@@ -238,7 +239,7 @@ export default function CloudSyncTab() {
       const data = await exportBackupFile(includeSecrets ? secretPassphrase : undefined);
       downloadBackupJson(data);
       const now = new Date().toLocaleString();
-      localStorage.setItem(LAST_BACKUP_KEY, now);
+      profileLocalStorage.setItem(LAST_BACKUP_KEY, now);
       setLastBackup(now);
       setStatusMsg(t("cloudSync.exportSuccess", "Backup file exported"));
       setStatusType("success");

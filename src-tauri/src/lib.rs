@@ -1,6 +1,7 @@
 mod account_colors;
 mod commands;
 mod events;
+mod profile;
 mod realtime;
 mod snooze_watcher;
 mod state;
@@ -63,16 +64,14 @@ fn log_startup_phase(start: Instant, phase_start: &mut Instant, label: &'static 
     *phase_start = now;
 }
 
-fn get_db_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let app_data = app.path().app_data_dir()?;
-    std::fs::create_dir_all(&app_data)?;
+fn get_db_path(app_data: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // The caller (setup) has already created app_data.
     let db_dir = app_data.join("db");
     std::fs::create_dir_all(&db_dir)?;
     Ok(db_dir.join("pebble.db"))
 }
 
-fn get_index_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let app_data = app.path().app_data_dir()?;
+fn get_index_path(app_data: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let index_dir = app_data.join("search_index");
     std::fs::create_dir_all(&index_dir)?;
     Ok(index_dir)
@@ -252,8 +251,22 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let app_data = app.path().app_data_dir()?;
+            let app_data = profile::resolve_app_profile_data_dir(app)?;
             std::fs::create_dir_all(&app_data)?;
+            let profile_paths = profile::ProfilePaths::new(app_data.clone()).map_err(|e| {
+                format!(
+                    "Cannot read or write the profile id in {}: {e}. \
+                     If you configured a custom profile directory (PEBBLE_PROFILE_DIR, \
+                     pebble-profile.txt, or a portable pebble-profile folder), make sure \
+                     Pebble has write access to it.",
+                    app_data.display()
+                )
+            })?;
+            app.manage(profile_paths);
+            let backgrounds_dir = app_data.join("backgrounds");
+            std::fs::create_dir_all(&backgrounds_dir)?;
+            app.asset_protocol_scope()
+                .allow_directory(&backgrounds_dir, true)?;
             let log_dir = commands::diagnostics::app_log_dir(&app_data);
             std::fs::create_dir_all(&log_dir)?;
             let file_appender =
@@ -294,7 +307,7 @@ pub fn run() {
             }
             app.manage(PendingMailtoUrls::default());
 
-            let db_path = get_db_path(app)?;
+            let db_path = get_db_path(&app_data)?;
             tracing::info!("Database path: {}", db_path.display());
             log_startup_phase(startup_start, &mut startup_phase, "app data paths resolved");
 
@@ -313,7 +326,7 @@ pub fn run() {
             }
             log_startup_phase(startup_start, &mut startup_phase, "database quick check complete");
 
-            let index_path = get_index_path(app)?;
+            let index_path = get_index_path(&app_data)?;
             tracing::info!("Search index path: {}", index_path.display());
             let search = pebble_search::TantivySearch::open(&index_path)?;
             let search_needs_reindex = search.needs_reindex();
@@ -329,9 +342,6 @@ pub fn run() {
             tracing::info!("Crypto service initialized successfully");
             log_startup_phase(startup_start, &mut startup_phase, "crypto service initialized");
 
-            let app_data = app
-                .path()
-                .app_data_dir()?;
             let attachments_dir = app_data.join("attachments");
             std::fs::create_dir_all(&attachments_dir)?;
             tracing::info!("Attachments directory: {}", attachments_dir.display());
@@ -469,6 +479,7 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             set_tray_menu_labels,
             take_pending_mailto_urls,
+            profile::get_profile_storage_namespace,
             commands::autostart::get_autostart_enabled,
             commands::autostart::set_autostart_enabled,
             commands::health::health_check,

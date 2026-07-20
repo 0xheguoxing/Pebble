@@ -2,7 +2,7 @@ use serde::Serialize;
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 pub const LOG_FILE_NAME: &str = "pebble.log";
 const DEFAULT_LOG_MAX_BYTES: u64 = 64 * 1024;
@@ -53,10 +53,7 @@ fn read_log_tail(path: &Path, max_bytes: u64) -> Result<AppLogSnapshot, String> 
 
 #[tauri::command]
 pub fn read_app_log(app: AppHandle, max_bytes: Option<u64>) -> Result<AppLogSnapshot, String> {
-    let app_data_dir = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| format!("Failed to resolve app data directory: {e}"))?;
+    let app_data_dir = crate::profile::require_managed_app_data_dir(&app)?;
     let max_bytes = max_bytes
         .unwrap_or(DEFAULT_LOG_MAX_BYTES)
         .clamp(1, MAX_LOG_MAX_BYTES);
