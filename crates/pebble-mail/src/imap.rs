@@ -350,6 +350,8 @@ where
 pub struct ImapMailboxStatus {
     pub uid_validity: Option<u32>,
     pub highest_modseq: Option<u64>,
+    /// Number of messages in the mailbox as reported by SELECT.
+    pub exists: u32,
 }
 
 /// An IMAP provider that manages a connection and session.
@@ -1306,28 +1308,7 @@ impl ImapProvider {
                     } else {
                         1
                     };
-                    let seq_set = format!("{start}:{exists}");
-                    let fetches = with_imap_timeout(
-                        "FETCH",
-                        IMAP_COMMAND_TIMEOUT_SECS,
-                        $s.fetch(&seq_set, "(UID BODY.PEEK[])"),
-                    )
-                    .await?;
-                    let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
-                        "FETCH collect",
-                        IMAP_COMMAND_TIMEOUT_SECS,
-                        fetches.try_collect(),
-                    )
-                    .await?;
-                    for fetch in fetches {
-                        if let Some(uid) = fetch.uid {
-                            if let Some(body) = fetch.body() {
-                                results.push((uid, body.to_vec()));
-                            }
-                        } else {
-                            tracing::warn!("Skipping message without UID (seq={})", fetch.message);
-                        }
-                    }
+                    return Self::fetch_messages_sequence_range($s, start, exists).await;
                 }
 
                 results
@@ -1336,6 +1317,83 @@ impl ImapProvider {
 
         let results = do_fetch!(sess);
 
+        Ok(results)
+    }
+
+    /// Fetch the raw bytes of the messages whose sequence numbers fall within
+    /// `[start_seq, end_seq]` (inclusive), after selecting `mailbox`.
+    ///
+    /// Sequence numbers are stable for the lifetime of a session; callers that
+    /// page backwards through a mailbox must issue these fetches on the same
+    /// connection. Returns `(uid, raw_bytes)` pairs ordered by the server
+    /// response, which is ascending sequence number.
+    pub async fn fetch_messages_page(
+        &self,
+        mailbox: &str,
+        start_seq: u32,
+        end_seq: u32,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        if start_seq == 0 || end_seq < start_seq {
+            return Ok(Vec::new());
+        }
+        let mut guard = self.session.lock().await;
+        let sess = guard
+            .as_mut()
+            .ok_or_else(|| PebbleError::Network("Not connected".to_string()))?;
+
+        macro_rules! do_fetch {
+            ($s:expr) => {{
+                let mailbox_info =
+                    with_imap_timeout("SELECT", IMAP_COMMAND_TIMEOUT_SECS, $s.select(mailbox))
+                        .await?;
+                if mailbox_info.exists == 0 || start_seq > mailbox_info.exists {
+                    return Ok(Vec::new());
+                }
+                let end_seq = end_seq.min(mailbox_info.exists);
+                Self::fetch_messages_sequence_range($s, start_seq, end_seq).await?
+            }};
+        }
+
+        let results = do_fetch!(sess);
+
+        Ok(results)
+    }
+
+    /// Fetch the raw bytes of the messages whose sequence numbers fall within
+    /// `[start_seq, end_seq]` (inclusive). The caller must have already
+    /// selected the mailbox on the same session.
+    async fn fetch_messages_sequence_range(
+        sess: &mut ImapSession,
+        start_seq: u32,
+        end_seq: u32,
+    ) -> Result<Vec<(u32, Vec<u8>)>> {
+        let seq_set = if start_seq == end_seq {
+            start_seq.to_string()
+        } else {
+            format!("{start_seq}:{end_seq}")
+        };
+        let fetches = with_imap_timeout(
+            "FETCH",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            sess.fetch(&seq_set, "(UID BODY.PEEK[])"),
+        )
+        .await?;
+        let fetches: Vec<async_imap::types::Fetch> = with_imap_timeout(
+            "FETCH collect",
+            IMAP_COMMAND_TIMEOUT_SECS,
+            fetches.try_collect(),
+        )
+        .await?;
+        let mut results = Vec::with_capacity(fetches.len());
+        for fetch in fetches {
+            if let Some(uid) = fetch.uid {
+                if let Some(body) = fetch.body() {
+                    results.push((uid, body.to_vec()));
+                }
+            } else {
+                tracing::warn!("Skipping message without UID (seq={})", fetch.message);
+            }
+        }
         Ok(results)
     }
 
@@ -1736,6 +1794,7 @@ impl ImapProvider {
                 ImapMailboxStatus {
                     uid_validity: mailbox_info.uid_validity,
                     highest_modseq: mailbox_info.highest_modseq,
+                    exists: mailbox_info.exists,
                 }
             }};
         }
