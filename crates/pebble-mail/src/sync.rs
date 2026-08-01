@@ -407,6 +407,30 @@ fn should_attempt_imap_remote_folder(folder: &pebble_core::Folder) -> bool {
     !folder.remote_id.starts_with("__local_")
 }
 
+/// Page size used when backfilling a folder's full history.
+const HISTORY_PAGE_SIZE: u32 = 200;
+
+/// Inclusive sequence-number ranges covering a mailbox from newest to
+/// oldest, each at most `page_size` messages long. `exists == 0` yields no
+/// ranges.
+fn history_page_ranges(exists: u32, page_size: u32) -> Vec<(u32, u32)> {
+    let mut ranges = Vec::new();
+    let mut end = exists;
+    while end >= 1 {
+        let start = if end > page_size {
+            end - page_size + 1
+        } else {
+            1
+        };
+        ranges.push((start, end));
+        if start == 1 {
+            break;
+        }
+        end = start - 1;
+    }
+    ranges
+}
+
 fn should_include_discovered_imap_folder(
     folder: &pebble_core::Folder,
     selected_remote_ids: Option<&HashSet<String>>,
@@ -933,11 +957,15 @@ impl SyncWorker {
 
         let cursor = self.try_imap_folder_cursor_for_sync(folder).await?;
         let since_uid = cursor.last_uid;
-        let limit = if since_uid.is_some() { 50 } else { 200 };
         let notify_new = should_notify_imap_startup_fetch(since_uid);
-        let count = self
-            .sync_folder(folder, since_uid, limit, notify_new)
-            .await?;
+        let count = if let Some(uid) = since_uid {
+            self.sync_folder(folder, Some(uid), 50, notify_new).await?
+        } else {
+            // No cursor yet (fresh account or folder whose local data was
+            // cleared): backfill the full mailbox instead of fetching only
+            // the most recent page.
+            self.sync_folder_history(folder, notify_new).await?
+        };
 
         if count > 0 {
             info!(
@@ -977,6 +1005,63 @@ impl SyncWorker {
             .fetch_messages_raw(&folder.remote_id, since_uid, limit)
             .await?;
 
+        self.store_fetched_messages(folder, raw_messages, notify_new)
+            .await
+    }
+
+    /// Backfill the full history of a folder that has no sync cursor yet,
+    /// e.g. a folder just re-added to the account's IMAP selection after
+    /// being deselected (which clears its local data).
+    ///
+    /// Pages backwards through the mailbox by sequence number until every
+    /// message is stored, so re-selecting a folder recovers more than the
+    /// most recent batch. Each page is one SELECT + FETCH round trip on the
+    /// same session; the per-page range is recomputed from the latest
+    /// EXISTS so late deletions shrink pages gracefully.
+    ///
+    /// Callers must not persist a cursor when this returns an error: a
+    /// partially backfilled folder would otherwise advance `last_uid` past
+    /// the gap and incremental sync could never fill it again.
+    pub async fn sync_folder_history(
+        &self,
+        folder: &pebble_core::Folder,
+        notify_new: bool,
+    ) -> Result<u32> {
+        if Self::is_local_folder(folder) {
+            return Ok(0);
+        }
+
+        let status = self
+            .provider
+            .inner()
+            .get_mailbox_status(&folder.remote_id)
+            .await?;
+        let ranges = history_page_ranges(status.exists, HISTORY_PAGE_SIZE);
+
+        let mut total = 0u32;
+        for (index, (start_seq, end_seq)) in ranges.into_iter().enumerate() {
+            let raw_messages = self
+                .provider
+                .inner()
+                .fetch_messages_page(&folder.remote_id, start_seq, end_seq)
+                .await?;
+            let count = self
+                .store_fetched_messages(folder, raw_messages, notify_new && index == 0)
+                .await?;
+            total += count;
+        }
+
+        Ok(total)
+    }
+
+    /// Store a batch of raw fetched messages, resolving threads and
+    /// attachments. Returns the number of newly stored messages.
+    async fn store_fetched_messages(
+        &self,
+        folder: &pebble_core::Folder,
+        raw_messages: Vec<(u32, Vec<u8>)>,
+        notify_new: bool,
+    ) -> Result<u32> {
         if raw_messages.is_empty() {
             return Ok(0);
         }
@@ -1256,9 +1341,15 @@ impl SyncWorker {
 
         let cursor = self.try_imap_folder_cursor_for_sync(folder).await?;
         let since_uid = cursor.last_uid;
-        let limit = if since_uid.is_some() { 50 } else { 200 };
 
-        let count = self.sync_folder(folder, since_uid, limit, true).await?;
+        let count = if let Some(uid) = since_uid {
+            self.sync_folder(folder, Some(uid), 50, true).await?
+        } else {
+            // Folder was just added to the selection (or its cursor was
+            // lost): backfill the full history before switching to
+            // incremental polls.
+            self.sync_folder_history(folder, true).await?
+        };
         if count > 0 {
             info!(
                 "Polled {} new messages from {} for account {}",
@@ -2294,6 +2385,26 @@ mod tests {
 
         assert!(should_include_discovered_imap_folder(&sent, None));
         assert!(should_include_discovered_imap_folder(&custom, None));
+    }
+
+    #[test]
+    fn history_page_ranges_empty_mailbox_has_no_pages() {
+        assert_eq!(history_page_ranges(0, 200), Vec::<(u32, u32)>::new());
+    }
+
+    #[test]
+    fn history_page_ranges_single_page_when_mailbox_fits() {
+        assert_eq!(history_page_ranges(1, 200), vec![(1, 1)]);
+        assert_eq!(history_page_ranges(200, 200), vec![(1, 200)]);
+    }
+
+    #[test]
+    fn history_page_ranges_pages_newest_to_oldest() {
+        assert_eq!(history_page_ranges(201, 200), vec![(2, 201), (1, 1)]);
+        assert_eq!(
+            history_page_ranges(450, 200),
+            vec![(251, 450), (51, 250), (1, 50)]
+        );
     }
 
     #[test]
