@@ -1,17 +1,25 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { Plus, Trash2, Mail, Pencil, Plug } from "lucide-react";
+import { Plus, Trash2, Mail, Pencil, Plug, RefreshCw } from "lucide-react";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import { useTranslation } from "react-i18next";
 import type { TFunction } from "i18next";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   deleteAccount,
+  getImapSyncFolders,
   getOAuthAccountProxySetting,
   testAccountConnection,
+  triggerSync,
   updateAccount,
+  updateImapSyncFolders,
   updateOAuthAccountProxySetting,
 } from "@/lib/api";
-import type { Account, AccountProxyMode, ConnectionSecurity } from "@/lib/api";
+import type {
+  Account,
+  AccountProxyMode,
+  ConnectionSecurity,
+  ImapSyncFolderSettings,
+} from "@/lib/api";
 import { useAccountsQuery, accountsQueryKey } from "@/hooks/queries";
 import { useMailStore } from "@/stores/mail.store";
 import { useUIStore, type RealtimeStatus } from "@/stores/ui.store";
@@ -392,6 +400,7 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
   onSaved: () => void;
 }) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const dialogRef = useRef<HTMLDivElement>(null);
   const emailInputRef = useRef<HTMLInputElement>(null);
   const [displayName, setDisplayName] = useState(account.display_name);
@@ -404,13 +413,26 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
   const [smtpPort, setSmtpPort] = useState("");
   const [imapSecurity, setImapSecurity] = useState<ConnectionSecurity | "">("");
   const [smtpSecurity, setSmtpSecurity] = useState<ConnectionSecurity | "">("");
+  const [acceptInvalidCerts, setAcceptInvalidCerts] = useState<"" | "false" | "true">("");
   const [oauthProxyMode, setOauthProxyMode] = useState<AccountProxyMode>("inherit");
   const [proxyHost, setProxyHost] = useState("");
   const [proxyPort, setProxyPort] = useState("");
   const [signature, setSignatureValue] = useState("");
+  const [imapFolderSettings, setImapFolderSettings] = useState<ImapSyncFolderSettings | null>(null);
+  const [selectedImapFolderIds, setSelectedImapFolderIds] = useState<Set<string>>(new Set());
+  const [folderLoading, setFolderLoading] = useState(false);
+  const [folderError, setFolderError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const isOAuth = account.provider === "gmail" || account.provider === "outlook";
+  const isImap = account.provider === "imap";
+  const isPop3 = account.provider === "pop3";
+  const incomingHostLabel = isPop3
+    ? t("accountSetup.pop3Host", "POP3 host")
+    : t("accountSetup.imapHost", "IMAP host");
+  const incomingPortLabel = isPop3
+    ? t("accountSetup.pop3Port", "POP3 port")
+    : t("accountSetup.imapPort", "IMAP port");
 
   useEffect(() => {
     let cancelled = false;
@@ -480,6 +502,20 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
     };
   }, [onClose]);
 
+  async function loadImapFolders() {
+    setFolderLoading(true);
+    setFolderError(null);
+    try {
+      const settings = await getImapSyncFolders(account.id);
+      setImapFolderSettings(settings);
+      setSelectedImapFolderIds(new Set(settings.selected_remote_ids));
+    } catch (err) {
+      setFolderError(extractErrorMessage(err));
+    } finally {
+      setFolderLoading(false);
+    }
+  }
+
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
@@ -490,6 +526,7 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
           account.id,
           email,
           displayName,
+          undefined,
           undefined,
           undefined,
           undefined,
@@ -527,11 +564,34 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
           smtpPort ? parseInt(smtpPort, 10) : undefined,
           imapSecurity || undefined,
           smtpSecurity || undefined,
+          acceptInvalidCerts === "" ? undefined : acceptInvalidCerts === "true",
           proxyHost.trim() || undefined,
           proxyPort ? parseInt(proxyPort, 10) : undefined,
           accountColor,
         );
       }
+
+      if (isImap && imapFolderSettings) {
+        const updatedSettings = await updateImapSyncFolders(
+          account.id,
+          Array.from(selectedImapFolderIds),
+        );
+        setImapFolderSettings(updatedSettings);
+        setSelectedImapFolderIds(new Set(updatedSettings.selected_remote_ids));
+        try {
+          await triggerSync(account.id, "manual");
+        } catch (err) {
+          console.warn("Failed to trigger sync after updating IMAP folders:", err);
+        }
+        await Promise.all([
+          queryClient.invalidateQueries({ queryKey: ["folders", account.id] }),
+          queryClient.invalidateQueries({ queryKey: ["messages"] }),
+          queryClient.invalidateQueries({ queryKey: ["threads"] }),
+          queryClient.invalidateQueries({ queryKey: ["folder-unread-counts", account.id] }),
+          queryClient.invalidateQueries({ queryKey: ["starred-messages", account.id] }),
+        ]);
+      }
+
       await setSignature(account.id, signature);
       onSaved();
     } catch (err) {
@@ -711,12 +771,12 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
 
                 <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: "12px" }}>
                   <div style={fieldStyle}>
-                    <label style={labelStyle}>{t("accountSetup.imapHost")} <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({t("settings.optional", "optional")})</span></label>
-                    <input aria-label={t("accountSetup.imapHost")} style={inputStyle} type="text" value={imapHost} onChange={(e) => setImapHost(e.target.value)} placeholder={t("settings.leaveEmptyKeep")} />
+                    <label style={labelStyle}>{incomingHostLabel} <span style={{ color: "var(--color-text-secondary)", fontWeight: 400 }}>({t("settings.optional", "optional")})</span></label>
+                    <input aria-label={incomingHostLabel} style={inputStyle} type="text" value={imapHost} onChange={(e) => setImapHost(e.target.value)} placeholder={t("settings.leaveEmptyKeep")} />
                   </div>
                   <div style={fieldStyle}>
-                    <label style={labelStyle}>{t("accountSetup.imapPort")}</label>
-                    <input aria-label={t("accountSetup.imapPort")} style={{ ...inputStyle, width: "70px" }} type="number" value={imapPort} onChange={(e) => setImapPort(e.target.value)} />
+                    <label style={labelStyle}>{incomingPortLabel}</label>
+                    <input aria-label={incomingPortLabel} style={{ ...inputStyle, width: "70px" }} type="number" value={imapPort} onChange={(e) => setImapPort(e.target.value)} />
                   </div>
                   <div style={fieldStyle}>
                     <label htmlFor="accountsetup-imap-security" style={labelStyle}>{t("accountSetup.security", "Security")}</label>
@@ -724,6 +784,7 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
                       <option value="">{t("settings.leaveEmptyKeep", "keep current")}</option>
                       <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                       <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
+                      <option value="plain">{t("accountSetup.securityPlain", "None")}</option>
                     </select>
                   </div>
                 </div>
@@ -743,14 +804,159 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
                       <option value="">{t("settings.leaveEmptyKeep", "keep current")}</option>
                       <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                       <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
+                      <option value="plain">{t("accountSetup.securityPlain", "None")}</option>
                     </select>
                   </div>
+                </div>
+
+                <div style={fieldStyle}>
+                  <label htmlFor="accountsetup-cert-policy" style={labelStyle}>
+                    {t("accountSetup.tlsCertificateVerification", "TLS certificate verification")}
+                  </label>
+                  <select
+                    id="accountsetup-cert-policy"
+                    value={acceptInvalidCerts}
+                    onChange={(e) => setAcceptInvalidCerts(e.target.value as "" | "false" | "true")}
+                    style={inputStyle}
+                  >
+                    <option value="">{t("settings.leaveEmptyKeep", "keep current")}</option>
+                    <option value="false">{t("accountSetup.verifyTlsCerts", "Verify certificates")}</option>
+                    <option value="true">{t("accountSetup.acceptInvalidCerts", "Allow invalid TLS certificates")}</option>
+                  </select>
                 </div>
 
               </>
             )}
 
             {proxyFields}
+
+            {isImap && (
+              <div
+                style={{
+                  display: "flex",
+                  flexDirection: "column",
+                  gap: "10px",
+                  padding: "12px",
+                  border: "1px solid var(--color-border)",
+                  borderRadius: "8px",
+                }}
+              >
+                <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
+                  <div>
+                    <div style={{ ...labelStyle, marginBottom: "3px" }}>
+                      {t("settings.syncFolders", "Folders to sync")}
+                    </div>
+                    <div style={{ fontSize: "12px", color: "var(--color-text-secondary)", lineHeight: 1.45 }}>
+                      {t(
+                        "settings.syncFoldersDesc",
+                        "Inbox is always synced. Choose any additional IMAP folders to keep locally.",
+                      )}
+                    </div>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={loadImapFolders}
+                    disabled={folderLoading || loading}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: "6px",
+                      padding: "7px 10px",
+                      borderRadius: "6px",
+                      border: "1px solid var(--color-border)",
+                      backgroundColor: "var(--color-bg)",
+                      color: "var(--color-text-primary)",
+                      fontSize: "12px",
+                      cursor: folderLoading || loading ? "wait" : "pointer",
+                      opacity: folderLoading || loading ? 0.7 : 1,
+                      flexShrink: 0,
+                    }}
+                  >
+                    <RefreshCw size={13} aria-hidden="true" />
+                    {folderLoading
+                      ? t("settings.loadingFolders", "Loading...")
+                      : imapFolderSettings
+                        ? t("settings.refreshFolders", "Refresh folders")
+                        : t("settings.chooseFolders", "Choose folders")}
+                  </button>
+                </div>
+
+                {folderError && (
+                  <div role="alert" style={{ color: "#ef4444", fontSize: "12px" }}>
+                    {t("settings.folderListFailed", "Failed to list IMAP folders: {{error}}", {
+                      error: folderError,
+                    })}
+                  </div>
+                )}
+
+                {imapFolderSettings && (
+                  <>
+                    <div
+                      role="group"
+                      aria-label={t("settings.syncFolders", "Folders to sync")}
+                      style={{
+                        display: "flex",
+                        flexDirection: "column",
+                        gap: "7px",
+                        maxHeight: "180px",
+                        overflowY: "auto",
+                        padding: "9px",
+                        borderRadius: "6px",
+                        backgroundColor: "var(--color-bg-secondary, var(--color-bg-hover))",
+                      }}
+                    >
+                      {imapFolderSettings.folders.map((folder) => {
+                        const isInboxFolder =
+                          folder.role === "inbox" || folder.remote_id.toUpperCase() === "INBOX";
+                        return (
+                          <label
+                            key={folder.remote_id}
+                            style={{
+                              display: "flex",
+                              alignItems: "center",
+                              gap: "8px",
+                              color: "var(--color-text-primary)",
+                              fontSize: "12px",
+                              cursor: isInboxFolder ? "default" : "pointer",
+                            }}
+                          >
+                            <input
+                              type="checkbox"
+                              aria-label={folder.name}
+                              checked={isInboxFolder || selectedImapFolderIds.has(folder.remote_id)}
+                              disabled={isInboxFolder}
+                              onChange={(event) => {
+                                setSelectedImapFolderIds((current) => {
+                                  const next = new Set(current);
+                                  if (event.target.checked) {
+                                    next.add(folder.remote_id);
+                                  } else {
+                                    next.delete(folder.remote_id);
+                                  }
+                                  return next;
+                                });
+                              }}
+                            />
+                            <span>{folder.name}</span>
+                            {isInboxFolder && (
+                              <span style={{ color: "var(--color-text-secondary)", marginLeft: "auto" }}>
+                                {t("settings.alwaysSynced", "Always synced")}
+                              </span>
+                            )}
+                          </label>
+                        );
+                      })}
+                    </div>
+                    <div style={{ color: "var(--color-text-secondary)", fontSize: "11px", lineHeight: 1.45 }}>
+                      {t(
+                        "settings.syncFoldersCleanupWarning",
+                        "Saving removes locally stored data for folders you uncheck. It does not delete mail from the server.",
+                      )}
+                    </div>
+                  </>
+                )}
+              </div>
+            )}
 
             {/* Signature */}
             <div style={fieldStyle}>
@@ -771,7 +977,7 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
 
             <button
               type="submit"
-              disabled={loading}
+              disabled={loading || folderLoading}
               style={{
                 padding: "9px 16px",
                 borderRadius: "6px",
@@ -780,8 +986,8 @@ function EditAccountModal({ account, initialColor, onClose, onSaved }: {
                 color: "#fff",
                 fontSize: "13px",
                 fontWeight: 600,
-                cursor: loading ? "not-allowed" : "pointer",
-                opacity: loading ? 0.7 : 1,
+                cursor: loading || folderLoading ? "not-allowed" : "pointer",
+                opacity: loading || folderLoading ? 0.7 : 1,
                 marginTop: "4px",
               }}
             >

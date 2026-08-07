@@ -1,6 +1,7 @@
 mod account_colors;
 mod commands;
 mod events;
+mod profile;
 mod realtime;
 mod snooze_watcher;
 mod state;
@@ -63,16 +64,14 @@ fn log_startup_phase(start: Instant, phase_start: &mut Instant, label: &'static 
     *phase_start = now;
 }
 
-fn get_db_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let app_data = app.path().app_data_dir()?;
-    std::fs::create_dir_all(&app_data)?;
+fn get_db_path(app_data: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
+    // The caller (setup) has already created app_data.
     let db_dir = app_data.join("db");
     std::fs::create_dir_all(&db_dir)?;
     Ok(db_dir.join("pebble.db"))
 }
 
-fn get_index_path(app: &tauri::App) -> Result<PathBuf, Box<dyn std::error::Error>> {
-    let app_data = app.path().app_data_dir()?;
+fn get_index_path(app_data: &std::path::Path) -> Result<PathBuf, Box<dyn std::error::Error>> {
     let index_dir = app_data.join("search_index");
     std::fs::create_dir_all(&index_dir)?;
     Ok(index_dir)
@@ -257,6 +256,10 @@ pub fn run() {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
             restore_main_window(app);
         }));
+        builder = builder.plugin(tauri_plugin_autostart::init(
+            tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+            None::<Vec<&str>>,
+        ));
     }
 
     builder
@@ -268,8 +271,22 @@ pub fn run() {
             }
         })
         .setup(|app| {
-            let app_data = app.path().app_data_dir()?;
+            let app_data = profile::resolve_app_profile_data_dir(app)?;
             std::fs::create_dir_all(&app_data)?;
+            let profile_paths = profile::ProfilePaths::new(app_data.clone()).map_err(|e| {
+                format!(
+                    "Cannot read or write the profile id in {}: {e}. \
+                     If you configured a custom profile directory (PEBBLE_PROFILE_DIR, \
+                     pebble-profile.txt, or a portable pebble-profile folder), make sure \
+                     Pebble has write access to it.",
+                    app_data.display()
+                )
+            })?;
+            app.manage(profile_paths);
+            let backgrounds_dir = app_data.join("backgrounds");
+            std::fs::create_dir_all(&backgrounds_dir)?;
+            app.asset_protocol_scope()
+                .allow_directory(&backgrounds_dir, true)?;
             let log_dir = commands::diagnostics::app_log_dir(&app_data);
             std::fs::create_dir_all(&log_dir)?;
             let file_appender =
@@ -299,9 +316,18 @@ pub fn run() {
             if let Err(e) = setup_tray(app) {
                 tracing::warn!("Failed to create system tray icon: {e}");
             }
+
+            // macOS: enable native traffic-light window controls with overlay titlebar
+            #[cfg(target_os = "macos")]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_decorations(true);
+                let _ = window.set_title_bar_style(tauri::TitleBarStyle::Overlay);
+                let _ = window
+                    .set_background_color(Some(tauri::window::Color(0xf8, 0xf7, 0xf5, 0xff)));
+            }
             app.manage(PendingMailtoUrls::default());
 
-            let db_path = get_db_path(app)?;
+            let db_path = get_db_path(&app_data)?;
             tracing::info!("Database path: {}", db_path.display());
             log_startup_phase(startup_start, &mut startup_phase, "app data paths resolved");
 
@@ -320,7 +346,7 @@ pub fn run() {
             }
             log_startup_phase(startup_start, &mut startup_phase, "database quick check complete");
 
-            let index_path = get_index_path(app)?;
+            let index_path = get_index_path(&app_data)?;
             tracing::info!("Search index path: {}", index_path.display());
             let search = pebble_search::TantivySearch::open(&index_path)?;
             let search_needs_reindex = search.needs_reindex();
@@ -336,9 +362,6 @@ pub fn run() {
             tracing::info!("Crypto service initialized successfully");
             log_startup_phase(startup_start, &mut startup_phase, "crypto service initialized");
 
-            let app_data = app
-                .path()
-                .app_data_dir()?;
             let attachments_dir = app_data.join("attachments");
             std::fs::create_dir_all(&attachments_dir)?;
             tracing::info!("Attachments directory: {}", attachments_dir.display());
@@ -375,7 +398,7 @@ pub fn run() {
             let store_for_reindex = state.store.clone();
             let search_for_reindex = state.search.clone();
             let app_for_reindex = app_handle.clone();
-            tauri::async_runtime::spawn_blocking(move || {
+            let reindex_handle = tauri::async_runtime::spawn_blocking(move || {
                 // 1. Process any pending search ops left over from a previous crash.
                 let pending = store_for_reindex.list_search_pending().unwrap_or_default();
                 if !pending.is_empty() {
@@ -439,15 +462,31 @@ pub fn run() {
                 }
             });
 
-            // Auto-resume sync for all existing accounts
-            let app_for_sync = app_handle.clone();
+            // Start the long-lived workers only after the background reindex
+            // finishes. do_reindex calls clear_index() then rebuilds from a DB
+            // snapshot; running sync workers concurrently could index a freshly
+            // stored message whose document is then wiped and missed by the
+            // snapshot, leaving it permanently unsearchable. On a normal launch
+            // the reindex task only does the cheap pending-recovery + count
+            // check (no rebuild), so this ordering adds latency only on
+            // schema-upgrade launches.
+            let app_for_workers = app_handle.clone();
             tauri::async_runtime::spawn(async move {
-                commands::sync_cmd::resume_all_syncs(app_for_sync).await;
-            });
-
-            let app_for_pending_ops = app_handle.clone();
-            tauri::async_runtime::spawn(async move {
-                commands::pending_mail_ops::run_pending_mail_ops_worker(app_for_pending_ops).await;
+                if let Err(e) = reindex_handle.await {
+                    tracing::error!("Background reindex task join failed: {e}");
+                }
+                let app_for_sync = app_for_workers.clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::sync_cmd::resume_all_syncs(app_for_sync).await;
+                });
+                let app_for_pending_ops = app_for_workers.clone();
+                tauri::async_runtime::spawn(async move {
+                    commands::pending_mail_ops::run_pending_mail_ops_worker(app_for_pending_ops)
+                        .await;
+                });
+                tauri::async_runtime::spawn(async move {
+                    commands::cloud_sync::run_auto_backup_worker(app_for_workers).await;
+                });
             });
             log_startup_phase(startup_start, &mut startup_phase, "background workers scheduled");
             tracing::info!(
@@ -460,9 +499,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             set_tray_menu_labels,
             take_pending_mailto_urls,
+            profile::get_profile_storage_namespace,
+            commands::autostart::get_autostart_enabled,
+            commands::autostart::set_autostart_enabled,
             commands::health::health_check,
             commands::health::check_for_update,
             commands::health::open_external_url,
+            commands::health::open_default_mail_settings,
+            commands::health::sync_titlebar_theme,
             commands::diagnostics::read_app_log,
             commands::appearance::import_background_image,
             commands::appearance::delete_background_image,
@@ -475,8 +519,11 @@ pub fn run() {
             commands::accounts::list_accounts,
             commands::accounts::delete_account,
             commands::accounts::test_imap_connection,
+            commands::accounts::test_pop3_connection,
             commands::accounts::test_account_connection,
             commands::folders::list_folders,
+            commands::folders::get_imap_sync_folders,
+            commands::folders::update_imap_sync_folders,
             commands::messages::query::list_messages,
             commands::messages::query::list_starred_messages,
             commands::messages::query::get_message,
@@ -540,8 +587,14 @@ pub fn run() {
             commands::batch::batch_star,
             commands::cloud_sync::test_webdav_connection,
             commands::cloud_sync::backup_to_webdav,
+            commands::cloud_sync::export_backup_file,
+            commands::cloud_sync::preview_backup_file,
+            commands::cloud_sync::import_backup_file,
             commands::cloud_sync::preview_webdav_backup,
             commands::cloud_sync::restore_from_webdav,
+            commands::cloud_sync::save_auto_backup_config,
+            commands::cloud_sync::load_auto_backup_config,
+            commands::cloud_sync::delete_auto_backup_config,
             commands::contacts::search_contacts,
             commands::advanced_search::advanced_search,
             commands::sync_cmd::reindex_search,
@@ -551,6 +604,7 @@ pub fn run() {
             commands::notifications::clear_notification_attention,
             commands::pending_mail_ops::get_pending_mail_ops_summary,
             commands::pending_mail_ops::list_pending_mail_ops,
+            commands::pending_mail_ops::dismiss_failed_pending_mail_ops,
             commands::drafts::save_draft,
             commands::drafts::delete_draft,
             commands::folder_counts::get_folder_unread_counts,

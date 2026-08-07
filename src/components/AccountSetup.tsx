@@ -4,7 +4,7 @@ import { useConfirmStore } from "@/stores/confirm.store";
 import { X } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
-import { addAccount, startSync, testImapConnection, completeOAuthFlow } from "@/lib/api";
+import { addAccount, startSync, testImapConnection, testPop3Connection, completeOAuthFlow } from "@/lib/api";
 import type { AddAccountRequest } from "@/lib/api";
 import { accountsQueryKey } from "@/hooks/queries";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
@@ -92,6 +92,8 @@ export default function AccountSetup({ onClose }: Props) {
     smtp_host: "",
     smtp_port: 587,
     smtp_security: "starttls",
+    accept_invalid_certs: false,
+    allow_plaintext: false,
     username: "",
     password: "",
   };
@@ -169,15 +171,31 @@ export default function AccountSetup({ onClose }: Props) {
     setTestResult(null);
     setTestLoading(true);
     try {
-      const report = await testImapConnection(
-        form.imap_host,
-        form.imap_port,
-        form.imap_security,
-        form.proxy_host,
-        form.proxy_port,
-        form.username || undefined,
-        form.password || undefined,
-      );
+      const report =
+        form.provider === "pop3"
+          ? await testPop3Connection(
+              form.imap_host,
+              form.imap_port,
+              form.imap_security,
+              form.accept_invalid_certs,
+              form.proxy_host,
+              form.proxy_port,
+              form.username || undefined,
+              form.password || undefined,
+              form.allow_plaintext,
+            )
+          : await testImapConnection(
+              form.imap_host,
+              form.imap_port,
+              form.imap_security,
+              form.accept_invalid_certs,
+              form.proxy_host,
+              form.proxy_port,
+              form.username || undefined,
+              form.password || undefined,
+              form.email || undefined,
+              form.allow_plaintext,
+            );
       setTestResult({ ok: true, message: report });
     } catch (err) {
       const msg = extractErrorMessage(err);
@@ -215,7 +233,7 @@ export default function AccountSetup({ onClose }: Props) {
   function applyPreset(key: string) {
     const preset = PRESETS[key];
     if (!preset) return;
-    setForm((prev) => ({ ...prev, ...preset }));
+    setForm((prev) => ({ ...prev, provider: "imap", ...preset }));
   }
 
   function handleChange(field: keyof AddAccountRequest, value: string | number | boolean) {
@@ -225,8 +243,28 @@ export default function AccountSetup({ onClose }: Props) {
       if (field === "email" && prev.username === prev.email) {
         updated.username = value as string;
       }
+      // The plaintext opt-in checkbox only shows while a connection is
+      // unencrypted. If the user switches both sides back to an encrypted
+      // mode, clear the flag so a transiently-checked box can't persist
+      // allow_plaintext=true onto an encrypted account (issue #70).
+      if (field === "imap_security" || field === "smtp_security") {
+        const anyPlain =
+          updated.imap_security === "plain" || updated.smtp_security === "plain";
+        if (!anyPlain) {
+          updated.allow_plaintext = false;
+        }
+      }
       return updated;
     });
+  }
+
+  function handleIncomingProtocolChange(provider: "imap" | "pop3") {
+    setForm((prev) => ({
+      ...prev,
+      provider,
+      imap_port: provider === "pop3" ? 995 : 993,
+      imap_security: "tls",
+    }));
   }
 
   async function handleSubmit(e: React.SyntheticEvent<HTMLFormElement>) {
@@ -260,6 +298,16 @@ export default function AccountSetup({ onClose }: Props) {
     flexDirection: "column",
     gap: "0",
   };
+  const isPop3 = form.provider === "pop3";
+  const incomingHostLabel = isPop3
+    ? t("accountSetup.pop3Host", "POP3 host")
+    : t("accountSetup.imapHost", "IMAP host");
+  const incomingPortLabel = isPop3
+    ? t("accountSetup.pop3Port", "POP3 port")
+    : t("accountSetup.imapPort", "IMAP port");
+  const incomingHostPlaceholder = isPop3 ? "pop.example.com" : "imap.example.com";
+  const canTestConnection =
+    !!form.imap_host && (!isPop3 || (!!form.username && !!form.password));
 
   const proxyFields = (
     <div style={{ display: "grid", gridTemplateColumns: "1fr auto", gap: "12px", marginBottom: "16px" }}>
@@ -480,10 +528,25 @@ export default function AccountSetup({ onClose }: Props) {
               />
             </div>
 
-            {/* IMAP */}
+            {/* Incoming */}
+            <div style={fieldStyle}>
+              <label htmlFor="setup-incoming-protocol" style={labelStyle}>
+                {t("accountSetup.incomingProtocol", "Incoming protocol")}
+              </label>
+              <select
+                id="setup-incoming-protocol"
+                value={isPop3 ? "pop3" : "imap"}
+                onChange={(e) => handleIncomingProtocolChange(e.target.value as "imap" | "pop3")}
+                style={inputStyle}
+              >
+                <option value="imap">{t("accountSetup.incomingProtocolImap", "IMAP")}</option>
+                <option value="pop3">{t("accountSetup.incomingProtocolPop3", "POP3")}</option>
+              </select>
+            </div>
+
             <div style={{ display: "grid", gridTemplateColumns: "1fr auto auto", gap: "12px" }}>
               <div style={fieldStyle}>
-                <label htmlFor="setup-imap-host" style={labelStyle}>{t("accountSetup.imapHost", "IMAP host")}</label>
+                <label htmlFor="setup-imap-host" style={labelStyle}>{incomingHostLabel}</label>
                 <input
                   id="setup-imap-host"
                   name="imap_host"
@@ -492,11 +555,11 @@ export default function AccountSetup({ onClose }: Props) {
                   required
                   value={form.imap_host}
                   onChange={(e) => handleChange("imap_host", e.target.value)}
-                  placeholder="imap.example.com"
+                  placeholder={incomingHostPlaceholder}
                 />
               </div>
               <div style={fieldStyle}>
-                <label htmlFor="setup-imap-port" style={labelStyle}>{t("accountSetup.imapPort", "IMAP port")}</label>
+                <label htmlFor="setup-imap-port" style={labelStyle}>{incomingPortLabel}</label>
                 <input
                   id="setup-imap-port"
                   name="imap_port"
@@ -517,6 +580,7 @@ export default function AccountSetup({ onClose }: Props) {
                 >
                   <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                   <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
+                  <option value="plain">{t("accountSetup.securityPlain", "None")}</option>
                 </select>
               </div>
             </div>
@@ -558,9 +622,57 @@ export default function AccountSetup({ onClose }: Props) {
                 >
                   <option value="tls">{t("accountSetup.securityTls", "SSL/TLS")}</option>
                   <option value="starttls">{t("accountSetup.securityStarttls", "STARTTLS")}</option>
+                  <option value="plain">{t("accountSetup.securityPlain", "None")}</option>
                 </select>
               </div>
             </div>
+
+            {/* TLS certificate policy */}
+            <label
+              htmlFor="setup-accept-invalid-certs"
+              style={{
+                display: "flex",
+                alignItems: "center",
+                gap: "8px",
+                fontSize: "12px",
+                color: "var(--color-text-primary)",
+              }}
+            >
+              <input
+                id="setup-accept-invalid-certs"
+                type="checkbox"
+                checked={!!form.accept_invalid_certs}
+                onChange={(e) => handleChange("accept_invalid_certs", e.target.checked)}
+              />
+              {t("accountSetup.acceptInvalidCerts", "Allow invalid TLS certificates")}
+            </label>
+
+            {(form.imap_security === "plain" || form.smtp_security === "plain") && (
+              <label
+                htmlFor="setup-allow-plaintext"
+                style={{
+                  display: "flex",
+                  alignItems: "flex-start",
+                  gap: "8px",
+                  fontSize: "12px",
+                  color: "var(--color-warning, #b45309)",
+                }}
+              >
+                <input
+                  id="setup-allow-plaintext"
+                  type="checkbox"
+                  checked={!!form.allow_plaintext}
+                  onChange={(e) => handleChange("allow_plaintext", e.target.checked)}
+                  style={{ marginTop: "2px" }}
+                />
+                <span>
+                  {t(
+                    "accountSetup.allowPlaintext",
+                    "Allow unencrypted connection (insecure — your password is sent in cleartext)",
+                  )}
+                </span>
+              </label>
+            )}
 
             {/* Username */}
             <div style={fieldStyle}>
@@ -571,7 +683,6 @@ export default function AccountSetup({ onClose }: Props) {
                 autoComplete="username"
                 style={inputStyle}
                 type="text"
-                required
                 value={form.username}
                 onChange={(e) => handleChange("username", e.target.value)}
                 placeholder={t("accountSetup.usernameHint", "Defaults to email address")}
@@ -636,7 +747,7 @@ export default function AccountSetup({ onClose }: Props) {
             <div style={{ display: "flex", gap: "10px", marginTop: "4px" }}>
               <button
                 type="button"
-                disabled={testLoading || !form.imap_host}
+                disabled={testLoading || !canTestConnection}
                 onClick={handleTestConnection}
                 style={{
                   padding: "9px 16px",
@@ -646,8 +757,8 @@ export default function AccountSetup({ onClose }: Props) {
                   color: "var(--color-text-primary)",
                   fontSize: "13px",
                   fontWeight: 500,
-                  cursor: testLoading || !form.imap_host ? "not-allowed" : "pointer",
-                  opacity: testLoading || !form.imap_host ? 0.6 : 1,
+                  cursor: testLoading || !canTestConnection ? "not-allowed" : "pointer",
+                  opacity: testLoading || !canTestConnection ? 0.6 : 1,
                 }}
               >
                 {testLoading ? t("accountSetup.testing", "Testing...") : t("accountSetup.testConnection", "Test Connection")}

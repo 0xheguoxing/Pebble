@@ -153,6 +153,14 @@ pub async fn process_pending_mail_ops(
                 state.store.mark_pending_mail_op_done(&op.id)?;
                 completed += 1;
             }
+            Err(ref e) if is_permanent_error(e) => {
+                state.store.mark_pending_mail_op_done(&op.id)?;
+                warn!(
+                    "Pending mail op {} permanently failed (non-retryable): {e}",
+                    op.id
+                );
+                completed += 1;
+            }
             Err(e) => {
                 state
                     .store
@@ -166,6 +174,28 @@ pub async fn process_pending_mail_ops(
         emit_pending_ops_changed(app);
     }
     Ok(completed)
+}
+
+fn is_permanent_error(e: &PebbleError) -> bool {
+    matches!(
+        e,
+        PebbleError::Auth(_) | PebbleError::UnsupportedProvider(_)
+    )
+}
+
+#[tauri::command]
+pub fn dismiss_failed_pending_mail_ops(
+    state: State<'_, AppState>,
+    app: tauri::AppHandle,
+    account_id: Option<String>,
+) -> std::result::Result<u64, PebbleError> {
+    let dismissed = state
+        .store
+        .dismiss_failed_pending_mail_ops(account_id.as_deref())?;
+    if dismissed > 0 {
+        emit_pending_ops_changed(Some(&app));
+    }
+    Ok(dismissed)
 }
 
 fn emit_pending_ops_changed(app: Option<&tauri::AppHandle>) {
@@ -305,6 +335,7 @@ async fn replay_remote_update_flags(
             let _ = imap.disconnect().await;
             result
         }
+        ProviderType::Pop3 => Ok(()),
     }
 }
 
@@ -341,11 +372,17 @@ async fn replay_remote_archive(
             let uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
             let result = imap
-                .move_message(&source_remote_id, uid, &target_remote_id)
+                .move_message_with_dedup(
+                    &source_remote_id,
+                    uid,
+                    &target_remote_id,
+                    message.message_id_header.as_deref(),
+                )
                 .await;
             let _ = imap.disconnect().await;
             result
         }
+        ProviderType::Pop3 => Ok(()),
     }
 }
 
@@ -393,11 +430,17 @@ async fn replay_remote_restore(
             let uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
             let result = imap
-                .move_message(&source_remote_id, uid, &target_remote_id)
+                .move_message_with_dedup(
+                    &source_remote_id,
+                    uid,
+                    &target_remote_id,
+                    message.message_id_header.as_deref(),
+                )
                 .await;
             let _ = imap.disconnect().await;
             result
         }
+        ProviderType::Pop3 => Ok(()),
     }
 }
 
@@ -447,8 +490,13 @@ async fn replay_remote_delete(
                 if trash_remote_id == source_remote_id {
                     imap.delete_message(&source_remote_id, uid).await
                 } else {
-                    imap.move_message(&source_remote_id, uid, &trash_remote_id)
-                        .await
+                    imap.move_message_with_dedup(
+                        &source_remote_id,
+                        uid,
+                        &trash_remote_id,
+                        message.message_id_header.as_deref(),
+                    )
+                    .await
                 }
             } else {
                 imap.delete_message(&source_remote_id, uid).await
@@ -456,6 +504,7 @@ async fn replay_remote_delete(
             let _ = imap.disconnect().await;
             result
         }
+        ProviderType::Pop3 => Ok(()),
     }
 }
 
@@ -496,11 +545,17 @@ async fn replay_remote_move_to_folder(
             let uid = parse_uid(message)?;
             let imap = connect_imap(state, &message.account_id).await?;
             let result = imap
-                .move_message(&source_remote_id, uid, &target_remote_id)
+                .move_message_with_dedup(
+                    &source_remote_id,
+                    uid,
+                    &target_remote_id,
+                    message.message_id_header.as_deref(),
+                )
                 .await;
             let _ = imap.disconnect().await;
             result
         }
+        ProviderType::Pop3 => Ok(()),
     }
 }
 
@@ -531,7 +586,9 @@ async fn replay_remote_send(
                 .send_message(&outgoing)
                 .await
         }
-        ProviderType::Imap => compose::send_imap_smtp_message(state, account, &outgoing).await,
+        ProviderType::Imap | ProviderType::Pop3 => {
+            compose::send_imap_smtp_message(state, account, &outgoing).await
+        }
     }
 }
 

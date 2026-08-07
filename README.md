@@ -34,7 +34,7 @@ The app is designed around a few practical ideas:
 - Privacy controls should be explicit, visible, and easy to override per message.
 - Search, snooze, rules, and a Kanban board should work together instead of living in separate tools.
 
-Pebble currently supports Gmail, IMAP, and experimental Outlook accounts.
+Pebble currently supports Gmail, IMAP, POP3, and experimental Outlook accounts.
 
 ## Highlights
 
@@ -50,21 +50,32 @@ Pebble currently supports Gmail, IMAP, and experimental Outlook accounts.
 ### Mail workflow
 
 - Unified inbox across multiple accounts.
-- Gmail, IMAP, and experimental Outlook support.
+- Gmail, IMAP, POP3, and experimental Outlook support.
 - Threaded and message-list views.
 - Archive, delete, star, mark read, batch actions, and restore flows.
 - Snooze messages and bring them back later.
 - Full-text search and advanced filters.
 - Rules engine for automatic organization.
+- Email CSS rendering with embedded style support.
+- Option to allow invalid TLS certificates for self-hosted mail servers.
 
 ### Productivity tools
 
 - Kanban board with Todo, Waiting, and Done columns.
 - Command palette and keyboard-first navigation.
-- Built-in translation providers with bilingual reading.
-- Dark and light themes.
+- Built-in translation providers with bilingual reading and customizable shortcuts (`T` to translate selection, `Ctrl+Shift+T` to toggle bilingual view).
+- Dark and light themes with wallpaper background support.
 - English and Chinese UI.
-- Optional WebDAV backup for settings, rules, Kanban cards, and Kanban notes.
+- Optional local file export/import and WebDAV backup for settings, rules, Kanban cards, Kanban notes, and separately encrypted account secrets.
+- Automatic scheduled WebDAV backup with configurable interval.
+
+### Platform integration
+
+- Native macOS traffic-light window controls.
+- Register as default email client on Windows (Settings > General).
+- Tray mode keeps mail sync running while the window is hidden.
+- Start hidden to system tray option.
+- `mailto:` protocol handler for composing mail from external apps.
 
 ## Screenshots
 
@@ -94,12 +105,36 @@ Pebble currently supports Gmail, IMAP, and experimental Outlook accounts.
 
 ## Getting Started
 
+### Install
+
+Download prebuilt desktop packages from the [Releases](https://github.com/QingJ01/Pebble/releases) page.
+
+On Arch Linux, Pebble is available from the AUR as `pebble-bin`:
+
+```bash
+yay -S pebble-bin
+# or
+paru -S pebble-bin
+```
+
 ### Prerequisites
 
 - Rust stable
 - Node.js 18 or newer
 - pnpm 8 or newer
 - Tauri system dependencies for your platform
+
+### Profile Storage
+
+By default, Pebble stores the database, search index, attachments, logs, imported backgrounds, and local interface preferences under the system app data directory.
+
+You can opt into a custom or portable profile directory before Pebble starts:
+
+- Set `PEBBLE_PROFILE_DIR` to an absolute path.
+- Put `pebble-profile.txt` next to `pebble.exe`; the first line can be an absolute path or a path relative to the executable directory.
+- Create a `pebble-profile` directory next to `pebble.exe` to store Pebble data beside the app.
+
+The selected directory is used on the next app launch.
 
 ### Development Setup
 
@@ -125,7 +160,7 @@ pnpm build:linux
 ```
 
 Desktop bundles are written under `target/release/` and `target/release/bundle/`.
-On Linux, install the Tauri system dependencies first; `pnpm build:linux` produces an AppImage under `target/release/bundle/appimage/`.
+On Linux, install the Tauri system dependencies first; `pnpm build:linux` produces AppImage, deb, and rpm packages under `target/release/bundle/`.
 macOS bundles are unsigned unless you provide your own signing setup.
 After copying an unsigned macOS build to `/Applications`, run the following command before opening it:
 
@@ -157,7 +192,7 @@ Copy `.env.example` to `.env`, then fill the provider values you need.
 | `pnpm build` | Build the desktop app for the current platform. |
 | `pnpm build:windows` | Build the Windows NSIS installer. |
 | `pnpm build:macos` | Build unsigned macOS `.app` and `.dmg` bundles. |
-| `pnpm build:linux` | Build the Linux `.AppImage` bundle. |
+| `pnpm build:linux` | Build Linux `.AppImage`, `.deb`, and `.rpm` packages. |
 | `cargo test -p pebble-mail` | Run the mail crate tests. |
 | `cargo check` | Check the Rust workspace. |
 
@@ -199,6 +234,8 @@ Pebble/
 | `F` | Forward |
 | `C` | Compose |
 | `/` | Focus search |
+| `T` | Translate selected text |
+| `Ctrl+Shift+T` | Toggle bilingual view |
 | `Esc` | Close, cancel, or go back |
 
 Shortcuts can be reviewed and customized in Settings.

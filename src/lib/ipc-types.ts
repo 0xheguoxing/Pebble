@@ -16,7 +16,7 @@ export interface Account {
   display_name: string;
   color?: string | null;
   /** ProviderType enum (rename_all = "lowercase") */
-  provider: "imap" | "gmail" | "outlook";
+  provider: "imap" | "pop3" | "gmail" | "outlook";
   created_at: number;
   updated_at: number;
 }
@@ -33,6 +33,12 @@ export interface Folder {
   color: string | null;
   is_system: boolean;
   sort_order: number;
+}
+
+/** @rust src-tauri/src/commands/folders.rs → ImapSyncFolderSettings */
+export interface ImapSyncFolderSettings {
+  folders: Folder[];
+  selected_remote_ids: string[];
 }
 
 /** @rust pebble-core/src/types.rs → EmailAddress */
@@ -169,6 +175,8 @@ export interface AddAccountRequest {
   password: string;
   imap_security: ConnectionSecurity;
   smtp_security: ConnectionSecurity;
+  accept_invalid_certs?: boolean;
+  allow_plaintext?: boolean;
   proxy_host?: string;
   proxy_port?: number;
 }
@@ -323,6 +331,9 @@ export interface BackupPreview {
   kanban_card_count: number;
   kanban_note_count: number;
   has_translate_config: boolean;
+  has_encrypted_secrets: boolean;
+  secret_account_count: number;
+  has_translate_secret: boolean;
   size_bytes: number;
 }
 

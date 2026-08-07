@@ -2,7 +2,7 @@ use pebble_core::{new_id, PebbleError};
 use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 pub const MAX_BACKGROUND_IMAGE_BYTES: usize = 10 * 1024 * 1024;
 
@@ -47,10 +47,8 @@ fn validate_background_image_bytes(bytes: &[u8]) -> Result<&'static str, PebbleE
 }
 
 fn background_images_dir(app: &AppHandle) -> Result<PathBuf, PebbleError> {
-    let app_data = app
-        .path()
-        .app_data_dir()
-        .map_err(|e| PebbleError::Internal(format!("Failed to resolve app data directory: {e}")))?;
+    let app_data =
+        crate::profile::require_managed_app_data_dir(app).map_err(PebbleError::Internal)?;
     Ok(app_data.join("backgrounds"))
 }
 

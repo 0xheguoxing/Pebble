@@ -14,7 +14,7 @@ use crate::Store;
 /// read-modify-write cycles don't clobber sibling fields by accident.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SyncState {
-    /// Provider slug as persisted: `"gmail"`, `"outlook"`, or `"imap"`.
+    /// Provider slug as persisted: `"gmail"`, `"outlook"`, `"imap"`, or `"pop3"`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
 
@@ -31,6 +31,14 @@ pub struct SyncState {
     /// Legacy inline SMTP config, same provenance as `imap`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub smtp: Option<serde_json::Value>,
+
+    /// Explicit IMAP mailbox selection, stored as provider remote IDs.
+    ///
+    /// `None` preserves the legacy behaviour of syncing every selectable
+    /// mailbox. `Some(...)` enables account-level selection; Inbox is always
+    /// included by the IMAP worker even when it is absent from this list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_imap_folder_remote_ids: Option<Vec<String>>,
 
     /// Any fields we don't yet model — preserved verbatim on write so
     /// round-tripping through [`Store::update_sync_state`] never drops data.
@@ -60,6 +68,7 @@ impl SyncState {
 fn provider_to_str(p: &ProviderType) -> &'static str {
     match p {
         ProviderType::Imap => "imap",
+        ProviderType::Pop3 => "pop3",
         ProviderType::Gmail => "gmail",
         ProviderType::Outlook => "outlook",
     }
@@ -67,6 +76,7 @@ fn provider_to_str(p: &ProviderType) -> &'static str {
 
 fn str_to_provider(s: &str) -> ProviderType {
     match s {
+        "pop3" => ProviderType::Pop3,
         "gmail" => ProviderType::Gmail,
         "outlook" => ProviderType::Outlook,
         _ => ProviderType::Imap,

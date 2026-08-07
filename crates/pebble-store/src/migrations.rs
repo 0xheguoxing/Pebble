@@ -1,8 +1,8 @@
-use pebble_core::{PebbleError, Result};
-use rusqlite::Connection;
+use pebble_core::{build_snippet, PebbleError, Result};
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
-const CURRENT_VERSION: u32 = 11;
+const CURRENT_VERSION: u32 = 14;
 const ACCOUNT_COLOR_PRESETS: [&str; 12] = [
     "#0ea5e9", "#22c55e", "#f59e0b", "#8b5cf6", "#f43f5e", "#14b8a6", "#6366f1", "#f97316",
     "#06b6d4", "#ec4899", "#84cc16", "#3b82f6",
@@ -70,6 +70,80 @@ fn backfill_account_colors(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    Ok(())
+}
+
+fn accounts_provider_check_allows_pop3(conn: &Connection) -> Result<bool> {
+    let sql: String = conn.query_row(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'accounts'",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(sql.contains("'pop3'"))
+}
+
+fn rebuild_accounts_with_pop3_provider(conn: &Connection) -> Result<()> {
+    if conn
+        .prepare("SELECT auth_data FROM accounts LIMIT 0")
+        .is_err()
+    {
+        conn.execute_batch("ALTER TABLE accounts ADD COLUMN auth_data BLOB;")
+            .map_err(|e| {
+                PebbleError::Storage(format!("Migration V12 auth_data column failed: {e}"))
+            })?;
+    }
+    if conn
+        .prepare("SELECT sync_state FROM accounts LIMIT 0")
+        .is_err()
+    {
+        conn.execute_batch("ALTER TABLE accounts ADD COLUMN sync_state TEXT;")
+            .map_err(|e| {
+                PebbleError::Storage(format!("Migration V12 sync_state column failed: {e}"))
+            })?;
+    }
+
+    conn.execute_batch(
+        "CREATE TABLE accounts_new (
+            id TEXT PRIMARY KEY,
+            email TEXT NOT NULL,
+            display_name TEXT NOT NULL DEFAULT '',
+            color TEXT,
+            provider TEXT NOT NULL CHECK(provider IN ('imap', 'pop3', 'gmail', 'outlook')),
+            auth_data BLOB,
+            sync_state TEXT,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );
+        INSERT INTO accounts_new (id, email, display_name, color, provider, auth_data, sync_state, created_at, updated_at)
+            SELECT id, email, display_name, color, provider, auth_data, sync_state, created_at, updated_at
+            FROM accounts;
+        DROP TABLE accounts;
+        ALTER TABLE accounts_new RENAME TO accounts;",
+    )
+    .map_err(|e| PebbleError::Storage(format!("Migration V12 failed: {e}")))?;
+    Ok(())
+}
+
+fn rebuild_snippets(conn: &Connection) -> Result<()> {
+    let mut stmt = match conn.prepare("SELECT id, body_text, body_html_raw FROM messages") {
+        Ok(s) => s,
+        Err(_) => return Ok(()),
+    };
+    let rows: Vec<(String, String, String)> = stmt
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .map_err(|e| PebbleError::Storage(format!("V13 query failed: {e}")))?
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut update = conn
+        .prepare("UPDATE messages SET snippet = ?1 WHERE id = ?2")
+        .map_err(|e| PebbleError::Storage(format!("V13 prepare update failed: {e}")))?;
+    for (id, body_text, body_html) in &rows {
+        let new_snippet = build_snippet(body_text, body_html);
+        update
+            .execute(rusqlite::params![new_snippet, id])
+            .map_err(|e| PebbleError::Storage(format!("V13 update failed: {e}")))?;
+    }
     Ok(())
 }
 
@@ -285,6 +359,82 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             .map_err(|e| PebbleError::Storage(format!("Migration V11 commit failed: {e}")))?;
     }
 
+    if version < 12 {
+        conn.execute_batch("PRAGMA foreign_keys=OFF;")
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 disable FK failed: {e}")))?;
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 begin failed: {e}")))?;
+        if !accounts_provider_check_allows_pop3(&tx)? {
+            rebuild_accounts_with_pop3_provider(&tx)?;
+        }
+        set_schema_version(&tx, CURRENT_VERSION)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 commit failed: {e}")))?;
+        conn.execute_batch("PRAGMA foreign_keys=ON;")
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 enable FK failed: {e}")))?;
+        let fk_violations: i64 = conn
+            .query_row("PRAGMA foreign_key_check", [], |_| Ok(1))
+            .optional()
+            .map_err(|e| PebbleError::Storage(format!("Migration V12 FK check failed: {e}")))?
+            .unwrap_or(0);
+        if fk_violations != 0 {
+            return Err(PebbleError::Storage(
+                "Migration V12 introduced foreign key violations".to_string(),
+            ));
+        }
+    }
+
+    // V13: rebuild snippets to strip leaked HTML/CSS from previews
+    if version < 13 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V13 begin failed: {e}")))?;
+        rebuild_snippets(&tx)?;
+        set_schema_version(&tx, CURRENT_VERSION)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V13 commit failed: {e}")))?;
+    }
+
+    // V14: enforce at most one LIVE row per (account_id, remote_id). The legacy
+    // idx_messages_account_remote index was non-unique, so a soft-delete followed
+    // by a re-sync that re-fetched the same remote_id inserted a second row
+    // (tombstone + new live copy). Deduplicate existing live rows first, then
+    // replace the index with a partial UNIQUE index scoped to is_deleted = 0 so
+    // tombstones (is_deleted = 1) can still coexist with a fresh live copy.
+    if version < 14 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V14 begin failed: {e}")))?;
+        // The messages table always exists in production (created in SCHEMA_V1).
+        // Guard the dedup/index so the migration is a no-op on the minimal
+        // schemas used by migration unit tests that omit messages — and is
+        // harmless if a future store variant lacks it.
+        let messages_count: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='messages'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(0);
+        if messages_count > 0 {
+            tx.execute_batch(
+                "DELETE FROM messages
+                 WHERE is_deleted = 0
+                   AND id NOT IN (
+                     SELECT MIN(id) FROM messages WHERE is_deleted = 0 GROUP BY account_id, remote_id
+                   );
+                 DROP INDEX IF EXISTS idx_messages_account_remote;
+                 CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_account_remote_unique
+                   ON messages(account_id, remote_id) WHERE is_deleted = 0;",
+            )
+            .map_err(|e| PebbleError::Storage(format!("Migration V14 failed: {e}")))?;
+        }
+        set_schema_version(&tx, 14)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V14 commit failed: {e}")))?;
+    }
+
     Ok(())
 }
 
@@ -294,7 +444,7 @@ CREATE TABLE IF NOT EXISTS accounts (
     email TEXT NOT NULL,
     display_name TEXT NOT NULL DEFAULT '',
     color TEXT,
-    provider TEXT NOT NULL CHECK(provider IN ('imap', 'gmail', 'outlook')),
+    provider TEXT NOT NULL CHECK(provider IN ('imap', 'pop3', 'gmail', 'outlook')),
     auth_data BLOB,
     sync_state TEXT,
     created_at INTEGER NOT NULL,
@@ -453,9 +603,85 @@ mod tests {
         let version: u32 = conn
             .pragma_query_value(None, "user_version", |row| row.get(0))
             .unwrap();
-        assert_eq!(version, 11);
+        assert_eq!(version, CURRENT_VERSION);
         conn.prepare("SELECT color FROM accounts LIMIT 0")
             .expect("accounts.color should exist after V11");
+    }
+
+    #[test]
+    fn migration_v14_dedups_live_rows_and_enforces_partial_unique_index() {
+        let conn = Connection::open_in_memory().unwrap();
+        // Minimal messages shape at the V13 boundary: only the columns V14
+        // touches. run_migrations from user_version=13 runs just the V14 block.
+        conn.execute_batch(
+            "CREATE TABLE messages (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL,
+                remote_id TEXT NOT NULL,
+                is_deleted INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX idx_messages_account_remote ON messages(account_id, remote_id);
+            PRAGMA user_version = 13;",
+        )
+        .unwrap();
+
+        // Two LIVE duplicates of the same remote message, one tombstone for it,
+        // and one unrelated live row.
+        conn.execute_batch(
+            "INSERT INTO messages (id, account_id, remote_id, is_deleted) VALUES
+                ('m-dup-a', 'acct', 'UID:42', 0),
+                ('m-dup-b', 'acct', 'UID:42', 0),
+                ('m-tomb',  'acct', 'UID:42', 1),
+                ('m-other', 'acct', 'UID:99', 0);",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+
+        // Duplicate live rows collapse to one; the tombstone survives; the
+        // unrelated live row is untouched.
+        let live_42: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE account_id='acct' AND remote_id='UID:42' AND is_deleted=0",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(live_42, 1, "duplicate live rows should be collapsed to one");
+
+        let tomb_survives: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE id='m-tomb'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tomb_survives, 1, "tombstone must not be removed by dedup");
+
+        // Partial unique index: a second LIVE row with the same key is rejected,
+        // but an additional tombstone (is_deleted=1) is still allowed.
+        let dup_live = conn.execute(
+            "INSERT INTO messages (id, account_id, remote_id, is_deleted) VALUES ('m-extra','acct','UID:42',0)",
+            [],
+        );
+        assert!(
+            dup_live.is_err(),
+            "second live row must be rejected by the partial unique index"
+        );
+
+        let dup_tomb = conn.execute(
+            "INSERT INTO messages (id, account_id, remote_id, is_deleted) VALUES ('m-tomb2','acct','UID:42',1)",
+            [],
+        );
+        assert!(
+            dup_tomb.is_ok(),
+            "additional tombstone must be allowed alongside one live row"
+        );
     }
 
     #[test]
@@ -492,5 +718,68 @@ mod tests {
             colors,
             vec![Some("#0ea5e9".to_string()), Some("#22c55e".to_string())]
         );
+    }
+
+    #[test]
+    fn migration_v12_allows_pop3_provider_without_breaking_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "PRAGMA foreign_keys=ON;
+            CREATE TABLE accounts (
+                id TEXT PRIMARY KEY,
+                email TEXT NOT NULL,
+                display_name TEXT NOT NULL DEFAULT '',
+                color TEXT,
+                provider TEXT NOT NULL CHECK(provider IN ('imap', 'gmail', 'outlook')),
+                auth_data BLOB,
+                sync_state TEXT,
+                created_at INTEGER NOT NULL,
+                updated_at INTEGER NOT NULL
+            );
+            CREATE TABLE folders (
+                id TEXT PRIMARY KEY,
+                account_id TEXT NOT NULL REFERENCES accounts(id) ON DELETE CASCADE,
+                remote_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                folder_type TEXT NOT NULL CHECK(folder_type IN ('folder', 'label', 'category')),
+                role TEXT CHECK(role IN ('inbox', 'sent', 'drafts', 'trash', 'archive', 'spam')),
+                parent_id TEXT,
+                color TEXT,
+                is_system INTEGER NOT NULL DEFAULT 0,
+                sort_order INTEGER NOT NULL DEFAULT 0
+            );
+            INSERT INTO accounts (id, email, display_name, color, provider, created_at, updated_at)
+                VALUES ('account-1', 'one@example.com', 'One', '#0ea5e9', 'imap', 1, 1);
+            INSERT INTO folders (id, account_id, remote_id, name, folder_type, role, is_system, sort_order)
+                VALUES ('folder-1', 'account-1', 'INBOX', 'Inbox', 'folder', 'inbox', 1, 0);
+            PRAGMA user_version = 11;",
+        )
+        .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, CURRENT_VERSION);
+        conn.execute(
+            "INSERT INTO accounts (id, email, display_name, provider, created_at, updated_at)
+                VALUES ('account-2', 'two@example.com', 'Two', 'pop3', 2, 2)",
+            [],
+        )
+        .expect("accounts.provider should accept pop3 after V12");
+        let folder_account: String = conn
+            .query_row(
+                "SELECT account_id FROM folders WHERE id = 'folder-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(folder_account, "account-1");
+        let fk_issue = conn
+            .query_row("PRAGMA foreign_key_check", [], |_| Ok(()))
+            .optional()
+            .unwrap();
+        assert!(fk_issue.is_none());
     }
 }

@@ -185,12 +185,19 @@
     "testNotificationSending": "Sending test notification...",
     "testNotificationSent": "Test notification sent",
     "testNotificationFailed": "Failed to send test notification",
+    "startupBehavior": "Startup Behavior",
+    "launchAtStartup": "Launch Pebble at system startup",
+    "autostartFailed": "Failed to update launch at startup",
+    "startHiddenToTray": "Start hidden to tray",
     "closeBehavior": "Close Behavior",
     "quitOnClose": "Quit app when window is closed",
     "folderCounts": "Folder Counts",
     "showUnreadCount": "Show unread count badges in sidebar",
+    "defaultMailClient": "Default Email Client",
+    "setDefaultMailClient": "Set Pebble as default email app",
+    "setDefaultMailClientHint": "Opens Windows Default Apps settings where you can select Pebble for email.",
     "globalProxy": "Global Proxy",
-    "globalProxyDesc": "Used by translation, OAuth, Gmail/Outlook API requests, IMAP, and SMTP when an account does not define its own SOCKS5 proxy.",
+    "globalProxyDesc": "Used by translation, OAuth, Gmail/Outlook API requests, IMAP, POP3, and SMTP when an account does not define its own SOCKS5 proxy.",
     "globalProxyHost": "SOCKS5 Proxy",
     "globalProxyPort": "Port",
     "globalProxySaved": "Global proxy saved",
@@ -214,29 +221,43 @@
     "optional": "optional",
     "signature": "Signature",
     "signaturePlaceholder": "Your email signature...",
+    "syncFolders": "Folders to sync",
+    "syncFoldersDesc": "Inbox is always synced. Choose any additional IMAP folders to keep locally.",
+    "chooseFolders": "Choose folders",
+    "refreshFolders": "Refresh folders",
+    "loadingFolders": "Loading...",
+    "folderListFailed": "Failed to list IMAP folders: {{error}}",
+    "alwaysSynced": "Always synced",
+    "syncFoldersCleanupWarning": "Saving removes locally stored data for folders you uncheck. It does not delete mail from the server.",
     "oauthAccountNote": "This account uses OAuth. Provider sign-in, password, and IMAP/SMTP settings are managed by the provider. Leave the proxy blank to inherit the global SOCKS5 proxy.",
     "deleteAccountSuccess": "Account removed successfully",
     "deleteAccountFailed": "Failed to remove account"
   },
   "cloudSync": {
     "title": "Settings Backup",
-    "description": "Back up rules, Kanban cards and notes, and account metadata to WebDAV. This does not sync mail data, attachments, or OAuth secrets.",
+    "description": "Back up rules, Kanban cards and notes, and account metadata to WebDAV. Account passwords, OAuth tokens, and API keys can be included with a separate backup encryption password.",
     "webdavUrl": "WebDAV URL",
     "username": "Username",
     "password": "Password",
     "testConnection": "Test Connection",
     "connectionSuccess": "Connection successful",
     "connectionFailed": "Connection failed",
+    "exportFile": "Export File",
+    "importFile": "Import File",
     "backup": "Backup Settings",
     "restore": "Restore Settings Backup",
-    "restoreNotice": "Restoring is partial: email accounts will be recreated without passwords or OAuth tokens, and translation providers may need to be reconnected.",
+    "restoreNotice": "Restoring without the backup encryption password is partial. Enter it to restore account passwords, OAuth tokens, and translation API keys when the backup contains them.",
     "lastBackup": "Last backup",
     "backupSuccess": "Settings backup completed successfully",
     "restoreSuccess": "Backup restored. Reconnect email accounts and translation providers to continue.",
-    "restoreConfirm": "This will replace local rules and Kanban cards/notes, and merge account metadata from the backup. Reauthentication will still be required for restored accounts. Continue?",
+    "restoreSuccessWithSecrets": "Backup restored with account passwords, OAuth tokens, and API keys.",
+    "restoreConfirm": "This will replace local rules and Kanban cards/notes, merge account metadata, and restore encrypted secrets when present. Continue?",
     "backupFailed": "Backup failed: {{error}}",
     "restoreFailed": "Restore failed: {{error}}",
-    "encryptionWarning": "Note: Backups are uploaded as unencrypted JSON. Ensure your WebDAV server is trusted.",
+    "exportSuccess": "Backup file exported",
+    "exportFailed": "Export failed: {{error}}",
+    "importFailed": "Import failed: {{error}}",
+    "encryptionWarning": "Note: regular settings are uploaded as JSON. Secrets are encrypted only when you enable the option below. Ensure your WebDAV server is trusted.",
     "restorePreviewHeader": "Backup contents to restore:",
     "restorePreviewSchema": "Schema version: {{version}}",
     "restorePreviewExported": "Exported: {{date}}",
@@ -244,8 +265,20 @@
     "restorePreviewRules": "Rules: {{count}}",
     "restorePreviewKanban": "Kanban cards: {{count}}",
     "restorePreviewKanbanNotes": "Kanban notes: {{count}}",
+    "restorePreviewEncryptedSecrets": "Encrypted account secrets: {{count}}",
+    "restorePreviewTranslateSecret": "Encrypted translation API keys: included",
     "restorePreviewSize": "Size: {{kb}} KB",
-    "scopeNotice": "WebDAV backup includes settings, rules, Kanban cards, and Kanban notes. Message bodies and attachments are not included unless you saved text into a Kanban note."
+    "scopeNotice": "WebDAV backup includes settings, rules, Kanban cards, and Kanban notes. Optional encrypted secrets include account passwords, OAuth tokens, and translation API keys. Message bodies and attachments are not included unless you saved text into a Kanban note.",
+    "includeSecrets": "Include account passwords, OAuth tokens, and API keys",
+    "includeSecretsDesc": "Secrets are encrypted with the password below before upload. You will need the same password to restore them on another device.",
+    "secretPassphrase": "Backup encryption password",
+    "secretPassphrasePlaceholder": "Required for backing up or restoring secrets",
+    "secretPassphraseRequired": "Enter a backup encryption password to include account passwords, OAuth tokens, and API keys.",
+    "restoreSecretPassphraseRequired": "This backup contains encrypted secrets. Enter the backup encryption password before restoring.",
+    "autoBackup": "Automatic Backup",
+    "autoBackupEnable": "Enable automatic WebDAV backup",
+    "autoBackupInterval": "Interval",
+    "autoBackupFillFields": "Fill in WebDAV credentials above to enable auto-backup."
   },
   "pendingOps": {
     "title": "Remote Writes",
@@ -282,13 +315,14 @@
       "update_flags": "Update flags",
       "move_to_folder": "Move to folder",
       "send": "Send"
-    }
+    },
+    "dismissFailed": "Dismiss failed"
   },
   "about": {
     "title": "About",
     "version": "Version",
     "description": "A local-first desktop email client built with Rust and React. Mail, search index, and attachments stay on your device. No telemetry. Outbound traffic happens only when you use a feature that requires it: mail sync with your provider, translation, WebDAV settings backup, external message images you choose to load, or a manual GitHub update check.",
-    "features": "Supports Gmail, Outlook, and IMAP accounts. Includes Kanban board, full-text search, snooze, rules engine, built-in translation, and optional WebDAV settings backup.",
+    "features": "Supports Gmail, Outlook, IMAP, and POP3 accounts. Includes Kanban board, full-text search, snooze, rules engine, built-in translation, and optional WebDAV settings backup.",
     "license": "Open source under AGPL-3.0 license.",
     "updates": "Updates",
     "checkUpdate": "Check for updates",
@@ -375,7 +409,10 @@
     "recording": "Press keys...",
     "conflict": "Already assigned to: {{action}}",
     "resetDefaults": "Reset to Defaults",
-    "resetConfirm": "All shortcuts restored to defaults"
+    "resetConfirm": "All shortcuts restored to defaults",
+    "translate": "Translate",
+    "translateSelection": "Translate selection",
+    "toggleBilingual": "Toggle bilingual view"
   },
   "messageActions": {
     "reply": "Reply",
@@ -445,8 +482,13 @@
     "quickSetup": "Quick setup",
     "emailAddress": "Email address",
     "displayName": "Display name",
+    "incomingProtocol": "Incoming protocol",
+    "incomingProtocolImap": "IMAP",
+    "incomingProtocolPop3": "POP3",
     "imapHost": "IMAP host",
     "imapPort": "IMAP port",
+    "pop3Host": "POP3 host",
+    "pop3Port": "POP3 port",
     "smtpHost": "SMTP host",
     "smtpPort": "SMTP port",
     "username": "Username",
@@ -471,7 +513,11 @@
     "namePlaceholder": "Your Name",
     "discardTitle": "Discard changes?",
     "discardConfirm": "Your changes will be lost. Are you sure?",
-    "accountAdded": "Account added successfully"
+    "accountAdded": "Account added successfully",
+    "acceptInvalidCerts": "Allow invalid TLS certificates",
+    "allowPlaintext": "Allow unencrypted connection (insecure — your password is sent in cleartext)",
+    "tlsCertificateVerification": "TLS certificate verification",
+    "verifyTlsCerts": "Verify certificates"
   },
   "commands": {
     "navigation": "Navigation",
@@ -626,7 +672,8 @@
   },
   "thread": {
     "title": "Thread",
-    "to": "To:"
+    "to": "To:",
+    "cc": "Cc:"
   },
   "errorBoundary": {
     "title": "Something went wrong",
@@ -659,6 +706,8 @@
     "unstar": "Unstar"
   },
   "messageDetail": {
-    "body": "Message body"
+    "body": "Message body",
+    "to": "To:",
+    "cc": "Cc:"
   }
 }

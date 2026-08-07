@@ -185,12 +185,19 @@
     "testNotificationSending": "正在发送测试通知...",
     "testNotificationSent": "测试通知已发送",
     "testNotificationFailed": "测试通知发送失败",
+    "startupBehavior": "启动行为",
+    "launchAtStartup": "开机时自动启动 Pebble",
+    "autostartFailed": "更新开机自启动失败",
+    "startHiddenToTray": "启动时隐藏到托盘",
     "closeBehavior": "关闭行为",
     "quitOnClose": "关闭窗口时退出应用",
     "folderCounts": "文件夹计数",
     "showUnreadCount": "在侧边栏显示未读数徽章",
+    "defaultMailClient": "默认邮件客户端",
+    "setDefaultMailClient": "将 Pebble 设为默认邮件应用",
+    "setDefaultMailClientHint": "打开 Windows 默认应用设置，在其中选择 Pebble 作为默认邮件应用。",
     "globalProxy": "全局代理",
-    "globalProxyDesc": "当账号未单独设置 SOCKS5 代理时，用于翻译、OAuth、Gmail/Outlook API 请求、IMAP 和 SMTP。",
+    "globalProxyDesc": "当账号未单独设置 SOCKS5 代理时，用于翻译、OAuth、Gmail/Outlook API 请求、IMAP、POP3 和 SMTP。",
     "globalProxyHost": "SOCKS5 代理",
     "globalProxyPort": "端口",
     "globalProxySaved": "全局代理已保存",
@@ -209,6 +216,14 @@
     "leaveEmptyKeep": "留空保持不变",
     "signature": "签名",
     "signaturePlaceholder": "输入邮件签名...",
+    "syncFolders": "同步文件夹",
+    "syncFoldersDesc": "收件箱始终同步。请选择还需要保存在本地的其他 IMAP 文件夹。",
+    "chooseFolders": "选择文件夹",
+    "refreshFolders": "刷新文件夹",
+    "loadingFolders": "正在加载...",
+    "folderListFailed": "无法列出 IMAP 文件夹：{{error}}",
+    "alwaysSynced": "始终同步",
+    "syncFoldersCleanupWarning": "保存后会移除未勾选文件夹的本地数据，但不会删除服务器上的邮件。",
     "optional": "可选",
     "oauthAccountNote": "此账户使用 OAuth 登录。服务商登录、密码和 IMAP/SMTP 设置由服务商管理。代理留空时会继承全局 SOCKS5 代理。",
     "deleteAccountSuccess": "账户已成功移除",
@@ -220,23 +235,29 @@
   },
   "cloudSync": {
     "title": "设置备份",
-    "description": "将规则、看板卡片和备注、账户元数据备份到 WebDAV。不包含邮件数据、附件或 OAuth 密钥。",
+    "description": "将规则、看板卡片和备注、账户元数据备份到 WebDAV。邮箱密码、OAuth tokens 和 API keys 可使用单独的备份加密密码一并备份。",
     "webdavUrl": "WebDAV 地址",
     "username": "用户名",
     "password": "密码",
     "testConnection": "测试连接",
     "connectionSuccess": "连接成功",
     "connectionFailed": "连接失败",
+    "exportFile": "导出文件",
+    "importFile": "导入文件",
     "backup": "开始备份",
     "restore": "恢复设置备份",
-    "restoreNotice": "恢复是部分恢复：邮箱账户会在没有密码或 OAuth token 的情况下重建，翻译提供方也可能需要重新连接。",
+    "restoreNotice": "不输入备份加密密码时只会部分恢复。输入该密码后，可在备份包含时恢复邮箱密码、OAuth tokens 和翻译 API keys。",
     "lastBackup": "上次备份",
     "backupSuccess": "设置备份已完成",
     "restoreSuccess": "备份已恢复，请重新连接邮箱账户和翻译提供方后再继续使用。",
-    "restoreConfirm": "这会用备份替换本地的规则和看板卡片/备注，并合并备份中的账户元数据。恢复后的账户仍需要重新验证。是否继续？",
+    "restoreSuccessWithSecrets": "备份已恢复，并已恢复邮箱密码、OAuth tokens 和 API keys。",
+    "restoreConfirm": "这会用备份替换本地的规则和看板卡片/备注，合并账户元数据，并在存在时恢复加密 secrets。是否继续？",
     "backupFailed": "备份失败：{{error}}",
     "restoreFailed": "恢复失败：{{error}}",
-    "encryptionWarning": "注意：备份以未加密 JSON 格式上传，请确保你的 WebDAV 服务器可信。",
+    "exportSuccess": "备份文件已导出",
+    "exportFailed": "导出失败：{{error}}",
+    "importFailed": "导入失败：{{error}}",
+    "encryptionWarning": "注意：普通设置仍以 JSON 格式上传。只有启用下方选项时，secrets 才会先加密再上传。请确保你的 WebDAV 服务器可信。",
     "restorePreviewHeader": "即将恢复的备份内容：",
     "restorePreviewSchema": "架构版本：{{version}}",
     "restorePreviewExported": "导出时间：{{date}}",
@@ -244,8 +265,20 @@
     "restorePreviewRules": "规则：{{count}}",
     "restorePreviewKanban": "看板卡片：{{count}}",
     "restorePreviewKanbanNotes": "看板备注：{{count}}",
+    "restorePreviewEncryptedSecrets": "加密账户 secrets：{{count}}",
+    "restorePreviewTranslateSecret": "加密翻译 API keys：已包含",
     "restorePreviewSize": "大小：{{kb}} KB",
-    "scopeNotice": "WebDAV 备份包含设置、规则、看板卡片和看板备注。不包含邮件正文和附件，除非你把正文文本保存到了看板备注中。"
+    "scopeNotice": "WebDAV 备份包含设置、规则、看板卡片和看板备注。可选加密 secrets 包含邮箱密码、OAuth tokens 和翻译 API keys。不包含邮件正文和附件，除非你把正文文本保存到了看板备注中。",
+    "includeSecrets": "包含邮箱密码、OAuth tokens 和 API keys",
+    "includeSecretsDesc": "Secrets 会先用下方密码加密再上传。你需要用同一个密码在其他设备上恢复。",
+    "secretPassphrase": "备份加密密码",
+    "secretPassphrasePlaceholder": "备份或恢复 secrets 时必填",
+    "secretPassphraseRequired": "请输入备份加密密码以包含邮箱密码、OAuth tokens 和 API keys。",
+    "restoreSecretPassphraseRequired": "这个备份包含加密 secrets。恢复前请输入备份加密密码。",
+    "autoBackup": "自动备份",
+    "autoBackupEnable": "启用 WebDAV 自动备份",
+    "autoBackupInterval": "间隔",
+    "autoBackupFillFields": "请先填写上方的 WebDAV 连接信息以启用自动备份。"
   },
   "pendingOps": {
     "title": "远端写回",
@@ -282,13 +315,14 @@
       "update_flags": "更新标记",
       "move_to_folder": "移动到文件夹",
       "send": "发送"
-    }
+    },
+    "dismissFailed": "清除失败项"
   },
   "about": {
     "title": "关于",
     "version": "版本",
     "description": "使用 Rust 和 React 构建的隐私优先桌面邮件客户端。邮件、搜索索引和附件都保存在本地设备。无遥测。翻译等可选功能仅将选中的文本发送到你配置的服务商。",
-    "features": "支持 Gmail、Outlook 和 IMAP 账户。内置看板、全文搜索、延后提醒、规则引擎、双语翻译，以及可选的 WebDAV 设置备份。",
+    "features": "支持 Gmail、Outlook、IMAP 和 POP3 账户。内置看板、全文搜索、延后提醒、规则引擎、双语翻译，以及可选的 WebDAV 设置备份。",
     "license": "基于 AGPL-3.0 许可证开源。",
     "updates": "更新",
     "checkUpdate": "检查更新",
@@ -375,7 +409,10 @@
     "recording": "按下快捷键...",
     "conflict": "已分配给: {{action}}",
     "resetDefaults": "恢复默认设置",
-    "resetConfirm": "所有快捷键已恢复默认"
+    "resetConfirm": "所有快捷键已恢复默认",
+    "translate": "翻译",
+    "translateSelection": "翻译选中文字",
+    "toggleBilingual": "切换双语对照"
   },
   "messageActions": {
     "reply": "回复",
@@ -445,8 +482,13 @@
     "quickSetup": "快速设置",
     "emailAddress": "邮箱地址",
     "displayName": "显示名称",
+    "incomingProtocol": "收信协议",
+    "incomingProtocolImap": "IMAP",
+    "incomingProtocolPop3": "POP3",
     "imapHost": "IMAP 服务器",
     "imapPort": "IMAP 端口",
+    "pop3Host": "POP3 服务器",
+    "pop3Port": "POP3 端口",
     "smtpHost": "SMTP 服务器",
     "smtpPort": "SMTP 端口",
     "username": "用户名",
@@ -471,7 +513,11 @@
     "namePlaceholder": "您的姓名",
     "discardTitle": "放弃更改？",
     "discardConfirm": "您的更改将会丢失，确定放弃吗？",
-    "accountAdded": "账户添加成功"
+    "accountAdded": "账户添加成功",
+    "acceptInvalidCerts": "允许无效的 TLS 证书",
+    "allowPlaintext": "允许不加密连接（不安全 —— 密码将以明文在网络上传输）",
+    "tlsCertificateVerification": "TLS 证书验证",
+    "verifyTlsCerts": "验证证书"
   },
   "commands": {
     "navigation": "导航",
@@ -626,7 +672,8 @@
   },
   "thread": {
     "title": "会话",
-    "to": "收件人："
+    "to": "收件人：",
+    "cc": "抄送："
   },
   "errorBoundary": {
     "title": "出了点问题",
@@ -659,6 +706,8 @@
     "unstar": "取消星标"
   },
   "messageDetail": {
-    "body": "邮件正文"
+    "body": "邮件正文",
+    "to": "收件人：",
+    "cc": "抄送："
   }
 }

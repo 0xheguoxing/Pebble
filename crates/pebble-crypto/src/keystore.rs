@@ -9,6 +9,26 @@ const DEK_LEN: usize = 32;
 
 pub struct KeyStore;
 
+trait DekCredential {
+    fn get_secret(&self) -> std::result::Result<Vec<u8>, keyring::Error>;
+    fn set_secret(&self, secret: &[u8]) -> std::result::Result<(), keyring::Error>;
+    fn delete_credential(&self) -> std::result::Result<(), keyring::Error>;
+}
+
+impl DekCredential for keyring::Entry {
+    fn get_secret(&self) -> std::result::Result<Vec<u8>, keyring::Error> {
+        keyring::Entry::get_secret(self)
+    }
+
+    fn set_secret(&self, secret: &[u8]) -> std::result::Result<(), keyring::Error> {
+        keyring::Entry::set_secret(self, secret)
+    }
+
+    fn delete_credential(&self) -> std::result::Result<(), keyring::Error> {
+        keyring::Entry::delete_credential(self)
+    }
+}
+
 impl KeyStore {
     /// Get or create the Data Encryption Key from the OS credential store.
     ///
@@ -19,44 +39,7 @@ impl KeyStore {
         let entry = keyring::Entry::new(SERVICE_NAME, KEY_ENTRY)
             .map_err(|e| PebbleError::Auth(format!("Keyring entry error: {e}")))?;
 
-        match entry.get_secret() {
-            Ok(secret) if secret.len() == DEK_LEN => {
-                // Legacy raw 32-byte DEK — migrate to hex encoding so the
-                // key can round-trip through string-based keychain backends.
-                let secret = Zeroizing::new(secret);
-                let mut key = Zeroizing::new([0u8; DEK_LEN]);
-                key.copy_from_slice(&secret);
-                let hex_key = Zeroizing::new(hex::encode(&key[..]));
-                if let Err(e) = entry.set_secret(hex_key.as_bytes()) {
-                    warn!("Failed to migrate legacy DEK to hex encoding: {e}");
-                }
-                return Ok(key);
-            }
-            Ok(hex_secret) => {
-                let hex_secret = Zeroizing::new(hex_secret);
-                if let Ok(key) = decode_hex(&hex_secret) {
-                    return Ok(key);
-                }
-                warn!(
-                    "DEK stored with unexpected format (len={}), regenerating",
-                    hex_secret.len()
-                );
-                let _ = entry.delete_credential();
-            }
-            Err(keyring::Error::NoEntry) => {
-                // expected first-run path
-            }
-            Err(e) => return Err(PebbleError::Auth(format!("Keyring read error: {e}"))),
-        }
-
-        info!("No usable DEK found, generating new one");
-        let mut key = Zeroizing::new([0u8; DEK_LEN]);
-        rand::thread_rng().fill_bytes(&mut *key);
-        let hex_key = Zeroizing::new(hex::encode(&key[..]));
-        entry
-            .set_secret(hex_key.as_bytes())
-            .map_err(|e| PebbleError::Auth(format!("Failed to store DEK: {e}")))?;
-        Ok(key)
+        get_or_create_dek_from_credential(&entry)
     }
 
     /// Delete the DEK from the OS credential store.
@@ -81,4 +64,168 @@ fn decode_hex(hex_data: &[u8]) -> std::result::Result<Zeroizing<[u8; DEK_LEN]>, 
     let mut key = Zeroizing::new([0u8; DEK_LEN]);
     key.copy_from_slice(&bytes);
     Ok(key)
+}
+
+fn get_or_create_dek_from_credential(
+    credential: &impl DekCredential,
+) -> Result<Zeroizing<[u8; DEK_LEN]>> {
+    match credential.get_secret() {
+        Ok(secret) => {
+            let secret = Zeroizing::new(secret);
+            if secret.len() == DEK_LEN {
+                let mut key = Zeroizing::new([0u8; DEK_LEN]);
+                key.copy_from_slice(&secret);
+                let hex_key = Zeroizing::new(hex::encode(&key[..]));
+                if let Err(error) = credential.set_secret(hex_key.as_bytes()) {
+                    warn!("Failed to migrate legacy DEK to hex encoding: {error}");
+                }
+                return Ok(key);
+            }
+
+            if let Ok(key) = decode_hex(&secret) {
+                return Ok(key);
+            }
+
+            warn!(
+                "Stored DEK has an invalid format (len={}); replacing it",
+                secret.len()
+            );
+            replace_dek(credential)
+        }
+        Err(keyring::Error::NoEntry) => {
+            info!("No DEK found, generating new one");
+            generate_and_store_dek(credential)
+        }
+        Err(e) => Err(PebbleError::Auth(format!("Keyring read error: {e}"))),
+    }
+}
+
+fn replace_dek(credential: &impl DekCredential) -> Result<Zeroizing<[u8; DEK_LEN]>> {
+    match credential.delete_credential() {
+        Ok(()) | Err(keyring::Error::NoEntry) => generate_and_store_dek(credential),
+        Err(e) => Err(PebbleError::Auth(format!(
+            "Failed to delete invalid DEK: {e}"
+        ))),
+    }
+}
+
+fn generate_and_store_dek(credential: &impl DekCredential) -> Result<Zeroizing<[u8; DEK_LEN]>> {
+    let mut key = Zeroizing::new([0u8; DEK_LEN]);
+    rand::thread_rng().fill_bytes(&mut *key);
+    let hex_key = Zeroizing::new(hex::encode(&key[..]));
+    credential
+        .set_secret(hex_key.as_bytes())
+        .map_err(|e| PebbleError::Auth(format!("Failed to store DEK: {e}")))?;
+    Ok(key)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    struct FakeCredential {
+        secret: RefCell<Option<Vec<u8>>>,
+        deletes: Cell<usize>,
+        writes: Cell<usize>,
+    }
+
+    impl FakeCredential {
+        fn with_secret(secret: Vec<u8>) -> Self {
+            Self {
+                secret: RefCell::new(Some(secret)),
+                deletes: Cell::new(0),
+                writes: Cell::new(0),
+            }
+        }
+
+        fn without_secret() -> Self {
+            Self {
+                secret: RefCell::new(None),
+                deletes: Cell::new(0),
+                writes: Cell::new(0),
+            }
+        }
+
+        fn stored_key(&self) -> Zeroizing<[u8; DEK_LEN]> {
+            decode_hex(self.secret.borrow().as_deref().unwrap()).unwrap()
+        }
+    }
+
+    impl DekCredential for FakeCredential {
+        fn get_secret(&self) -> std::result::Result<Vec<u8>, keyring::Error> {
+            self.secret.borrow().clone().ok_or(keyring::Error::NoEntry)
+        }
+
+        fn set_secret(&self, secret: &[u8]) -> std::result::Result<(), keyring::Error> {
+            self.writes.set(self.writes.get() + 1);
+            self.secret.borrow_mut().replace(secret.to_vec());
+            Ok(())
+        }
+
+        fn delete_credential(&self) -> std::result::Result<(), keyring::Error> {
+            self.deletes.set(self.deletes.get() + 1);
+            self.secret.borrow_mut().take();
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn invalid_stored_dek_is_replaced_with_new_hex_encoded_dek() {
+        let credential = FakeCredential::with_secret(vec![7u8; 50]);
+
+        let dek = get_or_create_dek_from_credential(&credential).unwrap();
+
+        assert_eq!(dek.len(), DEK_LEN);
+        assert_eq!(
+            credential.secret.borrow().as_ref().unwrap().len(),
+            DEK_LEN * 2
+        );
+        assert_eq!(&*credential.stored_key(), &*dek);
+        assert_eq!(credential.deletes.get(), 1);
+        assert_eq!(credential.writes.get(), 1);
+    }
+
+    #[test]
+    fn legacy_raw_dek_is_returned_and_migrated_to_hex() {
+        let raw_key: Vec<u8> = (0..DEK_LEN as u8).collect();
+        let credential = FakeCredential::with_secret(raw_key.clone());
+
+        let dek = get_or_create_dek_from_credential(&credential).unwrap();
+
+        assert_eq!(&dek[..], raw_key.as_slice());
+        assert_eq!(
+            credential.secret.borrow().as_deref().unwrap(),
+            hex::encode(raw_key).as_bytes()
+        );
+        assert_eq!(credential.deletes.get(), 0);
+        assert_eq!(credential.writes.get(), 1);
+    }
+
+    #[test]
+    fn valid_hex_dek_is_returned_without_rewriting() {
+        let raw_key = [0xa5; DEK_LEN];
+        let credential = FakeCredential::with_secret(hex::encode(raw_key).into_bytes());
+
+        let dek = get_or_create_dek_from_credential(&credential).unwrap();
+
+        assert_eq!(&*dek, &raw_key);
+        assert_eq!(credential.deletes.get(), 0);
+        assert_eq!(credential.writes.get(), 0);
+    }
+
+    #[test]
+    fn missing_dek_is_generated_and_stored_as_hex() {
+        let credential = FakeCredential::without_secret();
+
+        let dek = get_or_create_dek_from_credential(&credential).unwrap();
+
+        assert_eq!(
+            credential.secret.borrow().as_ref().unwrap().len(),
+            DEK_LEN * 2
+        );
+        assert_eq!(&*credential.stored_key(), &*dek);
+        assert_eq!(credential.deletes.get(), 0);
+        assert_eq!(credential.writes.get(), 1);
+    }
 }

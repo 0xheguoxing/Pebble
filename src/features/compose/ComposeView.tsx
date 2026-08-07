@@ -23,6 +23,7 @@ import { useToastStore } from "@/stores/toast.store";
 import type { Account } from "@/lib/ipc-types";
 import type { ComposeAttachment } from "./compose-draft";
 import { ModeButton, EditorToolbar, MarkdownToolbar, composeStyles } from "./ComposeToolbar";
+import { subjectAfterAddingAttachments } from "./attachment-subject";
 import { isValidEmailAddress, mergePendingRecipient } from "./recipient-utils";
 
 export default function ComposeView() {
@@ -101,6 +102,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
   const [attachments, setAttachments] = useState<ComposeAttachment[]>(() =>
     restoredDraft.current?.attachments ?? [],
   );
+  const attachmentsRef = useRef(attachments);
   const [isDragging, setIsDragging] = useState(false);
 
   const [editorReady, setEditorReady] = useState(false);
@@ -131,14 +133,39 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
     }
   }
 
+  function commitStagedAttachments(staged: ComposeAttachment[]) {
+    if (staged.length === 0) return;
+
+    const currentAttachments = attachmentsRef.current;
+    const nextAttachments = [...currentAttachments, ...staged];
+    attachmentsRef.current = nextAttachments;
+    setSubject((currentSubject) => subjectAfterAddingAttachments(
+      currentSubject,
+      currentAttachments.length,
+      staged.map((attachment) => attachment.name),
+    ));
+    setAttachments(nextAttachments);
+  }
+
+  function removeAttachment(attachmentToRemove: ComposeAttachment) {
+    const nextAttachments = attachmentsRef.current.filter(
+      (attachment) => attachment !== attachmentToRemove,
+    );
+    attachmentsRef.current = nextAttachments;
+    setAttachments(nextAttachments);
+  }
+
   async function stageAttachmentFiles(files: FileList | File[]) {
     const staged: ComposeAttachment[] = [];
-    for (const file of Array.from(files)) {
-      const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
-      const path = await stageComposeAttachment(file.name, bytes);
-      staged.push({ name: file.name, path, size: file.size });
+    try {
+      for (const file of Array.from(files)) {
+        const bytes = Array.from(new Uint8Array(await file.arrayBuffer()));
+        const path = await stageComposeAttachment(file.name, bytes);
+        staged.push({ name: file.name, path, size: file.size });
+      }
+    } finally {
+      commitStagedAttachments(staged);
     }
-    setAttachments((prev) => [...prev, ...staged]);
   }
 
   async function handleSaveTemplate() {
@@ -606,7 +633,7 @@ function ComposeViewInner({ accounts }: { accounts: Account[] }) {
                   </span>
                   <button
                     type="button"
-                    onClick={() => setAttachments((prev) => prev.filter((_, j) => j !== i))}
+                    onClick={() => removeAttachment(att)}
                     aria-label={t("compose.removeAttachment", "Remove attachment {{name}}", { name: att.name })}
                     title={t("compose.removeAttachment", "Remove attachment {{name}}", { name: att.name })}
                     style={{ border: "none", background: "none", cursor: "pointer", padding: "0 2px", color: "var(--color-text-secondary)" }}

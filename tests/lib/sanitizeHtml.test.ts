@@ -31,6 +31,15 @@ describe("sanitizeHtml", () => {
     expect(sanitized).toContain("color:");
   });
 
+  it("preserves safe border radius used by email cards", () => {
+    const sanitized = sanitizeHtml(
+      '<table style="border-radius:20px; background-color:#ffffff"><tbody><tr><td>Body</td></tr></tbody></table>',
+    );
+
+    expect(sanitized).toContain("border-radius:20px");
+    expect(sanitized).toContain("background-color:#ffffff");
+  });
+
   it("removes unsafe background shorthand urls", () => {
     const sanitized = sanitizeHtml(
       '<p style="background: url(https://evil.example/track); color: blue">Hello</p>',
@@ -71,6 +80,34 @@ describe("sanitizeHtml", () => {
     expect(sanitized).toContain("Visible body");
     expect(sanitized).not.toContain("Leaked subject");
     expect(sanitized).not.toContain("p{color:red}");
+  });
+
+  it("preserves backend-approved embedded style tags", () => {
+    const sanitized = sanitizeHtml(
+      '<style>.hero{color:red}</style><p class="hero">Visible body</p>',
+    );
+
+    expect(sanitized).toContain("<style>");
+    expect(sanitized).toContain(".hero{color:red}");
+    expect(sanitized).toContain('class="hero"');
+  });
+
+  it("preserves backend-approved stylesheet links", () => {
+    const sanitized = sanitizeHtml(
+      '<link rel="stylesheet" href="https://cdn.example.com/mail.css"><p>Visible body</p>',
+    );
+
+    expect(sanitized).toContain('rel="stylesheet"');
+    expect(sanitized).toContain('href="https://cdn.example.com/mail.css"');
+  });
+
+  it("removes non-stylesheet link tags", () => {
+    const sanitized = sanitizeHtml(
+      '<link rel="preload" href="https://cdn.example.com/mail.css"><p>Visible body</p>',
+    );
+
+    expect(sanitized).not.toContain("<link");
+    expect(sanitized).toContain("Visible body");
   });
 
   it("removes inline styles with escaped url tokens", () => {

@@ -1,6 +1,6 @@
 [package]
 name = "pebble-mail"
-version = "0.1.0"
+version = "0.1.3"
 edition = "2021"
 
 [dependencies]
@@ -16,6 +16,8 @@ tokio-rustls = { workspace = true }
 rustls = { workspace = true }
 webpki-roots = { workspace = true }
 mail-parser = { workspace = true }
+native-tls = { workspace = true }
+tokio-native-tls = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 utf7-imap = "0.3"

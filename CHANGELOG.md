@@ -6,6 +6,102 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-07-01
+
+### Added
+
+- Added an option to launch Pebble automatically when you sign in to your computer, under General settings → Startup Behavior (#64).
+- Added a per-account option to allow unencrypted (plaintext) IMAP/SMTP connections for legacy servers that only support plaintext, shown as an explicit opt-in with a security warning when a connection's security is set to "None" (#70).
+
+### Changed
+
+- Updated the desktop release metadata to version 0.1.3.
+
+### Fixed
+
+- Fixed some email links being shown with a literal `&amp;` (for example in password-reset URLs) by no longer double-escaping ampersands when auto-linking plain-text URLs (#68).
+- Fixed the account connection test reporting a false "passed" for accounts with a blank username: it now performs a real authenticated login, so authentication failures surface during testing instead of only after the account is added (#60).
+- Fixed the startup window background color and title-bar theme so the window matches the active theme immediately on launch.
+
+## [0.1.2] - 2026-06-15
+
+### Changed
+
+- Updated the desktop release metadata to version 0.1.2.
+
+### Fixed
+
+- Fixed DeepL and DeepLX translation always failing with a `400 "source_lang not supported"` error by omitting the source language field when auto-detection is requested (#65).
+- Fixed adding Outlook/Hotmail accounts: the username field is no longer required, and a blank username now defaults to the account email so app-password logins connect (#60).
+- Prevented duplicate messages from appearing in the destination mailbox when a move operation is retried after a partial COPY/EXPUNGE failure.
+- Prevented duplicate message rows from accumulating after a soft-delete followed by a re-sync, via a unique index on live `(account_id, remote_id)` rows.
+- Prevented newly-arrived messages from being permanently missing from search results due to a race between the startup background reindex and concurrent sync.
+- Preserved attachment filenames that were being altered on download and forwarding.
+- Registered Pebble as the Windows mail client in the registry before opening the default-apps settings so "set as default" works reliably.
+- Improved POP3 connectivity for legacy servers with a rustls→native-tls TLS backend fallback and optional TLS 1.0.
+- Synced the native window background color with the active theme on macOS.
+
+## [0.1.1] - 2026-06-03
+
+### Added
+
+- Added a tray preference to start Pebble hidden in the system tray at launch.
+- Added native macOS traffic-light window controls in the title bar for a platform-idiomatic close/minimize/maximize experience.
+- Added translation keyboard shortcuts, automatic settings backup, a default mail client preference, and a lightweight mode for the tray.
+- Added local settings backup file export/import for cross-platform migration without WebDAV.
+- Added optional encrypted WebDAV backup and restore for account passwords, OAuth tokens, and translation API keys.
+
+### Changed
+
+- Updated the desktop release metadata to version 0.1.1.
+
+### Fixed
+
+- Honored IMAP special-use folder attributes so the Trash, Sent, Drafts, Junk, and Archive flags reported by servers map to the expected local folders.
+- Preserved email HTML container styles (such as `html`, `body`, and wrapper element rules) so sanitized messages keep their original layout.
+- Stripped HTML and CSS from email preview snippets so list rows show clean plain-text previews instead of markup.
+- Stopped retrying permanent authentication errors for pending mail operations, surfaced clearer status, and allowed dismissing failed operations from settings.
+- Added missing English and Chinese translations for the new automatic backup, default mail client, and pending operations controls.
+- Surfaced translation keyboard shortcuts in the settings page and fixed the wallpaper mode settings background rendering.
+
+## [0.1.0] - 2026-05-28
+
+### Added
+
+- Added POP3 account support, including account setup, sync, provider dispatch, folder/message operations, and backup/restore metadata handling.
+- Added an account-level option to allow invalid TLS certificates for IMAP and SMTP connections, including connection testing and settings UI support.
+
+### Changed
+
+- Updated the desktop release metadata to version 0.1.0.
+
+### Fixed
+
+- Recovered from invalid stored data-encryption keys by replacing malformed keyring entries instead of failing startup.
+- Avoided repeated IMAP incremental fetches by checking UIDNEXT and searching for UIDs newer than the local cursor before fetching message bodies.
+- Fixed TLS certificate policy localization in English and Chinese.
+- Disabled WebKitGTK accelerated compositing for Linux AppImage launches when the user has not set `WEBKIT_DISABLE_COMPOSITING_MODE`, working around Wayland/Hyprland repaint stalls where the UI only updates after resizing.
+
+## [0.0.9] - 2026-05-23
+
+### Added
+
+- Added Pebble Web self-hosted edition information to the public site and README documentation.
+- Added Arch Linux AUR installation instructions.
+
+### Changed
+
+- Expanded release automation to build and upload Windows, macOS, and Linux packages from tagged releases.
+- Improved Linux package build handling and form focus-visible styling.
+
+### Fixed
+
+- Added `native-tls` fallback for IMAP TLS and STARTTLS connections when servers only offer DHE cipher suites unsupported by `rustls`, including `imap.sina.cn`.
+- Improved email CSS rendering by preserving embedded styles in relaxed mode and allowing remote stylesheets in unrestricted or trusted-sender modes.
+- Removed an overly strict home-directory check that could block attachment downloads.
+- Hid the compose floating action button while reading message details.
+- Fixed sidebar view switching so repeated navigation cannot get stuck on stale UI state.
+
 ## [0.0.8] - 2026-05-16
 
 ### Added
@@ -181,7 +277,12 @@ This release includes:
 - Windows installers are not code-signed yet, so Windows SmartScreen may show a warning.
 - Outlook support is still experimental and depends on Microsoft Graph permissions configured by the user.
 
-[Unreleased]: https://github.com/QingJ01/Pebble/compare/v0.0.8...HEAD
+[Unreleased]: https://github.com/QingJ01/Pebble/compare/v0.1.3...HEAD
+[0.1.3]: https://github.com/QingJ01/Pebble/compare/v0.1.2...v0.1.3
+[0.1.2]: https://github.com/QingJ01/Pebble/compare/v0.1.1...v0.1.2
+[0.1.1]: https://github.com/QingJ01/Pebble/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/QingJ01/Pebble/compare/v0.0.9...v0.1.0
+[0.0.9]: https://github.com/QingJ01/Pebble/compare/v0.0.8...v0.0.9
 [0.0.8]: https://github.com/QingJ01/Pebble/compare/v0.0.7...v0.0.8
 [0.0.7]: https://github.com/QingJ01/Pebble/compare/v0.0.6...v0.0.7
 [0.0.6]: https://github.com/QingJ01/Pebble/compare/v0.0.5...v0.0.6

@@ -364,8 +364,12 @@ mod tests {
             let request_head = String::from_utf8_lossy(&request);
             let content_length = request_head
                 .lines()
-                .find_map(|line| line.strip_prefix("content-length: "))
-                .and_then(|value| value.parse::<usize>().ok())
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
                 .unwrap_or(0);
             let header_end = request
                 .windows(4)
@@ -420,7 +424,13 @@ mod tests {
             !request.contains("client_secret"),
             "public client token exchange must not send an empty client_secret"
         );
-        assert!(request.contains("client_id=public-client-id"));
-        assert!(request.contains("code_verifier=verifier"));
+        assert!(
+            request.contains("client_id=public-client-id"),
+            "public client token exchange request omitted client_id: {request}"
+        );
+        assert!(
+            request.contains("code_verifier=verifier"),
+            "public client token exchange request omitted PKCE verifier: {request}"
+        );
     }
 }

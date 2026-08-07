@@ -1,6 +1,11 @@
-import { useCallback, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { showTestNotification } from "@/lib/api";
+import {
+  showTestNotification,
+  openDefaultMailSettings,
+  getAutostartEnabled,
+  setAutostartEnabled,
+} from "@/lib/api";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore, type RealtimePreference } from "@/stores/ui.store";
 
@@ -51,6 +56,8 @@ export default function GeneralTab() {
   const setNotificationsEnabled = useUIStore((s) => s.setNotificationsEnabled);
   const keepRunningInBackground = useUIStore((s) => s.keepRunningInBackground);
   const setKeepRunningInBackground = useUIStore((s) => s.setKeepRunningInBackground);
+  const startHiddenToTray = useUIStore((s) => s.startHiddenToTray);
+  const setStartHiddenToTray = useUIStore((s) => s.setStartHiddenToTray);
 
   const toggleNotifications = useCallback(() => {
     setNotificationsEnabled(!notificationsEnabled);
@@ -78,6 +85,42 @@ export default function GeneralTab() {
   const toggleQuitOnClose = useCallback(() => {
     setKeepRunningInBackground(quitOnClose);
   }, [quitOnClose, setKeepRunningInBackground]);
+
+  const toggleStartHiddenToTray = useCallback(() => {
+    setStartHiddenToTray(!startHiddenToTray);
+  }, [setStartHiddenToTray, startHiddenToTray]);
+
+  // Launch-at-startup state lives in the OS (registry / LaunchAgent / .desktop),
+  // not in app storage, so read the real value from the backend on mount.
+  const [launchAtStartup, setLaunchAtStartup] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    getAutostartEnabled()
+      .then((enabled) => {
+        if (active) setLaunchAtStartup(enabled);
+      })
+      .catch((err) => {
+        console.warn("Failed to read launch-at-startup state", err);
+      });
+    return () => {
+      active = false;
+    };
+  }, []);
+
+  const toggleLaunchAtStartup = useCallback(async () => {
+    const next = !launchAtStartup;
+    setLaunchAtStartup(next); // optimistic; revert below if the OS rejects it
+    try {
+      await setAutostartEnabled(next);
+    } catch {
+      setLaunchAtStartup(!next);
+      addToast({
+        message: t("settings.autostartFailed", "Failed to update launch at startup"),
+        type: "error",
+      });
+    }
+  }, [launchAtStartup, addToast, t]);
 
   const showUnreadCount = useUIStore((s) => s.showFolderUnreadCount);
   const setShowUnreadCount = useUIStore((s) => s.setShowFolderUnreadCount);
@@ -170,6 +213,45 @@ export default function GeneralTab() {
       </button>
 
       <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
+        {t("settings.startupBehavior", "Startup Behavior")}
+      </h3>
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          cursor: "pointer",
+          fontSize: "13px",
+          color: "var(--color-text-primary)",
+          marginBottom: "10px",
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={launchAtStartup}
+          onChange={toggleLaunchAtStartup}
+        />
+        <span>{t("settings.launchAtStartup", "Launch Pebble at system startup")}</span>
+      </label>
+      <label
+        style={{
+          display: "flex",
+          alignItems: "center",
+          gap: "8px",
+          cursor: "pointer",
+          fontSize: "13px",
+          color: "var(--color-text-primary)",
+        }}
+      >
+        <input
+          type="checkbox"
+          checked={startHiddenToTray}
+          onChange={toggleStartHiddenToTray}
+        />
+        <span>{t("settings.startHiddenToTray", "Start hidden to tray")}</span>
+      </label>
+
+      <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
         {t("settings.closeBehavior", "Close Behavior")}
       </h3>
       <label
@@ -210,6 +292,33 @@ export default function GeneralTab() {
         />
         <span>{t("settings.showUnreadCount", "Show unread count badges in sidebar")}</span>
       </label>
+
+      {navigator.userAgent.includes("Windows") && (
+        <>
+          <h3 style={{ fontSize: "14px", fontWeight: 600, marginBottom: "16px", marginTop: "32px" }}>
+            {t("settings.defaultMailClient", "Default Email Client")}
+          </h3>
+          <button
+            type="button"
+            onClick={() => openDefaultMailSettings()}
+            style={{
+              padding: "8px 18px",
+              fontSize: "13px",
+              fontWeight: 500,
+              border: "1px solid var(--color-border)",
+              borderRadius: "6px",
+              cursor: "pointer",
+              background: "var(--color-bg-secondary)",
+              color: "var(--color-text-primary)",
+            }}
+          >
+            {t("settings.setDefaultMailClient", "Set Pebble as default email app")}
+          </button>
+          <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", marginTop: "6px" }}>
+            {t("settings.setDefaultMailClientHint", "Opens Windows Default Apps settings where you can select Pebble for email.")}
+          </p>
+        </>
+      )}
     </div>
   );
 }
