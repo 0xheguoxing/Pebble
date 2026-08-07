@@ -1,7 +1,7 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ComposeView from "../../../src/features/compose/ComposeView";
-import { deleteDraft } from "../../../src/lib/api";
+import { deleteDraft, stageComposeAttachment } from "../../../src/lib/api";
 
 const mocks = vi.hoisted(() => ({
   mutate: vi.fn(),
@@ -172,7 +172,16 @@ vi.mock("../../../src/stores/toast.store", () => ({
 
 vi.mock("../../../src/lib/api", () => ({
   deleteDraft: vi.fn(),
+  stageComposeAttachment: vi.fn(),
 }));
+
+function attachmentFile(name: string, contents = name): File {
+  const file = new File([contents], name);
+  Object.defineProperty(file, "arrayBuffer", {
+    value: vi.fn().mockResolvedValue(new TextEncoder().encode(contents).buffer),
+  });
+  return file;
+}
 
 describe("ComposeView", () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
@@ -190,6 +199,8 @@ describe("ComposeView", () => {
     mocks.recipients.bcc = [];
     mocks.loadDraftFromStorage.mockReturnValue(null);
     vi.mocked(deleteDraft).mockReset();
+    vi.mocked(stageComposeAttachment).mockReset();
+    vi.mocked(stageComposeAttachment).mockImplementation(async (filename) => `staged/${filename}`);
   });
 
   afterEach(() => {
@@ -247,5 +258,67 @@ describe("ComposeView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show quoted message" }));
 
     expect(screen.getByText("Original message body")).toBeTruthy();
+  });
+
+  it("uses the first attached filename as an empty subject", async () => {
+    render(<ComposeView />);
+
+    const first = attachmentFile("季度报告.pdf", "quarterly results");
+    const second = attachmentFile("supporting-data.xlsx", "supporting data");
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    fireEvent.change(fileInput!, { target: { files: [first, second] } });
+
+    await waitFor(() => expect(vi.mocked(stageComposeAttachment)).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect((screen.getByLabelText("Subject") as HTMLInputElement).value)
+      .toBe("季度报告.pdf"));
+  });
+
+  it("does not let a later concurrent attachment refill a subject the user cleared", async () => {
+    let resolveFirst!: (path: string) => void;
+    let resolveSecond!: (path: string) => void;
+    vi.mocked(stageComposeAttachment).mockImplementation((filename) => new Promise((resolve) => {
+      if (filename === "first.pdf") resolveFirst = resolve;
+      if (filename === "second.pdf") resolveSecond = resolve;
+    }));
+
+    render(<ComposeView />);
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    const subjectInput = screen.getByLabelText("Subject") as HTMLInputElement;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("first.pdf")] } });
+    await waitFor(() => expect(stageComposeAttachment).toHaveBeenCalledWith("first.pdf", expect.any(Array)));
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("second.pdf")] } });
+    await waitFor(() => expect(stageComposeAttachment).toHaveBeenCalledWith("second.pdf", expect.any(Array)));
+
+    await act(async () => resolveFirst("staged/first.pdf"));
+    await waitFor(() => expect(subjectInput.value).toBe("first.pdf"));
+    fireEvent.change(subjectInput, { target: { value: "" } });
+
+    await act(async () => resolveSecond("staged/second.pdf"));
+    await waitFor(() => expect(screen.getByText("second.pdf")).toBeTruthy());
+    expect(subjectInput.value).toBe("");
+  });
+
+  it("keeps successfully staged files when a later file in the batch fails", async () => {
+    vi.mocked(stageComposeAttachment)
+      .mockResolvedValueOnce("staged/first.pdf")
+      .mockRejectedValueOnce(new Error("staging failed"));
+
+    render(<ComposeView />);
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    fireEvent.change(fileInput!, {
+      target: { files: [attachmentFile("first.pdf"), attachmentFile("broken.pdf")] },
+    });
+
+    await waitFor(() => expect(screen.getByText("first.pdf")).toBeTruthy());
+    expect(screen.queryByText("broken.pdf")).toBeNull();
+    expect((screen.getByLabelText("Subject") as HTMLInputElement).value).toBe("first.pdf");
+    expect(screen.getByRole("alert").textContent).toContain("Failed to attach file");
   });
 });
