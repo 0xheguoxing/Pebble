@@ -330,6 +330,7 @@ export interface BackupPreview {
   rule_count: number;
   kanban_card_count: number;
   kanban_note_count: number;
+  contact_count: number;
   has_translate_config: boolean;
   has_encrypted_secrets: boolean;
   secret_account_count: number;

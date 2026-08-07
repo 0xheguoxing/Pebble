@@ -305,6 +305,78 @@ pub(crate) fn save_contact_with_conn(conn: &Connection, input: &ContactInput) ->
         .ok_or_else(|| PebbleError::Internal("Saved contact could not be loaded".to_string()))
 }
 
+pub(crate) fn replace_contacts_with_conn(conn: &Connection, contacts: &[Contact]) -> Result<()> {
+    conn.execute("DELETE FROM contacts", [])?;
+
+    for contact in contacts {
+        if contact.id.trim().is_empty() {
+            return Err(PebbleError::Validation(
+                "Restored contact id must not be empty".to_string(),
+            ));
+        }
+        if contact
+            .emails
+            .iter()
+            .any(|email| email.id.trim().is_empty())
+        {
+            return Err(PebbleError::Validation(
+                "Restored contact email id must not be empty".to_string(),
+            ));
+        }
+
+        let input = ContactInput {
+            id: Some(contact.id.clone()),
+            display_name: contact.display_name.clone(),
+            notes: contact.notes.clone(),
+            is_favorite: contact.is_favorite,
+            emails: contact
+                .emails
+                .iter()
+                .map(|email| ContactEmailInput {
+                    id: Some(email.id.clone()),
+                    address: email.address.clone(),
+                    label: email.label.clone(),
+                    is_primary: email.is_primary,
+                })
+                .collect(),
+        };
+        let prepared_emails = validate_contact_input(&input)?;
+
+        conn.execute(
+            "INSERT INTO contacts
+                (id, display_name, notes, is_favorite, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                contact.id,
+                contact.display_name.trim(),
+                contact.notes.trim(),
+                contact.is_favorite,
+                contact.created_at,
+                contact.updated_at
+            ],
+        )?;
+
+        for (email, (address, normalized)) in contact.emails.iter().zip(prepared_emails) {
+            conn.execute(
+                "INSERT INTO contact_emails
+                    (id, contact_id, address, normalized_address, label, is_primary, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    email.id,
+                    contact.id,
+                    address,
+                    normalized,
+                    contact_label_to_str(&email.label),
+                    email.is_primary,
+                    contact.created_at
+                ],
+            )?;
+        }
+    }
+
+    Ok(())
+}
+
 impl Store {
     pub fn save_contact(&self, input: &ContactInput) -> Result<Contact> {
         self.with_write(|conn| {
