@@ -21,6 +21,20 @@ export function tauriBuildArgsForPlatform(platform = process.platform, extraArgs
   return ["tauri", "build", "--bundles", bundleTargetsForPlatform(platform), ...extraArgs];
 }
 
+export function tauriBuildEnvironmentForPlatform(
+  platform = process.platform,
+  environment = process.env,
+) {
+  if (platform !== "linux") {
+    return environment;
+  }
+
+  return {
+    ...environment,
+    NO_STRIP: environment.NO_STRIP ?? "1",
+  };
+}
+
 function isEntrypoint() {
   return process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 }
@@ -37,6 +51,7 @@ if (isEntrypoint()) {
   const result = spawnSync("pnpm", args, {
     stdio: "inherit",
     shell: process.platform === "win32",
+    env: tauriBuildEnvironmentForPlatform(),
   });
 
   process.exit(result.status ?? 1);
