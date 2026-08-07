@@ -6,6 +6,30 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-08-08
+
+### Added
+
+- Added custom and portable profile directories, including environment-variable, pointer-file, and executable-adjacent portable modes with profile-scoped frontend storage.
+- Added CC recipient display and selectable IMAP sync folders; re-enabling a folder now backfills its complete message history (#74, #82).
+- Added automatic compose subjects derived from the first attachment when the subject is otherwise empty.
+
+### Changed
+
+- Updated the desktop release metadata to version 0.1.4.
+- Stored data-encryption keys in a keychain-safe hexadecimal format, with automatic migration and zeroization for legacy binary secrets (#22).
+- Improved Linux AppImage startup by preferring Wayland when available while retaining X11 fallback, respecting explicit user configuration, and disabling binary stripping for release bundles.
+
+### Fixed
+
+- Fixed Outlook account setup so mailbox identity is resolved from Microsoft Graph without trusting incomplete local profile data.
+- Hardened Gmail, Outlook, IMAP, and POP3 synchronization against UIDVALIDITY changes, stale cursors, pagination loops, attachment failures, duplicate provider IDs, and interrupted indexing or database commits.
+- Made outgoing mail crash-safe by persisting the message, attachments, and send state before dispatch; uncertain outcomes are never retried automatically, API-provider placeholders are removed after confirmation, and SMTP copies move atomically to Sent.
+- Made attachment downloads, draft replacement, trash deletion, and pending remote operations transactional and idempotent, including recovery after restarts and already-absent remote messages.
+- Bound encrypted records to their storage identity with authenticated encryption, migrated legacy ciphertext safely, and prevented proxy, tracker, signature, template, and cloud-setting state from leaking across records or racing with user updates.
+- Fixed compose attachment staging, autosave retries, Strict Mode lifecycle handling, rapid realtime preference changes, and several confirmation, selection, accessibility, and starred-message UI races.
+- Hardened tagged release automation against unsafe tag interpolation, incomplete artifact sets, concurrent publication, and accidental overwrites of existing GitHub Releases.
+
 ## [0.1.3] - 2026-07-01
 
 ### Added
@@ -277,7 +301,8 @@ This release includes:
 - Windows installers are not code-signed yet, so Windows SmartScreen may show a warning.
 - Outlook support is still experimental and depends on Microsoft Graph permissions configured by the user.
 
-[Unreleased]: https://github.com/QingJ01/Pebble/compare/v0.1.3...HEAD
+[Unreleased]: https://github.com/QingJ01/Pebble/compare/v0.1.4...HEAD
+[0.1.4]: https://github.com/QingJ01/Pebble/compare/v0.1.3...v0.1.4
 [0.1.3]: https://github.com/QingJ01/Pebble/compare/v0.1.2...v0.1.3
 [0.1.2]: https://github.com/QingJ01/Pebble/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/QingJ01/Pebble/compare/v0.1.0...v0.1.1
