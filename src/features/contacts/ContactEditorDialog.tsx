@@ -13,6 +13,7 @@ import { fieldGroupStyle, inputStyle, labelStyle } from "@/styles/form";
 
 interface ContactEditorDialogProps {
   contact: Contact | null;
+  initialValue?: { displayName?: string | null; address: string };
   onClose: () => void;
   onSave: (input: ContactInput) => Promise<void>;
 }
@@ -23,11 +24,11 @@ interface DraftEmail extends ContactEmailInput {
 
 let draftEmailId = 0;
 
-function makeDraftEmail(email?: Contact["emails"][number]): DraftEmail {
+function makeDraftEmail(email?: Contact["emails"][number], initialAddress = ""): DraftEmail {
   return {
     key: email?.id ?? `new-email-${++draftEmailId}`,
     id: email?.id,
-    address: email?.address ?? "",
+    address: email?.address ?? initialAddress,
     label: email?.label ?? "work",
     is_primary: email?.is_primary ?? true,
   };
@@ -35,16 +36,21 @@ function makeDraftEmail(email?: Contact["emails"][number]): DraftEmail {
 
 export default function ContactEditorDialog({
   contact,
+  initialValue,
   onClose,
   onSave,
 }: ContactEditorDialogProps) {
   const { t } = useTranslation();
   const nameRef = useRef<HTMLInputElement>(null);
-  const [displayName, setDisplayName] = useState(contact?.display_name ?? "");
+  const [displayName, setDisplayName] = useState(
+    contact?.display_name ?? initialValue?.displayName ?? "",
+  );
   const [notes, setNotes] = useState(contact?.notes ?? "");
   const [isFavorite, setIsFavorite] = useState(contact?.is_favorite ?? false);
   const [emails, setEmails] = useState<DraftEmail[]>(
-    contact?.emails.length ? contact.emails.map(makeDraftEmail) : [makeDraftEmail()],
+    contact?.emails.length
+      ? contact.emails.map((email) => makeDraftEmail(email))
+      : [makeDraftEmail(undefined, initialValue?.address ?? "")],
   );
   const [error, setError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);

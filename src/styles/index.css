@@ -1451,6 +1451,32 @@ textarea:focus-visible {
   transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease, opacity 0.14s ease;
 }
 
+.contact-address-action {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 25px;
+  height: 25px;
+  padding: 0;
+  border: 1px solid var(--color-border);
+  border-radius: 5px;
+  background: var(--color-bg);
+  color: var(--color-text-secondary);
+  cursor: pointer;
+  transition: background-color 0.14s ease, border-color 0.14s ease, color 0.14s ease;
+}
+
+.contact-address-action:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--color-accent) 28%, var(--color-border));
+  background: color-mix(in srgb, var(--color-accent) 7%, var(--color-bg));
+  color: var(--color-accent);
+}
+
+.contact-address-action:disabled {
+  cursor: default;
+  opacity: 0.42;
+}
+
 .contact-primary-button,
 .contact-secondary-button,
 .contact-danger-button {

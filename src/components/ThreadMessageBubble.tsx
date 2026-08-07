@@ -6,6 +6,7 @@ import type { Message, RenderedHtml } from "@/lib/api";
 import { defaultPrivacyMode } from "@/lib/privacyMode";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
 import { ShadowDomEmail } from "./ShadowDomEmail";
+import ContactAddressAction from "./ContactAddressAction";
 
 interface Props {
   message: Message;
@@ -82,6 +83,32 @@ export default function ThreadMessageBubble({ message, defaultExpanded = false }
                 {t("thread.cc", "Cc:")} {message.cc_list.map((r: { address: string }) => r.address).join(", ")}
               </div>
             )}
+            <div
+              aria-label={t("contacts.participantActions", "Contact actions")}
+              style={{ display: "flex", alignItems: "center", gap: "3px", marginTop: "5px" }}
+            >
+              <ContactAddressAction
+                accountId={message.account_id}
+                name={message.from_name}
+                address={message.from_address}
+              />
+              {message.to_list.map((recipient) => (
+                <ContactAddressAction
+                  key={`to-${recipient.address}`}
+                  accountId={message.account_id}
+                  name={recipient.name}
+                  address={recipient.address}
+                />
+              ))}
+              {message.cc_list.map((recipient) => (
+                <ContactAddressAction
+                  key={`cc-${recipient.address}`}
+                  accountId={message.account_id}
+                  name={recipient.name}
+                  address={recipient.address}
+                />
+              ))}
+            </div>
           </div>
           {/* Body content */}
           {rendered?.html ? (

@@ -22,6 +22,12 @@ vi.mock("../../src/components/ShadowDomEmail", () => ({
   ShadowDomEmail: ({ html }: { html: string }) => <div>{html}</div>,
 }));
 
+vi.mock("../../src/components/ContactAddressAction", () => ({
+  default: ({ address }: { address: string }) => (
+    <span data-testid="contact-address-action">{address}</span>
+  ),
+}));
+
 const message: Message = {
   id: "message-1",
   account_id: "account-1",
@@ -66,5 +72,11 @@ describe("ThreadMessageBubble", () => {
     await waitFor(() => {
       expect(getRenderedHtml).toHaveBeenCalledWith("message-1", "LoadOnce");
     });
+  });
+
+  it("offers contact actions for expanded message participants", () => {
+    render(<ThreadMessageBubble message={message} defaultExpanded />);
+
+    expect(document.querySelectorAll("[data-testid='contact-address-action']")).toHaveLength(3);
   });
 });

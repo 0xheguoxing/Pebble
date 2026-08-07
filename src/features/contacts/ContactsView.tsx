@@ -17,6 +17,7 @@ import { extractErrorMessage } from "@/lib/extractErrorMessage";
 import { useComposeStore } from "@/stores/compose.store";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { useToastStore } from "@/stores/toast.store";
+import { useUIStore } from "@/stores/ui.store";
 import ContactEditorDialog from "./ContactEditorDialog";
 import ContactListItem from "./ContactListItem";
 
@@ -42,6 +43,8 @@ export default function ContactsView() {
   const { save, remove, setFavorite } = useContactMutations();
   const addToast = useToastStore((state) => state.addToast);
   const confirm = useConfirmStore((state) => state.confirm);
+  const pendingContactId = useUIStore((state) => state.pendingContactId);
+  const clearPendingContact = useUIStore((state) => state.clearPendingContact);
 
   const selectedContact = useMemo(
     () => contacts.find((contact) => contact.id === selectedId) ?? null,
@@ -53,6 +56,14 @@ export default function ContactsView() {
       setSelectedId(null);
     }
   }, [contacts, selectedId]);
+
+  useEffect(() => {
+    if (!pendingContactId) return;
+    if (contacts.some((contact) => contact.id === pendingContactId)) {
+      setSelectedId(pendingContactId);
+      clearPendingContact();
+    }
+  }, [clearPendingContact, contacts, pendingContactId]);
 
   const handleSave = async (input: ContactInput) => {
     const saved = await save.mutateAsync(input);
