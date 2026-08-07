@@ -1,6 +1,13 @@
 import { useState, useRef, useEffect, useCallback, useId } from "react";
 import { useTranslation } from "react-i18next";
-import { searchContacts, type KnownContact } from "@/lib/api";
+import { X } from "lucide-react";
+import {
+  searchContactSuggestions,
+  suppressContactSuggestion,
+  type ContactSuggestion,
+} from "@/lib/api";
+import { queryClient } from "@/lib/query-client";
+import { contactSuggestionsQueryRoot } from "@/hooks/queries";
 import { useToastStore } from "@/stores/toast.store";
 import { isValidEmailAddress } from "@/features/compose/recipient-utils";
 
@@ -33,7 +40,7 @@ export default function ContactAutocomplete({
   const instanceId = useId();
   const [uncontrolledInputValue, setUncontrolledInputValue] = useState("");
   const inputValue = controlledInputValue ?? uncontrolledInputValue;
-  const [suggestions, setSuggestions] = useState<KnownContact[]>([]);
+  const [suggestions, setSuggestions] = useState<ContactSuggestion[]>([]);
   const [showDropdown, setShowDropdown] = useState(false);
   const [activeIndex, setActiveIndex] = useState(-1);
   const [loading, setLoading] = useState(false);
@@ -60,10 +67,10 @@ export default function ContactAutocomplete({
       }
       setLoading(true);
       try {
-        const results = await searchContacts(accountId, query, 10);
-        // Filter out already-selected addresses
+        const results = await searchContactSuggestions(accountId, query, 10);
+        const selectedAddresses = new Set(value.map((address) => address.trim().toLowerCase()));
         const filtered = results.filter(
-          (c) => !value.includes(c.address),
+          (contact) => !selectedAddresses.has(contact.address.trim().toLowerCase()),
         );
         setSuggestions(filtered);
         setShowDropdown(filtered.length > 0);
@@ -86,8 +93,9 @@ export default function ContactAutocomplete({
     }, 200);
   };
 
-  const selectContact = (contact: KnownContact) => {
-    if (!value.includes(contact.address)) {
+  const selectContact = (contact: ContactSuggestion) => {
+    const normalized = contact.address.trim().toLowerCase();
+    if (!value.some((address) => address.trim().toLowerCase() === normalized)) {
       onChange([...value, contact.address]);
     }
     setInputValue("");
@@ -100,7 +108,9 @@ export default function ContactAutocomplete({
   const addRawAddress = (text: string) => {
     const trimmed = text.trim();
     if (!trimmed) { setInputValue(""); return; }
-    if (isValidEmailAddress(trimmed) && !value.includes(trimmed)) {
+    if (isValidEmailAddress(trimmed) && !value.some(
+      (address) => address.trim().toLowerCase() === trimmed.toLowerCase(),
+    )) {
       onChange([...value, trimmed]);
     } else if (!isValidEmailAddress(trimmed)) {
       useToastStore.getState().addToast({
@@ -116,6 +126,31 @@ export default function ContactAutocomplete({
   const removeChip = (address: string) => {
     onChange(value.filter((a) => a !== address));
     inputRef.current?.focus();
+  };
+
+  const removeSuggestion = async (
+    event: React.MouseEvent<HTMLButtonElement>,
+    contact: ContactSuggestion,
+  ) => {
+    event.preventDefault();
+    event.stopPropagation();
+    try {
+      await suppressContactSuggestion(contact.address);
+      setSuggestions((current) => {
+        const next = current.filter((item) => (
+          item.address.trim().toLowerCase() !== contact.address.trim().toLowerCase()
+        ));
+        if (next.length === 0) setShowDropdown(false);
+        return next;
+      });
+      setActiveIndex(-1);
+      await queryClient.invalidateQueries({ queryKey: contactSuggestionsQueryRoot });
+    } catch {
+      useToastStore.getState().addToast({
+        message: t("compose.removeSuggestionFailed", "Failed to remove suggestion"),
+        type: "error",
+      });
+    }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -218,6 +253,7 @@ export default function ContactAutocomplete({
           >
             {addr}
             <button
+              type="button"
               onClick={(e) => {
                 e.stopPropagation();
                 removeChip(addr);
@@ -233,7 +269,7 @@ export default function ContactAutocomplete({
               }}
               aria-label={t("common.remove")}
             >
-              ×
+              <X size={11} aria-hidden="true" />
             </button>
           </span>
         ))}
@@ -315,11 +351,15 @@ export default function ContactAutocomplete({
                 key={contact.address}
                 role="option"
                 id={`${instanceId}-option-${idx}`}
+                aria-label={`${contact.name ?? contact.address} ${contact.address}`}
                 aria-selected={idx === activeIndex}
                 onClick={() => selectContact(contact)}
                 onMouseEnter={() => setActiveIndex(idx)}
                 style={{
-                  padding: "6px 12px",
+                  display: "flex",
+                  alignItems: "center",
+                  gap: "10px",
+                  padding: "7px 9px 7px 12px",
                   cursor: "pointer",
                   backgroundColor:
                     idx === activeIndex
@@ -328,24 +368,62 @@ export default function ContactAutocomplete({
                   fontSize: "13px",
                 }}
               >
-                {contact.name && (
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  {contact.name && (
+                    <div
+                      style={{
+                        color: "var(--color-text-primary)",
+                        fontWeight: 500,
+                      }}
+                    >
+                      {highlightMatch(contact.name, inputValue)}
+                    </div>
+                  )}
                   <div
                     style={{
-                      color: "var(--color-text-primary)",
-                      fontWeight: 500,
+                      color: "var(--color-text-secondary)",
+                      fontSize: "12px",
                     }}
                   >
-                    {highlightMatch(contact.name, inputValue)}
+                    {highlightMatch(contact.address, inputValue)}
                   </div>
-                )}
-                <div
+                </div>
+                <span
                   style={{
-                    color: "var(--color-text-secondary)",
-                    fontSize: "12px",
+                    flex: "0 0 auto",
+                    color: contact.source === "saved"
+                      ? "var(--color-accent)"
+                      : "var(--color-text-secondary)",
+                    fontSize: "10px",
+                    fontWeight: 600,
                   }}
                 >
-                  {highlightMatch(contact.address, inputValue)}
-                </div>
+                  {contact.source === "saved"
+                    ? t("compose.savedContact", "Saved contact")
+                    : t("compose.recentContact", "Recent")}
+                </span>
+                {contact.source === "recent" && (
+                  <button
+                    type="button"
+                    aria-label={`${t("compose.removeSuggestion", "Remove suggestion")} ${contact.address}`}
+                    onClick={(event) => removeSuggestion(event, contact)}
+                    style={{
+                      display: "inline-flex",
+                      alignItems: "center",
+                      justifyContent: "center",
+                      width: "26px",
+                      height: "26px",
+                      padding: 0,
+                      border: 0,
+                      borderRadius: "5px",
+                      background: "transparent",
+                      color: "var(--color-text-secondary)",
+                      cursor: "pointer",
+                    }}
+                  >
+                    <X size={13} aria-hidden="true" />
+                  </button>
+                )}
               </div>
             ))
           )}
