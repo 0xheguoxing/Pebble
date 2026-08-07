@@ -61,12 +61,15 @@ Pebble currently supports Gmail, IMAP, POP3, and experimental Outlook accounts.
 
 ### Productivity tools
 
+- Local address book with search, favorites, notes, multiple labeled email addresses, and one-click contact actions from message participants.
+- Recipient autocomplete that prioritizes saved contacts and falls back to recent correspondents.
+- vCard (`.vcf`) import and export for moving contacts between Pebble and other address books.
 - Kanban board with Todo, Waiting, and Done columns.
 - Command palette and keyboard-first navigation.
 - Built-in translation providers with bilingual reading and customizable shortcuts (`T` to translate selection, `Ctrl+Shift+T` to toggle bilingual view).
 - Dark and light themes with wallpaper background support.
 - English and Chinese UI.
-- Optional local file export/import and WebDAV backup for settings, rules, Kanban cards, Kanban notes, and separately encrypted account secrets.
+- Optional local file export/import and WebDAV backup for contacts, settings, rules, Kanban cards, Kanban notes, and separately encrypted account secrets.
 - Automatic scheduled WebDAV backup with configurable interval.
 
 ### Platform integration

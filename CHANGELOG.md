@@ -6,6 +6,13 @@ The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and
 
 ## [Unreleased]
 
+### Added
+
+- Added a local address book with searchable contacts, multiple labeled email addresses, favorites, notes, and quick create/edit actions from message participants (#81).
+- Added recipient suggestions that prioritize saved contacts while retaining recent correspondents, with controls to suppress unwanted recent addresses (#81).
+- Added standards-compatible vCard import and export with duplicate merging, partial-error reporting, UTF-8/folded-line support, and safe file/card limits (#81).
+- Added contacts to local file and WebDAV settings backups using the backward-compatible v2 backup schema (#81).
+
 ## [0.1.3] - 2026-07-01
 
 ### Added
