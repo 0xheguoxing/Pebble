@@ -391,6 +391,15 @@ export interface ContactSuggestion {
   last_interaction_at: number | null;
 }
 
+/** @rust pebble-core/src/types.rs → VcardImportResult */
+export interface VcardImportResult {
+  created: number;
+  merged: number;
+  skipped: number;
+  invalid: number;
+  errors: string[];
+}
+
 /** @rust pebble-core/src/types.rs → KnownContact */
 export interface KnownContact {
   name: string | null;

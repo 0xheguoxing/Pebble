@@ -335,6 +335,15 @@ pub struct ContactSuggestion {
     pub last_interaction_at: Option<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct VcardImportResult {
+    pub created: usize,
+    pub merged: usize,
+    pub skipped: usize,
+    pub invalid: usize,
+    pub errors: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Category {
     pub id: String,

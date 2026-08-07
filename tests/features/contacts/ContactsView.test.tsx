@@ -12,6 +12,8 @@ const mocks = vi.hoisted(() => ({
   remove: vi.fn(),
   setFavorite: vi.fn(),
   confirm: vi.fn(),
+  importVcard: vi.fn(),
+  exportVcard: vi.fn(),
 }));
 
 vi.mock("react-i18next", () => ({
@@ -34,6 +36,11 @@ vi.mock("@/hooks/mutations", () => ({
     remove: { mutateAsync: mocks.remove, isPending: false },
     setFavorite: { mutateAsync: mocks.setFavorite, isPending: false },
   }),
+}));
+
+vi.mock("@/lib/api", () => ({
+  importContactsVcard: (data: string) => mocks.importVcard(data),
+  exportContactsVcard: () => mocks.exportVcard(),
 }));
 
 import ContactsView from "@/features/contacts/ContactsView";
@@ -67,6 +74,14 @@ describe("ContactsView", () => {
     mocks.remove.mockResolvedValue(undefined);
     mocks.setFavorite.mockResolvedValue(undefined);
     mocks.confirm.mockResolvedValue(true);
+    mocks.importVcard.mockResolvedValue({
+      created: 1,
+      merged: 2,
+      skipped: 3,
+      invalid: 4,
+      errors: ["Card 4: invalid email"],
+    });
+    mocks.exportVcard.mockResolvedValue("BEGIN:VCARD\r\nEND:VCARD\r\n");
     useConfirmStore.setState({ confirm: mocks.confirm });
     useUIStore.setState({ activeView: "contacts" as never });
     useComposeStore.setState({
@@ -133,5 +148,44 @@ describe("ContactsView", () => {
         suppressAddresses: true,
       });
     });
+  });
+
+  it("imports a vCard file and shows the result summary", async () => {
+    render(<ContactsView />);
+    const file = new File(["BEGIN:VCARD\r\nEND:VCARD\r\n"], "contacts.vcf", {
+      type: "text/vcard",
+    });
+    Object.defineProperty(file, "text", {
+      value: vi.fn().mockResolvedValue("BEGIN:VCARD\r\nEND:VCARD\r\n"),
+    });
+
+    fireEvent.change(screen.getByLabelText("Choose vCard file"), {
+      target: { files: [file] },
+    });
+
+    await waitFor(() => {
+      expect(mocks.importVcard).toHaveBeenCalledWith("BEGIN:VCARD\r\nEND:VCARD\r\n");
+    });
+    expect(await screen.findByRole("status")).toBeTruthy();
+    expect(document.body.textContent).toContain("1 created");
+    expect(document.body.textContent).toContain("2 merged");
+    expect(document.body.textContent).toContain("4 invalid");
+  });
+
+  it("exports saved contacts as a vCard download", async () => {
+    const createObjectURL = vi.fn().mockReturnValue("blob:contacts");
+    const revokeObjectURL = vi.fn();
+    Object.defineProperty(URL, "createObjectURL", { configurable: true, value: createObjectURL });
+    Object.defineProperty(URL, "revokeObjectURL", { configurable: true, value: revokeObjectURL });
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    render(<ContactsView />);
+
+    fireEvent.click(screen.getByRole("button", { name: "Export vCard" }));
+
+    await waitFor(() => expect(mocks.exportVcard).toHaveBeenCalled());
+    expect(createObjectURL).toHaveBeenCalled();
+    expect(click).toHaveBeenCalled();
+    expect(revokeObjectURL).toHaveBeenCalledWith("blob:contacts");
+    click.mockRestore();
   });
 });

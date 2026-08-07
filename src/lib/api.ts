@@ -41,6 +41,7 @@ export type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  VcardImportResult,
 } from "./ipc-types";
 
 import type {
@@ -77,6 +78,7 @@ import type {
   TranslateConfig,
   TranslateResult,
   TrustedSender,
+  VcardImportResult,
 } from "./ipc-types";
 
 // ─── Account API ─────────────────────────────────────────────────────────────
@@ -745,6 +747,14 @@ export async function searchContactSuggestions(
 
 export async function suppressContactSuggestion(address: string): Promise<void> {
   return invoke<void>("suppress_contact_suggestion", { address });
+}
+
+export async function importContactsVcard(data: string): Promise<VcardImportResult> {
+  return invoke<VcardImportResult>("import_contacts_vcard", { data });
+}
+
+export async function exportContactsVcard(): Promise<string> {
+  return invoke<string>("export_contacts_vcard");
 }
 
 // ─── Drafts API ──────────────────────────────────────────────────────────────

@@ -1,19 +1,33 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowLeft,
   Clipboard,
+  Download,
   Mail,
   Pencil,
   Plus,
   Search,
   Star,
   Trash2,
+  Upload,
+  X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { useContactsQuery } from "@/hooks/queries";
+import {
+  contactSuggestionsQueryRoot,
+  contactsQueryRoot,
+  useContactsQuery,
+} from "@/hooks/queries";
 import { useContactMutations } from "@/hooks/mutations";
-import type { Contact, ContactInput } from "@/lib/api";
+import {
+  exportContactsVcard,
+  importContactsVcard,
+  type Contact,
+  type ContactInput,
+  type VcardImportResult,
+} from "@/lib/api";
 import { extractErrorMessage } from "@/lib/extractErrorMessage";
+import { queryClient } from "@/lib/query-client";
 import { useComposeStore } from "@/stores/compose.store";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { useToastStore } from "@/stores/toast.store";
@@ -22,6 +36,7 @@ import ContactEditorDialog from "./ContactEditorDialog";
 import ContactListItem from "./ContactListItem";
 
 const EMPTY_CONTACTS: Contact[] = [];
+const MAX_VCARD_FILE_SIZE = 5 * 1024 * 1024;
 
 function primaryEmailFor(contact: Contact) {
   return contact.emails.find((email) => email.is_primary) ?? contact.emails[0];
@@ -33,6 +48,10 @@ export default function ContactsView() {
   const [favoriteOnly, setFavoriteOnly] = useState(false);
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [editorContact, setEditorContact] = useState<Contact | null | undefined>(undefined);
+  const [importResult, setImportResult] = useState<VcardImportResult | null>(null);
+  const [isImporting, setIsImporting] = useState(false);
+  const [isExporting, setIsExporting] = useState(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
   const { data = EMPTY_CONTACTS, isLoading, error, refetch } = useContactsQuery({
     query,
     favoriteOnly,
@@ -128,6 +147,62 @@ export default function ContactsView() {
     }
   };
 
+  const handleImport = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.target.files?.[0];
+    event.target.value = "";
+    if (!file) return;
+
+    if (file.size > MAX_VCARD_FILE_SIZE) {
+      addToast({
+        message: t("contacts.vcardFileTooLarge", "vCard files must be 5 MB or smaller"),
+        type: "error",
+      });
+      return;
+    }
+
+    setIsImporting(true);
+    try {
+      const result = await importContactsVcard(await file.text());
+      setImportResult(result);
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: contactsQueryRoot }),
+        queryClient.invalidateQueries({ queryKey: contactSuggestionsQueryRoot }),
+      ]);
+      addToast({
+        message: t("contacts.importSuccess", "vCard import complete"),
+        type: "success",
+      });
+    } catch (importError) {
+      addToast({ message: extractErrorMessage(importError), type: "error" });
+    } finally {
+      setIsImporting(false);
+    }
+  };
+
+  const handleExport = async () => {
+    setIsExporting(true);
+    let downloadUrl: string | null = null;
+    try {
+      const data = await exportContactsVcard();
+      downloadUrl = URL.createObjectURL(new Blob([data], { type: "text/vcard;charset=utf-8" }));
+      const anchor = document.createElement("a");
+      anchor.href = downloadUrl;
+      anchor.download = "pebble-contacts.vcf";
+      document.body.appendChild(anchor);
+      anchor.click();
+      anchor.remove();
+      addToast({
+        message: t("contacts.exportSuccess", "Contacts exported"),
+        type: "success",
+      });
+    } catch (exportError) {
+      addToast({ message: extractErrorMessage(exportError), type: "error" });
+    } finally {
+      if (downloadUrl) URL.revokeObjectURL(downloadUrl);
+      setIsExporting(false);
+    }
+  };
+
   return (
     <section className="contacts-view" aria-labelledby="contacts-view-title">
       <header className="contacts-header">
@@ -140,10 +215,42 @@ export default function ContactsView() {
             </span>
           </div>
         </div>
-        <button type="button" className="contact-primary-button" onClick={() => setEditorContact(null)}>
-          <Plus size={15} />
-          {t("contacts.new", "New contact")}
-        </button>
+        <div className="contacts-header-actions">
+          <input
+            ref={fileInputRef}
+            className="sr-only"
+            type="file"
+            accept=".vcf,text/vcard,text/x-vcard"
+            aria-label={t("contacts.chooseVcard", "Choose vCard file")}
+            onChange={handleImport}
+          />
+          <button
+            type="button"
+            className="contact-secondary-button"
+            disabled={isImporting}
+            onClick={() => fileInputRef.current?.click()}
+          >
+            <Upload size={15} />
+            {isImporting
+              ? t("contacts.importingVcard", "Importing…")
+              : t("contacts.importVcard", "Import vCard")}
+          </button>
+          <button
+            type="button"
+            className="contact-secondary-button"
+            disabled={isExporting}
+            onClick={handleExport}
+          >
+            <Download size={15} />
+            {isExporting
+              ? t("contacts.exportingVcard", "Exporting…")
+              : t("contacts.exportVcard", "Export vCard")}
+          </button>
+          <button type="button" className="contact-primary-button" onClick={() => setEditorContact(null)}>
+            <Plus size={15} />
+            {t("contacts.new", "New contact")}
+          </button>
+        </div>
       </header>
 
       <div className="contacts-toolbar">
@@ -167,6 +274,36 @@ export default function ContactsView() {
           {t("contacts.favoritesOnly", "Favorites only")}
         </label>
       </div>
+
+      {importResult && (
+        <div className="contacts-import-summary" role="status">
+          <div>
+            <strong>{t("contacts.importSummary", "Import summary")}</strong>
+            <p>
+              {importResult.created} {t("contacts.importCreated", "created")}
+              {" · "}
+              {importResult.merged} {t("contacts.importMerged", "merged")}
+              {" · "}
+              {importResult.skipped} {t("contacts.importSkipped", "skipped")}
+              {" · "}
+              {importResult.invalid} {t("contacts.importInvalid", "invalid")}
+            </p>
+            {importResult.errors.length > 0 && (
+              <ul>
+                {importResult.errors.map((message, index) => <li key={`${index}-${message}`}>{message}</li>)}
+              </ul>
+            )}
+          </div>
+          <button
+            type="button"
+            className="contact-icon-button"
+            aria-label={t("contacts.closeImportSummary", "Close import summary")}
+            onClick={() => setImportResult(null)}
+          >
+            <X size={15} />
+          </button>
+        </div>
+      )}
 
       <div className="contacts-shell" data-has-selection={Boolean(selectedContact)}>
         <div className="contacts-list-pane">

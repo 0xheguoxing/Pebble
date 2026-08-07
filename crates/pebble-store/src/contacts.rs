@@ -92,7 +92,10 @@ fn validate_contact_input(input: &ContactInput) -> Result<Vec<(String, String)>>
     Ok(prepared)
 }
 
-fn load_contact_with_conn(conn: &Connection, contact_id: &str) -> Result<Option<Contact>> {
+pub(crate) fn load_contact_with_conn(
+    conn: &Connection,
+    contact_id: &str,
+) -> Result<Option<Contact>> {
     let row = conn
         .query_row(
             "SELECT id, display_name, notes, is_favorite, created_at, updated_at
@@ -200,113 +203,113 @@ fn add_recent_candidate(
     }
 }
 
+pub(crate) fn save_contact_with_conn(conn: &Connection, input: &ContactInput) -> Result<Contact> {
+    let prepared_emails = validate_contact_input(input)?;
+    let display_name = input.display_name.trim().to_string();
+    let notes = input.notes.trim().to_string();
+    let now = pebble_core::now_timestamp();
+    let (contact_id, created_at, existing_email_ids) = if let Some(id) = &input.id {
+        if id.trim().is_empty() {
+            return Err(PebbleError::Validation(
+                "Contact id must not be empty".to_string(),
+            ));
+        }
+        let created_at = conn
+            .query_row(
+                "SELECT created_at FROM contacts WHERE id = ?1",
+                params![id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .ok_or_else(|| PebbleError::Validation(format!("Contact not found: {id}")))?;
+        let mut stmt = conn.prepare("SELECT id FROM contact_emails WHERE contact_id = ?1")?;
+        let existing_ids = stmt
+            .query_map(params![id], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<HashSet<_>, _>>()?;
+        (id.clone(), created_at, existing_ids)
+    } else {
+        (pebble_core::new_id(), now, HashSet::new())
+    };
+
+    for (_, normalized) in &prepared_emails {
+        let owner: Option<String> = conn
+            .query_row(
+                "SELECT contact_id FROM contact_emails
+                 WHERE normalized_address = ?1 COLLATE NOCASE AND contact_id != ?2",
+                params![normalized, contact_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if owner.is_some() {
+            return Err(PebbleError::Validation(format!(
+                "Email address already belongs to another contact: {normalized}"
+            )));
+        }
+    }
+
+    if input.id.is_some() {
+        conn.execute(
+            "UPDATE contacts
+             SET display_name = ?1, notes = ?2, is_favorite = ?3, updated_at = ?4
+             WHERE id = ?5",
+            params![display_name, notes, input.is_favorite, now, contact_id],
+        )?;
+        conn.execute(
+            "DELETE FROM contact_emails WHERE contact_id = ?1",
+            params![contact_id],
+        )?;
+    } else {
+        conn.execute(
+            "INSERT INTO contacts
+                (id, display_name, notes, is_favorite, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                contact_id,
+                display_name,
+                notes,
+                input.is_favorite,
+                created_at,
+                now
+            ],
+        )?;
+    }
+
+    for (index, email) in input.emails.iter().enumerate() {
+        let (address, normalized) = &prepared_emails[index];
+        let email_id = email
+            .id
+            .as_ref()
+            .filter(|id| existing_email_ids.contains(*id))
+            .cloned()
+            .unwrap_or_else(pebble_core::new_id);
+        conn.execute(
+            "INSERT INTO contact_emails
+                (id, contact_id, address, normalized_address, label, is_primary, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                email_id,
+                contact_id,
+                address,
+                normalized,
+                contact_label_to_str(&email.label),
+                email.is_primary,
+                now
+            ],
+        )
+        .map_err(|error| {
+            PebbleError::Validation(format!("Unable to save contact email {address}: {error}"))
+        })?;
+    }
+
+    load_contact_with_conn(conn, &contact_id)?
+        .ok_or_else(|| PebbleError::Internal("Saved contact could not be loaded".to_string()))
+}
+
 impl Store {
     pub fn save_contact(&self, input: &ContactInput) -> Result<Contact> {
-        let prepared_emails = validate_contact_input(input)?;
-        let display_name = input.display_name.trim().to_string();
-        let notes = input.notes.trim().to_string();
-        let now = pebble_core::now_timestamp();
-
         self.with_write(|conn| {
             let tx = conn.unchecked_transaction()?;
-            let (contact_id, created_at, existing_email_ids) = if let Some(id) = &input.id {
-                if id.trim().is_empty() {
-                    return Err(PebbleError::Validation(
-                        "Contact id must not be empty".to_string(),
-                    ));
-                }
-                let created_at = tx
-                    .query_row(
-                        "SELECT created_at FROM contacts WHERE id = ?1",
-                        params![id],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()?
-                    .ok_or_else(|| PebbleError::Validation(format!("Contact not found: {id}")))?;
-                let mut stmt = tx.prepare("SELECT id FROM contact_emails WHERE contact_id = ?1")?;
-                let existing_ids = stmt
-                    .query_map(params![id], |row| row.get::<_, String>(0))?
-                    .collect::<std::result::Result<HashSet<_>, _>>()?;
-                (id.clone(), created_at, existing_ids)
-            } else {
-                (pebble_core::new_id(), now, HashSet::new())
-            };
-
-            for (_, normalized) in &prepared_emails {
-                let owner: Option<String> = tx
-                    .query_row(
-                        "SELECT contact_id FROM contact_emails
-                         WHERE normalized_address = ?1 COLLATE NOCASE AND contact_id != ?2",
-                        params![normalized, contact_id],
-                        |row| row.get(0),
-                    )
-                    .optional()?;
-                if owner.is_some() {
-                    return Err(PebbleError::Validation(format!(
-                        "Email address already belongs to another contact: {normalized}"
-                    )));
-                }
-            }
-
-            if input.id.is_some() {
-                tx.execute(
-                    "UPDATE contacts
-                     SET display_name = ?1, notes = ?2, is_favorite = ?3, updated_at = ?4
-                     WHERE id = ?5",
-                    params![display_name, notes, input.is_favorite, now, contact_id],
-                )?;
-                tx.execute(
-                    "DELETE FROM contact_emails WHERE contact_id = ?1",
-                    params![contact_id],
-                )?;
-            } else {
-                tx.execute(
-                    "INSERT INTO contacts
-                        (id, display_name, notes, is_favorite, created_at, updated_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                    params![
-                        contact_id,
-                        display_name,
-                        notes,
-                        input.is_favorite,
-                        created_at,
-                        now
-                    ],
-                )?;
-            }
-
-            for (index, email) in input.emails.iter().enumerate() {
-                let (address, normalized) = &prepared_emails[index];
-                let email_id = email
-                    .id
-                    .as_ref()
-                    .filter(|id| existing_email_ids.contains(*id))
-                    .cloned()
-                    .unwrap_or_else(pebble_core::new_id);
-                tx.execute(
-                    "INSERT INTO contact_emails
-                        (id, contact_id, address, normalized_address, label, is_primary, created_at)
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                    params![
-                        email_id,
-                        contact_id,
-                        address,
-                        normalized,
-                        contact_label_to_str(&email.label),
-                        email.is_primary,
-                        now
-                    ],
-                )
-                .map_err(|error| {
-                    PebbleError::Validation(format!(
-                        "Unable to save contact email {address}: {error}"
-                    ))
-                })?;
-            }
-
-            let contact = load_contact_with_conn(&tx, &contact_id)?.ok_or_else(|| {
-                PebbleError::Internal("Saved contact could not be loaded".to_string())
-            })?;
+            let contact = save_contact_with_conn(&tx, input)?;
             tx.commit()?;
             Ok(contact)
         })

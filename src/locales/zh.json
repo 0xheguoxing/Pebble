@@ -569,7 +569,21 @@
     "duplicateEmail": "同一个邮箱地址只能添加一次",
     "notesTooLong": "备注不能超过 2000 个字符",
     "back": "返回联系人列表",
-    "count": "{{count}} 位联系人"
+    "count": "{{count}} 位联系人",
+    "chooseVcard": "选择 vCard 文件",
+    "importVcard": "导入 vCard",
+    "exportVcard": "导出 vCard",
+    "importingVcard": "正在导入…",
+    "exportingVcard": "正在导出…",
+    "vcardFileTooLarge": "vCard 文件不能超过 5 MB",
+    "importSuccess": "vCard 导入完成",
+    "exportSuccess": "联系人已导出",
+    "importSummary": "导入摘要",
+    "importCreated": "个已创建",
+    "importMerged": "个已合并",
+    "importSkipped": "个已跳过",
+    "importInvalid": "个无效",
+    "closeImportSummary": "关闭导入摘要"
   },
   "commands": {
     "navigation": "导航",

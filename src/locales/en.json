@@ -569,7 +569,21 @@
     "duplicateEmail": "Each email address can only be added once",
     "notesTooLong": "Notes must be 2000 characters or fewer",
     "back": "Back to contacts",
-    "count": "{{count}} contacts"
+    "count": "{{count}} contacts",
+    "chooseVcard": "Choose vCard file",
+    "importVcard": "Import vCard",
+    "exportVcard": "Export vCard",
+    "importingVcard": "Importing…",
+    "exportingVcard": "Exporting…",
+    "vcardFileTooLarge": "vCard files must be 5 MB or smaller",
+    "importSuccess": "vCard import complete",
+    "exportSuccess": "Contacts exported",
+    "importSummary": "Import summary",
+    "importCreated": "created",
+    "importMerged": "merged",
+    "importSkipped": "skipped",
+    "importInvalid": "invalid",
+    "closeImportSummary": "Close import summary"
   },
   "commands": {
     "navigation": "Navigation",

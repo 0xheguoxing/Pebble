@@ -1,5 +1,7 @@
 use crate::state::AppState;
-use pebble_core::{Contact, ContactInput, ContactSuggestion, KnownContact, PebbleError};
+use pebble_core::{
+    Contact, ContactInput, ContactSuggestion, KnownContact, PebbleError, VcardImportResult,
+};
 use pebble_store::Store;
 use tauri::State;
 
@@ -100,6 +102,21 @@ pub async fn suppress_contact_suggestion(
     address: String,
 ) -> std::result::Result<(), PebbleError> {
     state.store.suppress_contact_suggestion(&address)
+}
+
+#[tauri::command]
+pub async fn import_contacts_vcard(
+    state: State<'_, AppState>,
+    data: String,
+) -> std::result::Result<VcardImportResult, PebbleError> {
+    state.store.import_contacts_vcard(&data)
+}
+
+#[tauri::command]
+pub async fn export_contacts_vcard(
+    state: State<'_, AppState>,
+) -> std::result::Result<String, PebbleError> {
+    state.store.export_contacts_vcard()
 }
 
 #[tauri::command]

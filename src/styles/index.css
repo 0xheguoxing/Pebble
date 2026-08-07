@@ -1066,6 +1066,14 @@ textarea:focus-visible {
   padding: 22px 28px 16px;
 }
 
+.contacts-header-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .contacts-eyebrow,
 .contact-dialog-kicker {
   display: block;
@@ -1117,6 +1125,36 @@ textarea:focus-visible {
   align-items: center;
   gap: 10px;
   padding: 0 28px 16px;
+}
+
+.contacts-import-summary {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  margin: 0 28px 16px;
+  padding: 12px 14px;
+  border: 1px solid color-mix(in srgb, var(--color-accent) 28%, var(--color-border));
+  border-radius: 7px;
+  background: color-mix(in srgb, var(--color-accent) 6%, var(--color-bg));
+  color: var(--color-text-primary);
+  font-size: 12px;
+}
+
+.contacts-import-summary strong {
+  font-size: 12px;
+}
+
+.contacts-import-summary p {
+  margin: 4px 0 0;
+  color: var(--color-text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+.contacts-import-summary ul {
+  margin: 8px 0 0;
+  padding-left: 18px;
+  color: var(--color-danger);
 }
 
 .contacts-search-shell {
@@ -1675,12 +1713,23 @@ textarea:focus-visible {
 
 @media (max-width: 760px) {
   .contacts-header {
+    align-items: flex-start;
+    flex-direction: column;
     padding: 18px 18px 14px;
+  }
+
+  .contacts-header-actions {
+    width: 100%;
+    justify-content: flex-start;
   }
 
   .contacts-toolbar {
     flex-wrap: wrap;
     padding: 0 18px 14px;
+  }
+
+  .contacts-import-summary {
+    margin: 0 18px 14px;
   }
 
   .contacts-search-shell {

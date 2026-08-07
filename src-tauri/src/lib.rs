@@ -582,6 +582,8 @@ pub fn run() {
             commands::contacts::set_contact_favorite,
             commands::contacts::search_contact_suggestions,
             commands::contacts::suppress_contact_suggestion,
+            commands::contacts::import_contacts_vcard,
+            commands::contacts::export_contacts_vcard,
             commands::contacts::search_contacts,
             commands::advanced_search::advanced_search,
             commands::sync_cmd::reindex_search,
