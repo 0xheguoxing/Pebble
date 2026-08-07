@@ -1,5 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { act, renderHook } from "@testing-library/react";
+import { act, renderHook, waitFor } from "@testing-library/react";
+import type { Contact } from "@/lib/api";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { listContacts } from "@/lib/api";
@@ -59,5 +60,36 @@ describe("useContactsQuery", () => {
       await Promise.resolve();
     });
     expect(mockListContacts).toHaveBeenCalledWith("alice", false, 50, 0);
+  });
+
+  it("loads every backend page when the requested limit exceeds 200", async () => {
+    const contact = (index: number): Contact => ({
+      id: `contact-${index}`,
+      display_name: `Contact ${index}`,
+      notes: "",
+      is_favorite: false,
+      emails: [{
+        id: `email-${index}`,
+        address: `user${index}@example.com`,
+        label: "other",
+        is_primary: true,
+      }],
+      created_at: 1,
+      updated_at: 1,
+    });
+    mockListContacts.mockImplementation(async (_query, _favoriteOnly, _limit, offset) => (
+      offset === 0
+        ? Array.from({ length: 200 }, (_, index) => contact(index))
+        : [contact(200)]
+    ));
+
+    const { result } = renderHook(
+      () => useContactsQuery({ query: "", favoriteOnly: false, limit: 10_000, offset: 0 }),
+      { wrapper: createWrapper() },
+    );
+
+    await waitFor(() => expect(result.current.data).toHaveLength(201));
+    expect(mockListContacts).toHaveBeenNthCalledWith(1, "", false, 200, 0);
+    expect(mockListContacts).toHaveBeenNthCalledWith(2, "", false, 200, 200);
   });
 });

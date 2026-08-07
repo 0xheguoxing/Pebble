@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { listContacts } from "@/lib/api";
+import { listContacts, type Contact } from "@/lib/api";
 
 export const contactsQueryRoot = ["contacts"] as const;
 export const contactSuggestionsQueryRoot = ["contact-suggestions"] as const;
@@ -24,6 +24,29 @@ export const contactQueryKey = (contactId: string) => ["contact", contactId] as 
 export const contactSuggestionsQueryKey = (accountId: string, query: string) =>
   ["contact-suggestions", accountId, query] as const;
 
+const CONTACT_PAGE_SIZE = 200;
+
+async function listContactPages(options: ContactsQueryOptions): Promise<Contact[]> {
+  const requestedLimit = Math.max(1, options.limit);
+  const contacts: Contact[] = [];
+  let offset = Math.max(0, options.offset);
+
+  while (contacts.length < requestedLimit) {
+    const pageLimit = Math.min(CONTACT_PAGE_SIZE, requestedLimit - contacts.length);
+    const page = await listContacts(
+      options.query,
+      options.favoriteOnly,
+      pageLimit,
+      offset,
+    );
+    contacts.push(...page);
+    if (page.length < pageLimit) break;
+    offset += page.length;
+  }
+
+  return contacts;
+}
+
 export function useContactsQuery(options: ContactsQueryOptions) {
   const [debouncedQuery, setDebouncedQuery] = useState(options.query);
 
@@ -36,12 +59,7 @@ export function useContactsQuery(options: ContactsQueryOptions) {
   const debouncedOptions = { ...options, query: debouncedQuery };
   return useQuery({
     queryKey: contactsQueryKey(debouncedOptions),
-    queryFn: () => listContacts(
-      debouncedQuery,
-      options.favoriteOnly,
-      options.limit,
-      options.offset,
-    ),
+    queryFn: () => listContactPages(debouncedOptions),
     placeholderData: keepPreviousData,
     staleTime: 30_000,
   });

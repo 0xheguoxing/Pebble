@@ -55,7 +55,7 @@ export default function ContactsView() {
   const { data = EMPTY_CONTACTS, isLoading, error, refetch } = useContactsQuery({
     query,
     favoriteOnly,
-    limit: 200,
+    limit: Number.MAX_SAFE_INTEGER,
     offset: 0,
   });
   const contacts = data;

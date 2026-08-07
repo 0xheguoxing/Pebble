@@ -111,6 +111,7 @@ describe("ContactsView", () => {
     expect(mocks.useContactsQuery).toHaveBeenLastCalledWith(expect.objectContaining({
       query: "alice",
       favoriteOnly: true,
+      limit: Number.MAX_SAFE_INTEGER,
     }));
   });
 

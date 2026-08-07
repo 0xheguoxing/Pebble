@@ -97,11 +97,24 @@ fn name_from_n(value: &str) -> String {
 }
 
 fn parse_email_header(header: &str) -> (ContactEmailLabel, bool) {
-    let upper = header.to_ascii_uppercase();
-    let tokens = upper
+    let tokens = header
         .split(';')
         .skip(1)
-        .flat_map(|part| part.strip_prefix("TYPE=").unwrap_or(part).split(','))
+        .flat_map(|part| {
+            let (name, value) = part
+                .split_once('=')
+                .map(|(name, value)| (Some(name.trim()), value.trim()))
+                .unwrap_or((None, part.trim()));
+            if name.is_some_and(|name| !name.eq_ignore_ascii_case("TYPE")) {
+                return Vec::new();
+            }
+            value
+                .trim_matches('"')
+                .split(',')
+                .map(|token| token.trim().trim_matches('"').to_ascii_uppercase())
+                .filter(|token| !token.is_empty())
+                .collect::<Vec<_>>()
+        })
         .collect::<HashSet<_>>();
     let label = if tokens.contains("WORK") {
         ContactEmailLabel::Work
@@ -507,6 +520,19 @@ mod tests {
 
         let contacts = store.list_contacts(None, false, 20, 0).unwrap();
         assert_eq!(contacts[0].display_name, "Ada Lovelace");
+    }
+
+    #[test]
+    fn imports_quoted_type_parameter_tokens() {
+        let store = Store::open_in_memory().unwrap();
+        let data = "BEGIN:VCARD\nVERSION:3.0\nFN:Alice\nEMAIL;TYPE=\"WORK,PREF\":alice@example.com\nEMAIL;TYPE=\"HOME\":alice@home.example\nEND:VCARD\n";
+
+        store.import_contacts_vcard(data).unwrap();
+
+        let contact = &store.list_contacts(None, false, 20, 0).unwrap()[0];
+        assert_eq!(contact.emails[0].label, ContactEmailLabel::Work);
+        assert!(contact.emails[0].is_primary);
+        assert_eq!(contact.emails[1].label, ContactEmailLabel::Personal);
     }
 
     #[test]

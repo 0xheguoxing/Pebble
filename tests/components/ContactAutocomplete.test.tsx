@@ -188,4 +188,25 @@ describe("ContactAutocomplete", () => {
     });
     expect(onChange).not.toHaveBeenCalled();
   });
+
+  it("keeps the recent-suggestion removal action outside options and reachable from the combobox", async () => {
+    vi.mocked(searchContactSuggestions).mockResolvedValue([{
+      contact_id: null,
+      name: "Alex",
+      address: "alex@example.com",
+      source: "recent",
+      is_favorite: false,
+      last_interaction_at: 100,
+    }]);
+    render(<ContactAutocomplete value={[]} onChange={vi.fn()} accountId="account-1" />);
+
+    const input = screen.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "alex" } });
+    const removeButton = await screen.findByRole("button", {
+      name: "Remove suggestion alex@example.com",
+    });
+
+    expect(removeButton.closest('[role="option"]')).toBeNull();
+    expect(fireEvent.keyDown(input, { key: "Tab" })).toBe(true);
+  });
 });

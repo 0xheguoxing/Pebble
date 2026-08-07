@@ -145,6 +145,7 @@ export default function ContactAutocomplete({
       });
       setActiveIndex(-1);
       await queryClient.invalidateQueries({ queryKey: contactSuggestionsQueryRoot });
+      inputRef.current?.focus();
     } catch {
       useToastStore.getState().addToast({
         message: t("compose.removeSuggestionFailed", "Failed to remove suggestion"),
@@ -182,6 +183,13 @@ export default function ContactAutocomplete({
       removeChip(value[value.length - 1]);
     } else if (e.key === "," || e.key === "Tab") {
       if (inputValue.trim()) {
+        const activeSuggestion = suggestions[activeIndex];
+        const removableSuggestion = activeIndex >= 0
+          ? (activeSuggestion?.source === "recent" ? activeSuggestion : undefined)
+          : suggestions.find((suggestion) => suggestion.source === "recent");
+        if (e.key === "Tab" && showDropdown && removableSuggestion) {
+          return;
+        }
         e.preventDefault();
         addRawAddress(inputValue);
       }
@@ -221,6 +229,10 @@ export default function ContactAutocomplete({
       </>
     );
   };
+
+  const removableSuggestion = activeIndex >= 0
+    ? (suggestions[activeIndex]?.source === "recent" ? suggestions[activeIndex] : undefined)
+    : suggestions.find((suggestion) => suggestion.source === "recent");
 
   return (
     <div ref={containerRef} style={{ position: "relative", flex: 1 }}>
@@ -308,8 +320,6 @@ export default function ContactAutocomplete({
 
       {showDropdown && (
         <div
-          id={`${instanceId}-listbox`}
-          role="listbox"
           style={{
             position: "absolute",
             top: "100%",
@@ -320,11 +330,14 @@ export default function ContactAutocomplete({
             border: "1px solid var(--color-border)",
             borderRadius: "8px",
             boxShadow: "0 4px 12px rgba(0,0,0,0.15)",
-            maxHeight: "200px",
-            overflowY: "auto",
             marginTop: "2px",
           }}
         >
+          <div
+            id={`${instanceId}-listbox`}
+            role="listbox"
+            style={{ maxHeight: "200px", overflowY: "auto" }}
+          >
           {loading ? (
             <div
               style={{
@@ -402,30 +415,36 @@ export default function ContactAutocomplete({
                     ? t("compose.savedContact", "Saved contact")
                     : t("compose.recentContact", "Recent")}
                 </span>
-                {contact.source === "recent" && (
-                  <button
-                    type="button"
-                    aria-label={`${t("compose.removeSuggestion", "Remove suggestion")} ${contact.address}`}
-                    onClick={(event) => removeSuggestion(event, contact)}
-                    style={{
-                      display: "inline-flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      width: "26px",
-                      height: "26px",
-                      padding: 0,
-                      border: 0,
-                      borderRadius: "5px",
-                      background: "transparent",
-                      color: "var(--color-text-secondary)",
-                      cursor: "pointer",
-                    }}
-                  >
-                    <X size={13} aria-hidden="true" />
-                  </button>
-                )}
               </div>
             ))
+          )}
+          </div>
+          {removableSuggestion && (
+            <button
+              type="button"
+              aria-label={`${t("compose.removeSuggestion", "Remove suggestion")} ${removableSuggestion.address}`}
+              onClick={(event) => removeSuggestion(event, removableSuggestion)}
+              style={{
+                display: "flex",
+                alignItems: "center",
+                justifyContent: "center",
+                gap: "6px",
+                width: "100%",
+                minHeight: "32px",
+                padding: "5px 10px",
+                border: 0,
+                borderTop: "1px solid var(--color-border)",
+                borderRadius: "0 0 8px 8px",
+                background: "var(--color-bg)",
+                color: "var(--color-text-secondary)",
+                cursor: "pointer",
+                font: "inherit",
+                fontSize: "11px",
+              }}
+            >
+              <X size={12} aria-hidden="true" />
+              {t("compose.removeSuggestion", "Remove suggestion")}: {removableSuggestion.address}
+            </button>
           )}
         </div>
       )}

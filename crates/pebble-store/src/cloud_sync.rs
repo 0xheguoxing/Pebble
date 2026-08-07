@@ -15,6 +15,34 @@ pub const MAX_BACKUP_SIZE_BYTES: usize = 16 * 1024 * 1024;
 pub const BACKUP_SCHEMA_VERSION: u32 = 2;
 pub const SETTINGS_BACKUP_FILENAME: &str = "pebble-settings-backup.json";
 
+fn validate_backup_schema(backup: &SettingsBackup) -> Result<()> {
+    if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
+        return Err(PebbleError::Validation(format!(
+            "Unsupported backup version {} (this build supports up to {})",
+            backup.version, BACKUP_SCHEMA_VERSION
+        )));
+    }
+    if backup.version >= 2 && backup.contacts.is_none() {
+        return Err(PebbleError::Validation(
+            "Backup version 2 is missing the required contacts field".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn serialize_backup(backup: &SettingsBackup) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec_pretty(backup)
+        .map_err(|e| PebbleError::Internal(format!("Failed to serialize settings: {e}")))?;
+    if json.len() > MAX_BACKUP_SIZE_BYTES {
+        return Err(PebbleError::Validation(format!(
+            "Backup file is too large ({} bytes, max {})",
+            json.len(),
+            MAX_BACKUP_SIZE_BYTES
+        )));
+    }
+    Ok(json)
+}
+
 fn validate_backup_payload_shape(data: &[u8]) -> Result<()> {
     let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
     let Some(first) = data.iter().copied().find(|b| !b.is_ascii_whitespace()) else {
@@ -78,12 +106,7 @@ pub fn preview_backup(data: &[u8]) -> Result<BackupPreview> {
     let backup: SettingsBackup = serde_json::from_slice(data).map_err(|e| {
         PebbleError::Validation(format!("Backup file is not a valid settings backup: {e}"))
     })?;
-    if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-        return Err(PebbleError::Validation(format!(
-            "Unsupported backup version {} (this build supports up to {})",
-            backup.version, BACKUP_SCHEMA_VERSION
-        )));
-    }
+    validate_backup_schema(&backup)?;
     Ok(BackupPreview {
         version: backup.version,
         exported_at: backup.exported_at,
@@ -91,7 +114,7 @@ pub fn preview_backup(data: &[u8]) -> Result<BackupPreview> {
         rule_count: backup.rules.len(),
         kanban_card_count: backup.kanban_cards.len(),
         kanban_note_count: backup.kanban_context_notes.len(),
-        contact_count: backup.contacts.len(),
+        contact_count: backup.contacts.as_ref().map(Vec::len).unwrap_or(0),
         has_translate_config: backup
             .translate_config
             .as_ref()
@@ -123,7 +146,7 @@ pub struct SettingsBackup {
     #[serde(default)]
     pub kanban_context_notes: HashMap<String, String>,
     #[serde(default)]
-    pub contacts: Vec<pebble_core::Contact>,
+    pub contacts: Option<Vec<pebble_core::Contact>>,
     pub translate_config: Option<pebble_core::TranslateConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_summary: Option<BackupSecretSummary>,
@@ -335,15 +358,13 @@ impl Store {
             rules,
             kanban_cards,
             kanban_context_notes: HashMap::new(),
-            contacts,
+            contacts: Some(contacts),
             translate_config,
             secret_summary: None,
             encrypted_secrets: None,
         };
 
-        let json = serde_json::to_vec_pretty(&backup)
-            .map_err(|e| PebbleError::Internal(format!("Failed to serialize settings: {e}")))?;
-        Ok(json)
+        serialize_backup(&backup)
     }
 
     /// Import settings from JSON bytes, upserting into the store.
@@ -362,12 +383,7 @@ impl Store {
         validate_backup_payload_shape(data)?;
         let backup: SettingsBackup = serde_json::from_slice(data)
             .map_err(|e| PebbleError::Validation(format!("Failed to deserialize settings: {e}")))?;
-        if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-            return Err(PebbleError::Validation(format!(
-                "Unsupported backup version {} (this build supports up to {})",
-                backup.version, BACKUP_SCHEMA_VERSION
-            )));
-        }
+        validate_backup_schema(&backup)?;
 
         self.with_write(|conn| {
             let tx = conn.unchecked_transaction()
@@ -445,7 +461,9 @@ impl Store {
             // Contacts were added in schema v2. A v1 restore must preserve
             // local contacts because the older file could not contain them.
             if backup.version >= 2 {
-                crate::contacts::replace_contacts_with_conn(&tx, &backup.contacts)?;
+                if let Some(contacts) = &backup.contacts {
+                    crate::contacts::replace_contacts_with_conn(&tx, contacts)?;
+                }
             }
 
             // Upsert translate config — skip if config field is empty (redacted export)
@@ -477,12 +495,7 @@ impl Store {
         validate_backup_payload_shape(data)?;
         let backup: SettingsBackup = serde_json::from_slice(data)
             .map_err(|e| PebbleError::Validation(format!("Failed to deserialize settings: {e}")))?;
-        if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-            return Err(PebbleError::Validation(format!(
-                "Unsupported backup version {} (this build supports up to {})",
-                backup.version, BACKUP_SCHEMA_VERSION
-            )));
-        }
+        validate_backup_schema(&backup)?;
 
         self.with_write(|conn| {
             let tx = conn
@@ -555,7 +568,9 @@ impl Store {
             }
 
             if backup.version >= 2 {
-                crate::contacts::replace_contacts_with_conn(&tx, &backup.contacts)?;
+                if let Some(contacts) = &backup.contacts {
+                    crate::contacts::replace_contacts_with_conn(&tx, contacts)?;
+                }
             }
 
             if let Some(tc) = &backup.translate_config {
@@ -718,9 +733,10 @@ mod tests {
         assert_eq!(backup.accounts[0].color.as_deref(), Some("#22c55e"));
         assert_eq!(backup.rules.len(), 1);
         assert_eq!(backup.rules[0].name, "Auto-archive");
-        assert_eq!(backup.contacts.len(), 1);
-        assert_eq!(backup.contacts[0].emails.len(), 2);
-        assert!(backup.contacts[0].is_favorite);
+        let backed_up_contacts = backup.contacts.as_ref().unwrap();
+        assert_eq!(backed_up_contacts.len(), 1);
+        assert_eq!(backed_up_contacts[0].emails.len(), 2);
+        assert!(backed_up_contacts[0].is_favorite);
         assert!(backup.translate_config.is_some());
         // Config field should be redacted (empty) in export
         assert_eq!(backup.translate_config.as_ref().unwrap().config, "");
@@ -844,6 +860,60 @@ mod tests {
         let contacts = store.list_contacts(None, false, 200, 0).unwrap();
         assert_eq!(contacts.len(), 1);
         assert_eq!(contacts[0].display_name, "Local contact");
+    }
+
+    #[test]
+    fn version_two_backup_requires_contacts_field() {
+        let backup = serde_json::json!({
+            "version": 2,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "translate_config": null
+        });
+        let data = serde_json::to_vec(&backup).unwrap();
+
+        let error = preview_backup(&data).unwrap_err().to_string();
+
+        assert!(error.contains("contacts"));
+        assert!(error.contains("version 2"));
+    }
+
+    #[test]
+    fn export_rejects_backup_that_cannot_be_restored_due_to_size() {
+        let store = Store::open_in_memory().unwrap();
+        let notes = "x".repeat(2000);
+        store
+            .with_write(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                for index in 0..8_500 {
+                    let contact_id = format!("contact-{index}");
+                    let email_id = format!("email-{index}");
+                    let address = format!("user{index}@example.com");
+                    tx.execute(
+                        "INSERT INTO contacts
+                            (id, display_name, notes, is_favorite, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 0, 1, 1)",
+                        rusqlite::params![contact_id, address, notes],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO contact_emails
+                            (id, contact_id, address, normalized_address, label, is_primary, created_at)
+                         VALUES (?1, ?2, ?3, ?3, 'other', 1, 1)",
+                        rusqlite::params![email_id, contact_id, address],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = store.export_settings().unwrap_err().to_string();
+
+        assert!(error.contains("too large"));
+        assert!(error.contains(&MAX_BACKUP_SIZE_BYTES.to_string()));
     }
 
     #[test]
@@ -996,7 +1066,7 @@ mod tests {
             }],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
-            contacts: vec![],
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
@@ -1042,7 +1112,7 @@ mod tests {
             }],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
-            contacts: vec![],
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
@@ -1155,7 +1225,7 @@ mod tests {
                 updated_at: now,
             }],
             kanban_context_notes: HashMap::new(),
-            contacts: vec![],
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
@@ -1189,7 +1259,7 @@ mod tests {
             rules: vec![],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
-            contacts: vec![],
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
