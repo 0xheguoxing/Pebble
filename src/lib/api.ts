@@ -11,6 +11,13 @@ export type {
   Attachment,
   BackupPreview,
   ConnectionSecurity,
+  Contact,
+  ContactEmail,
+  ContactEmailInput,
+  ContactEmailLabel,
+  ContactInput,
+  ContactSuggestion,
+  ContactSuggestionSource,
   EmailAddress,
   Folder,
   HttpProxyConfig,
@@ -46,6 +53,9 @@ import type {
   Attachment,
   BackupPreview,
   ConnectionSecurity,
+  Contact,
+  ContactInput,
+  ContactSuggestion,
   Folder,
   HttpProxyConfig,
   ImapSyncFolderSettings,
@@ -692,6 +702,49 @@ export async function searchContacts(
   limit?: number,
 ): Promise<KnownContact[]> {
   return invoke<KnownContact[]>("search_contacts", { accountId, query, limit });
+}
+
+export async function listContacts(
+  query?: string,
+  favoriteOnly = false,
+  limit = 50,
+  offset = 0,
+): Promise<Contact[]> {
+  return invoke<Contact[]>("list_contacts", { query, favoriteOnly, limit, offset });
+}
+
+export async function getContact(contactId: string): Promise<Contact | null> {
+  return invoke<Contact | null>("get_contact", { contactId });
+}
+
+export async function saveContact(input: ContactInput): Promise<Contact> {
+  return invoke<Contact>("save_contact", { input });
+}
+
+export async function deleteContact(
+  contactId: string,
+  suppressAddresses = false,
+): Promise<void> {
+  return invoke<void>("delete_contact", { contactId, suppressAddresses });
+}
+
+export async function setContactFavorite(
+  contactId: string,
+  isFavorite: boolean,
+): Promise<void> {
+  return invoke<void>("set_contact_favorite", { contactId, isFavorite });
+}
+
+export async function searchContactSuggestions(
+  accountId: string,
+  query: string,
+  limit = 20,
+): Promise<ContactSuggestion[]> {
+  return invoke<ContactSuggestion[]>("search_contact_suggestions", { accountId, query, limit });
+}
+
+export async function suppressContactSuggestion(address: string): Promise<void> {
+  return invoke<void>("suppress_contact_suggestion", { address });
 }
 
 // ─── Drafts API ──────────────────────────────────────────────────────────────
