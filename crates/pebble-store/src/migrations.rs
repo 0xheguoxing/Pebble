@@ -2,7 +2,7 @@ use pebble_core::{build_snippet, PebbleError, Result};
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
-const CURRENT_VERSION: u32 = 14;
+const CURRENT_VERSION: u32 = 15;
 const ACCOUNT_COLOR_PRESETS: [&str; 12] = [
     "#0ea5e9", "#22c55e", "#f59e0b", "#8b5cf6", "#f43f5e", "#14b8a6", "#6366f1", "#f97316",
     "#06b6d4", "#ec4899", "#84cc16", "#3b82f6",
@@ -435,6 +435,46 @@ pub fn run_migrations(conn: &Connection) -> Result<()> {
             .map_err(|e| PebbleError::Storage(format!("Migration V14 commit failed: {e}")))?;
     }
 
+    // V15: profile-level address book and hidden recent-contact suggestions.
+    if version < 15 {
+        let tx = conn
+            .unchecked_transaction()
+            .map_err(|e| PebbleError::Storage(format!("Migration V15 begin failed: {e}")))?;
+        tx.execute_batch(
+            "CREATE TABLE contacts (
+                 id TEXT PRIMARY KEY,
+                 display_name TEXT NOT NULL DEFAULT '',
+                 notes TEXT NOT NULL DEFAULT '',
+                 is_favorite INTEGER NOT NULL DEFAULT 0 CHECK(is_favorite IN (0, 1)),
+                 created_at INTEGER NOT NULL,
+                 updated_at INTEGER NOT NULL
+             );
+             CREATE TABLE contact_emails (
+                 id TEXT PRIMARY KEY,
+                 contact_id TEXT NOT NULL REFERENCES contacts(id) ON DELETE CASCADE,
+                 address TEXT NOT NULL,
+                 normalized_address TEXT NOT NULL COLLATE NOCASE,
+                 label TEXT NOT NULL DEFAULT 'other'
+                     CHECK(label IN ('work', 'personal', 'other')),
+                 is_primary INTEGER NOT NULL DEFAULT 0 CHECK(is_primary IN (0, 1)),
+                 created_at INTEGER NOT NULL,
+                 UNIQUE(normalized_address)
+             );
+             CREATE INDEX idx_contact_emails_contact
+                 ON contact_emails(contact_id);
+             CREATE UNIQUE INDEX idx_contact_emails_one_primary
+                 ON contact_emails(contact_id) WHERE is_primary = 1;
+             CREATE TABLE contact_suggestion_suppressions (
+                 normalized_address TEXT PRIMARY KEY COLLATE NOCASE,
+                 created_at INTEGER NOT NULL
+             );",
+        )
+        .map_err(|e| PebbleError::Storage(format!("Migration V15 failed: {e}")))?;
+        set_schema_version(&tx, 15)?;
+        tx.commit()
+            .map_err(|e| PebbleError::Storage(format!("Migration V15 commit failed: {e}")))?;
+    }
+
     Ok(())
 }
 
@@ -581,6 +621,64 @@ CREATE TABLE IF NOT EXISTS translate_config (
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn migration_v15_creates_contact_tables() {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch("PRAGMA foreign_keys=ON; PRAGMA user_version=14;")
+            .unwrap();
+
+        run_migrations(&conn).unwrap();
+
+        let version: u32 = conn
+            .pragma_query_value(None, "user_version", |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 15);
+
+        conn.execute_batch(
+            "INSERT INTO contacts
+                (id, display_name, notes, is_favorite, created_at, updated_at)
+             VALUES ('contact-1', 'Alice', '', 0, 1, 1);
+             INSERT INTO contact_emails
+                (id, contact_id, address, normalized_address, label, is_primary, created_at)
+             VALUES ('email-1', 'contact-1', 'Alice@Example.com', 'alice@example.com', 'work', 1, 1);
+             INSERT INTO contact_suggestion_suppressions (normalized_address, created_at)
+             VALUES ('hidden@example.com', 1);",
+        )
+        .expect("V15 contact tables should accept valid rows");
+
+        let duplicate_address = conn.execute(
+            "INSERT INTO contact_emails
+                (id, contact_id, address, normalized_address, label, is_primary, created_at)
+             VALUES ('email-2', 'contact-1', 'ALICE@example.com', 'ALICE@EXAMPLE.COM', 'other', 0, 1)",
+            [],
+        );
+        assert!(
+            duplicate_address.is_err(),
+            "normalized email addresses must be unique case-insensitively"
+        );
+
+        let second_primary = conn.execute(
+            "INSERT INTO contact_emails
+                (id, contact_id, address, normalized_address, label, is_primary, created_at)
+             VALUES ('email-3', 'contact-1', 'other@example.com', 'other@example.com', 'personal', 1, 1)",
+            [],
+        );
+        assert!(
+            second_primary.is_err(),
+            "a contact must not have more than one primary email"
+        );
+
+        conn.execute("DELETE FROM contacts WHERE id = 'contact-1'", [])
+            .unwrap();
+        let remaining_emails: i64 = conn
+            .query_row("SELECT COUNT(*) FROM contact_emails", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            remaining_emails, 0,
+            "contact emails should cascade on delete"
+        );
+    }
 
     #[test]
     fn migration_v11_adds_account_color_and_sets_schema_version() {
