@@ -1,8 +1,8 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use pebble_core::{
-    Contact, ContactEmail, ContactEmailInput, ContactEmailLabel, ContactInput, KnownContact,
-    PebbleError, Result,
+    Contact, ContactEmail, ContactEmailInput, ContactEmailLabel, ContactInput, ContactSuggestion,
+    ContactSuggestionSource, EmailAddress, KnownContact, PebbleError, Result,
 };
 use rusqlite::{params, Connection, OptionalExtension};
 
@@ -140,6 +140,64 @@ fn load_contact_with_conn(conn: &Connection, contact_id: &str) -> Result<Option<
         created_at,
         updated_at,
     }))
+}
+
+#[derive(Debug)]
+struct RecentContactCandidate {
+    name: Option<String>,
+    address: String,
+    last_interaction_at: i64,
+}
+
+fn add_recent_candidate(
+    candidates: &mut HashMap<String, RecentContactCandidate>,
+    self_address: &str,
+    name: Option<String>,
+    address: String,
+    date: i64,
+) {
+    let trimmed = address.trim();
+    let normalized = trimmed.to_lowercase();
+    if normalized.is_empty() || normalized == self_address {
+        return;
+    }
+    let email = ContactEmailInput {
+        id: None,
+        address: trimmed.to_string(),
+        label: ContactEmailLabel::Other,
+        is_primary: true,
+    };
+    if prepare_email(&email).is_err() {
+        return;
+    }
+    let name = name.and_then(|value| {
+        let value = value.trim().to_string();
+        (!value.is_empty()).then_some(value)
+    });
+
+    match candidates.get_mut(&normalized) {
+        Some(existing) if date > existing.last_interaction_at => {
+            *existing = RecentContactCandidate {
+                name,
+                address: trimmed.to_string(),
+                last_interaction_at: date,
+            };
+        }
+        Some(existing) if existing.name.is_none() && name.is_some() => {
+            existing.name = name;
+        }
+        Some(_) => {}
+        None => {
+            candidates.insert(
+                normalized,
+                RecentContactCandidate {
+                    name,
+                    address: trimmed.to_string(),
+                    last_interaction_at: date,
+                },
+            );
+        }
+    }
 }
 
 impl Store {
@@ -312,15 +370,35 @@ impl Store {
         })
     }
 
-    pub fn delete_contact(&self, contact_id: &str, _suppress_addresses: bool) -> Result<()> {
+    pub fn delete_contact(&self, contact_id: &str, suppress_addresses: bool) -> Result<()> {
         self.with_write(|conn| {
-            let deleted =
-                conn.execute("DELETE FROM contacts WHERE id = ?1", params![contact_id])?;
+            let tx = conn.unchecked_transaction()?;
+            if suppress_addresses {
+                let addresses = {
+                    let mut stmt = tx.prepare(
+                        "SELECT normalized_address FROM contact_emails WHERE contact_id = ?1",
+                    )?;
+                    let values = stmt
+                        .query_map(params![contact_id], |row| row.get::<_, String>(0))?
+                        .collect::<std::result::Result<Vec<_>, _>>()?;
+                    values
+                };
+                let now = pebble_core::now_timestamp();
+                for address in addresses {
+                    tx.execute(
+                        "INSERT OR IGNORE INTO contact_suggestion_suppressions
+                            (normalized_address, created_at) VALUES (?1, ?2)",
+                        params![address, now],
+                    )?;
+                }
+            }
+            let deleted = tx.execute("DELETE FROM contacts WHERE id = ?1", params![contact_id])?;
             if deleted == 0 {
                 return Err(PebbleError::Validation(format!(
                     "Contact not found: {contact_id}"
                 )));
             }
+            tx.commit()?;
             Ok(())
         })
     }
@@ -337,6 +415,191 @@ impl Store {
                 )));
             }
             Ok(())
+        })
+    }
+
+    pub fn suppress_contact_suggestion(&self, address: &str) -> Result<()> {
+        let (_, normalized) = prepare_email(&ContactEmailInput {
+            id: None,
+            address: address.to_string(),
+            label: ContactEmailLabel::Other,
+            is_primary: true,
+        })?;
+        self.with_write(|conn| {
+            conn.execute(
+                "INSERT OR IGNORE INTO contact_suggestion_suppressions
+                    (normalized_address, created_at) VALUES (?1, ?2)",
+                params![normalized, pebble_core::now_timestamp()],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn search_contact_suggestions(
+        &self,
+        account_id: &str,
+        query: &str,
+        limit: i64,
+    ) -> Result<Vec<ContactSuggestion>> {
+        let limit = limit.clamp(1, 100) as usize;
+        let candidate_limit = (limit.saturating_mul(5)).max(100) as i64;
+        let query = query.trim();
+        let lower_query = query.to_lowercase();
+        let escaped = query
+            .replace('\\', "\\\\")
+            .replace('%', "\\%")
+            .replace('_', "\\_");
+        let pattern = format!("%{escaped}%");
+
+        self.with_read(|conn| {
+            let self_address = conn
+                .query_row(
+                    "SELECT email FROM accounts WHERE id = ?1",
+                    params![account_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    PebbleError::Validation(format!("Account not found: {account_id}"))
+                })?
+                .trim()
+                .to_lowercase();
+
+            let suppressed = {
+                let mut stmt = conn.prepare(
+                    "SELECT normalized_address FROM contact_suggestion_suppressions",
+                )?;
+                let values = stmt
+                    .query_map([], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<HashSet<_>, _>>()?;
+                values
+            };
+
+            let mut recent = HashMap::new();
+            let mut history_stmt = conn.prepare(
+                "SELECT from_name, from_address, to_list, cc_list, bcc_list, date
+                 FROM messages
+                 WHERE account_id = ?1 AND is_deleted = 0
+                 ORDER BY date DESC
+                 LIMIT 1000",
+            )?;
+            let history_rows = history_stmt.query_map(params![account_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                ))
+            })?;
+            for row in history_rows {
+                let (from_name, from_address, to_json, cc_json, bcc_json, date) = row?;
+                add_recent_candidate(
+                    &mut recent,
+                    &self_address,
+                    (!from_name.trim().is_empty()).then_some(from_name),
+                    from_address,
+                    date,
+                );
+                for json in [&to_json, &cc_json, &bcc_json] {
+                    if let Ok(addresses) = serde_json::from_str::<Vec<EmailAddress>>(json) {
+                        for address in addresses {
+                            add_recent_candidate(
+                                &mut recent,
+                                &self_address,
+                                address.name,
+                                address.address,
+                                date,
+                            );
+                        }
+                    }
+                }
+            }
+            drop(history_stmt);
+
+            let mut suggestions = Vec::new();
+            let mut seen = HashSet::new();
+            let mut saved_stmt = conn.prepare(
+                "SELECT c.id, c.display_name, c.is_favorite,
+                        ce.address, ce.normalized_address
+                 FROM contacts c
+                 JOIN contact_emails ce ON ce.contact_id = c.id
+                 WHERE (?1 = '' OR c.display_name LIKE ?2 ESCAPE '\\' COLLATE NOCASE
+                        OR ce.address LIKE ?2 ESCAPE '\\' COLLATE NOCASE)
+                 ORDER BY c.is_favorite DESC,
+                          LOWER(CASE WHEN c.display_name = '' THEN ce.address ELSE c.display_name END),
+                          ce.is_primary DESC,
+                          LOWER(ce.address), ce.id
+                 LIMIT ?3",
+            )?;
+            let saved_rows = saved_stmt.query_map(
+                params![query, pattern, candidate_limit],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, bool>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                    ))
+                },
+            )?;
+            for row in saved_rows {
+                let (contact_id, display_name, is_favorite, address, normalized) = row?;
+                let normalized = normalized.to_lowercase();
+                if normalized == self_address || !seen.insert(normalized.clone()) {
+                    continue;
+                }
+                suggestions.push(ContactSuggestion {
+                    contact_id: Some(contact_id),
+                    name: (!display_name.trim().is_empty()).then_some(display_name),
+                    address,
+                    source: ContactSuggestionSource::Saved,
+                    is_favorite,
+                    last_interaction_at: recent
+                        .get(&normalized)
+                        .map(|item| item.last_interaction_at),
+                });
+            }
+            drop(saved_stmt);
+
+            let mut recent_entries = recent.into_iter().collect::<Vec<_>>();
+            recent_entries.sort_by(|(left_address, left), (right_address, right)| {
+                right
+                    .last_interaction_at
+                    .cmp(&left.last_interaction_at)
+                    .then_with(|| left_address.cmp(right_address))
+            });
+            for (normalized, candidate) in recent_entries {
+                if suggestions.len() >= limit {
+                    break;
+                }
+                let name_matches = candidate
+                    .name
+                    .as_ref()
+                    .map(|name| name.to_lowercase().contains(&lower_query))
+                    .unwrap_or(false);
+                if (!lower_query.is_empty()
+                    && !normalized.contains(&lower_query)
+                    && !name_matches)
+                    || suppressed.contains(&normalized)
+                    || !seen.insert(normalized)
+                {
+                    continue;
+                }
+                suggestions.push(ContactSuggestion {
+                    contact_id: None,
+                    name: candidate.name,
+                    address: candidate.address,
+                    source: ContactSuggestionSource::Recent,
+                    is_favorite: false,
+                    last_interaction_at: Some(candidate.last_interaction_at),
+                });
+            }
+
+            suggestions.truncate(limit);
+            Ok(suggestions)
         })
     }
 
@@ -564,6 +827,84 @@ mod tests {
             .unwrap();
 
         (store, account.id)
+    }
+
+    fn setup_suggestion_store() -> (Store, String, String) {
+        let store = Store::open_in_memory().unwrap();
+        let now = now_timestamp();
+        let account = Account {
+            id: new_id(),
+            email: "me@example.com".to_string(),
+            display_name: "Me".to_string(),
+            color: None,
+            provider: ProviderType::Imap,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_account(&account).unwrap();
+        let folder = Folder {
+            id: new_id(),
+            account_id: account.id.clone(),
+            remote_id: "INBOX".to_string(),
+            name: "Inbox".to_string(),
+            folder_type: FolderType::Folder,
+            role: Some(FolderRole::Inbox),
+            parent_id: None,
+            color: None,
+            is_system: true,
+            sort_order: 0,
+        };
+        store.insert_folder(&folder).unwrap();
+        (store, account.id, folder.id)
+    }
+
+    struct SuggestionMessage<'a> {
+        remote_id: &'a str,
+        from_name: &'a str,
+        from_address: &'a str,
+        to: Vec<EmailAddress>,
+        cc: Vec<EmailAddress>,
+        bcc: Vec<EmailAddress>,
+        date: i64,
+    }
+
+    fn insert_suggestion_message(
+        store: &Store,
+        account_id: &str,
+        folder_id: &str,
+        message: SuggestionMessage<'_>,
+    ) {
+        let saved = Message {
+            id: new_id(),
+            account_id: account_id.to_string(),
+            remote_id: message.remote_id.to_string(),
+            message_id_header: None,
+            in_reply_to: None,
+            references_header: None,
+            thread_id: None,
+            subject: "Contact history".to_string(),
+            snippet: String::new(),
+            from_address: message.from_address.to_string(),
+            from_name: message.from_name.to_string(),
+            to_list: message.to,
+            cc_list: message.cc,
+            bcc_list: message.bcc,
+            body_text: String::new(),
+            body_html_raw: String::new(),
+            has_attachments: false,
+            is_read: true,
+            is_starred: false,
+            is_draft: false,
+            date: message.date,
+            remote_version: None,
+            is_deleted: false,
+            deleted_at: None,
+            created_at: message.date,
+            updated_at: message.date,
+        };
+        store
+            .insert_message(&saved, &[folder_id.to_string()])
+            .unwrap();
     }
 
     #[test]
@@ -809,5 +1150,217 @@ mod tests {
 
         store.delete_contact(&saved.id, false).unwrap();
         assert!(store.get_contact(&saved.id).unwrap().is_none());
+    }
+
+    #[test]
+    fn contact_suggestions_rank_favorite_saved_then_saved_then_recent() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        let mut favorite = contact_input("Zoe Favorite", "zoe@example.com");
+        favorite.is_favorite = true;
+        store.save_contact(&favorite).unwrap();
+        store
+            .save_contact(&contact_input("Alice Saved", "alice@example.com"))
+            .unwrap();
+        insert_suggestion_message(
+            &store,
+            &account_id,
+            &folder_id,
+            SuggestionMessage {
+                remote_id: "recent",
+                from_name: "Recent Person",
+                from_address: "recent@example.com",
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                date: 300,
+            },
+        );
+
+        let results = store
+            .search_contact_suggestions(&account_id, "", 20)
+            .unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|item| item.address.as_str())
+                .collect::<Vec<_>>(),
+            vec!["zoe@example.com", "alice@example.com", "recent@example.com"]
+        );
+        assert_eq!(results[0].source, ContactSuggestionSource::Saved);
+        assert_eq!(results[2].source, ContactSuggestionSource::Recent);
+    }
+
+    #[test]
+    fn contact_suggestions_deduplicate_saved_and_recent_addresses() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        let saved = store
+            .save_contact(&contact_input("Saved Alice", "Alice@Example.com"))
+            .unwrap();
+        insert_suggestion_message(
+            &store,
+            &account_id,
+            &folder_id,
+            SuggestionMessage {
+                remote_id: "alice-history",
+                from_name: "Historical Alice",
+                from_address: "alice@example.COM",
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                date: 500,
+            },
+        );
+
+        let results = store
+            .search_contact_suggestions(&account_id, "alice", 20)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].contact_id.as_deref(), Some(saved.id.as_str()));
+        assert_eq!(results[0].source, ContactSuggestionSource::Saved);
+        assert_eq!(results[0].last_interaction_at, Some(500));
+    }
+
+    #[test]
+    fn contact_suggestions_include_cc_and_bcc_but_filter_current_account() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        insert_suggestion_message(
+            &store,
+            &account_id,
+            &folder_id,
+            SuggestionMessage {
+                remote_id: "all-recipients",
+                from_name: "Sender",
+                from_address: "sender@example.com",
+                to: vec![EmailAddress {
+                    name: Some("Me".to_string()),
+                    address: "ME@example.com".to_string(),
+                }],
+                cc: vec![EmailAddress {
+                    name: Some("Copy".to_string()),
+                    address: "copy@example.com".to_string(),
+                }],
+                bcc: vec![EmailAddress {
+                    name: Some("Blind".to_string()),
+                    address: "blind@example.com".to_string(),
+                }],
+                date: 100,
+            },
+        );
+
+        let results = store
+            .search_contact_suggestions(&account_id, "", 20)
+            .unwrap();
+        let addresses = results
+            .iter()
+            .map(|item| item.address.to_lowercase())
+            .collect::<Vec<_>>();
+        assert!(addresses.contains(&"sender@example.com".to_string()));
+        assert!(addresses.contains(&"copy@example.com".to_string()));
+        assert!(addresses.contains(&"blind@example.com".to_string()));
+        assert!(!addresses.contains(&"me@example.com".to_string()));
+    }
+
+    #[test]
+    fn recent_contact_suggestions_sort_by_latest_interaction() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        for (remote_id, address, date) in [
+            ("older", "older@example.com", 100),
+            ("newer", "newer@example.com", 200),
+        ] {
+            insert_suggestion_message(
+                &store,
+                &account_id,
+                &folder_id,
+                SuggestionMessage {
+                    remote_id,
+                    from_name: "Recent",
+                    from_address: address,
+                    to: vec![],
+                    cc: vec![],
+                    bcc: vec![],
+                    date,
+                },
+            );
+        }
+
+        let results = store
+            .search_contact_suggestions(&account_id, "", 20)
+            .unwrap();
+        assert_eq!(results[0].address, "newer@example.com");
+        assert_eq!(results[1].address, "older@example.com");
+    }
+
+    #[test]
+    fn contact_suggestion_suppression_hides_recent_but_not_saved_contact() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        insert_suggestion_message(
+            &store,
+            &account_id,
+            &folder_id,
+            SuggestionMessage {
+                remote_id: "hidden",
+                from_name: "Hidden",
+                from_address: "hidden@example.com",
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                date: 100,
+            },
+        );
+        store
+            .suppress_contact_suggestion("HIDDEN@example.com")
+            .unwrap();
+        assert!(store
+            .search_contact_suggestions(&account_id, "hidden", 20)
+            .unwrap()
+            .is_empty());
+
+        store
+            .save_contact(&contact_input("Saved Hidden", "hidden@example.com"))
+            .unwrap();
+        let results = store
+            .search_contact_suggestions(&account_id, "hidden", 20)
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].source, ContactSuggestionSource::Saved);
+    }
+
+    #[test]
+    fn suppress_contact_suggestion_rejects_invalid_email() {
+        let store = Store::open_in_memory().unwrap();
+
+        assert!(matches!(
+            store.suppress_contact_suggestion("not-an-address"),
+            Err(PebbleError::Validation(_))
+        ));
+    }
+
+    #[test]
+    fn deleting_contact_can_suppress_its_addresses_from_recent_history() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        let saved = store
+            .save_contact(&contact_input("Delete Me", "delete@example.com"))
+            .unwrap();
+        insert_suggestion_message(
+            &store,
+            &account_id,
+            &folder_id,
+            SuggestionMessage {
+                remote_id: "delete-history",
+                from_name: "Delete Me",
+                from_address: "delete@example.com",
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                date: 100,
+            },
+        );
+
+        store.delete_contact(&saved.id, true).unwrap();
+
+        assert!(store
+            .search_contact_suggestions(&account_id, "delete", 20)
+            .unwrap()
+            .is_empty());
     }
 }
