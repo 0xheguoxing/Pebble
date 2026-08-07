@@ -227,8 +227,42 @@ fn take_pending_mailto_urls(state: tauri::State<PendingMailtoUrls>) -> Vec<Strin
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn should_prefer_wayland(
+    wayland_display: Option<&std::ffi::OsStr>,
+    gdk_backend: Option<&std::ffi::OsStr>,
+    is_appimage: bool,
+) -> bool {
+    wayland_display.is_some_and(|value| !value.is_empty())
+        && (gdk_backend.is_none()
+            || (is_appimage && gdk_backend == Some(std::ffi::OsStr::new("x11"))))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Prefer native Wayland when a Wayland compositor is available.
+    //
+    // Two cases:
+    // 1. No GDK_BACKEND set at all — safe to default to wayland.
+    // 2. AppImage: the bundled GTK plugin hardcodes GDK_BACKEND=x11 in
+    //    its AppRun hook (see tauri#8541).  Detect this via the APPDIR
+    //    env var and override the AppImage default so the app actually
+    //    runs on Wayland when a compositor is present.
+    // We do NOT override any other explicit GDK_BACKEND value (e.g. a
+    // user who intentionally set GDK_BACKEND=x11 outside of AppImage).
+    #[cfg(target_os = "linux")]
+    {
+        let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+        let gdk_backend = std::env::var_os("GDK_BACKEND");
+        if should_prefer_wayland(
+            wayland_display.as_deref(),
+            gdk_backend.as_deref(),
+            std::env::var_os("APPDIR").is_some(),
+        ) {
+            std::env::set_var("GDK_BACKEND", "wayland,x11");
+        }
+    }
+
     let mut builder = tauri::Builder::default();
 
     #[cfg(desktop)]
@@ -600,7 +634,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod startup_timing_tests {
-    use super::startup_phase_timing;
+    use super::{should_prefer_wayland, startup_phase_timing};
+    use std::ffi::OsStr;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -614,5 +649,20 @@ mod startup_timing_tests {
         assert_eq!(timing.label, "search index opened");
         assert_eq!(timing.phase_ms, 175);
         assert_eq!(timing.total_ms, 250);
+    }
+
+    #[test]
+    fn wayland_preference_respects_display_backend_and_appimage_context() {
+        let display = Some(OsStr::new("wayland-0"));
+        let empty_display = Some(OsStr::new(""));
+        let x11 = Some(OsStr::new("x11"));
+        let wayland = Some(OsStr::new("wayland"));
+
+        assert!(!should_prefer_wayland(None, None, false));
+        assert!(!should_prefer_wayland(empty_display, None, false));
+        assert!(should_prefer_wayland(display, None, false));
+        assert!(!should_prefer_wayland(display, x11, false));
+        assert!(should_prefer_wayland(display, x11, true));
+        assert!(!should_prefer_wayland(display, wayland, true));
     }
 }

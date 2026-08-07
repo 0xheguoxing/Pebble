@@ -44,6 +44,15 @@ describe("macOS release configuration", () => {
     expect(buildScript.bundleTargetsForPlatform("win32")).toBe("nsis");
     expect(buildScript.bundleTargetsForPlatform("darwin")).toBe("app,dmg");
     expect(buildScript.bundleTargetsForPlatform("linux")).toBe("appimage,deb,rpm");
+    expect(buildScript.tauriBuildEnvironmentForPlatform("linux", {})).toEqual({
+      NO_STRIP: "1",
+    });
+    expect(
+      buildScript.tauriBuildEnvironmentForPlatform("linux", {
+        NO_STRIP: "0",
+      }),
+    ).toEqual({ NO_STRIP: "0" });
+    expect(buildScript.tauriBuildEnvironmentForPlatform("win32", {})).toEqual({});
   });
 
   it("keeps desktop notification clicks routable to the target message", () => {
