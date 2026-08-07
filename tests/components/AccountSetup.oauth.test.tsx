@@ -257,6 +257,33 @@ describe("AccountSetup OAuth", () => {
     });
   });
 
+  it("keeps a manually edited Outlook username independent from the mailbox address", () => {
+    const queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false } },
+    });
+
+    render(
+      <QueryClientProvider client={queryClient}>
+        <AccountSetup onClose={vi.fn()} />
+      </QueryClientProvider>,
+    );
+
+    fireEvent.click(screen.getByRole("button", { name: "Outlook" }));
+    fireEvent.change(screen.getByLabelText("Email address"), {
+      target: { value: "mailbox@outlook.com" },
+    });
+    fireEvent.change(screen.getByLabelText("Username"), {
+      target: { value: "external-login@qq.com" },
+    });
+    fireEvent.change(screen.getByLabelText("Email address"), {
+      target: { value: "renamed-mailbox@outlook.com" },
+    });
+
+    expect((screen.getByLabelText("Username") as HTMLInputElement).value).toBe(
+      "external-login@qq.com",
+    );
+  });
+
   it("clears the plaintext opt-in when security switches back to encrypted", async () => {
     // Issue #70 review: the opt-in checkbox only shows while a connection is
     // unencrypted. Checking it and then switching both sides back to an
