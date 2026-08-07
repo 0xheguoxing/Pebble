@@ -245,20 +245,19 @@ pub(crate) fn stage_local_attachment_records(
     })?;
 
     let mut records = Vec::with_capacity(source_paths.len());
-    let canonical_message_dir = message_dir.canonicalize().map_err(|e| {
-        PebbleError::Internal(format!(
-            "Failed to resolve local attachment directory {}: {e}",
-            message_dir.display()
-        ))
-    })?;
     for source in source_paths {
         let source_path = Path::new(source);
-        let source_metadata = std::fs::metadata(source_path).map_err(|e| {
-            PebbleError::Internal(format!(
-                "Attachment source file not available: {source} ({e})"
-            ))
-        })?;
+        let source_metadata = match std::fs::metadata(source_path) {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                cleanup_staged_attachment_records(&records);
+                return Err(PebbleError::Internal(format!(
+                    "Attachment source file not available: {source} ({error})"
+                )));
+            }
+        };
         if !source_metadata.is_file() {
+            cleanup_staged_attachment_records(&records);
             return Err(PebbleError::Validation(format!(
                 "Attachment source is not a file: {source}"
             )));
@@ -269,15 +268,24 @@ pub(crate) fn stage_local_attachment_records(
             .and_then(|value| value.to_str())
             .map(sanitize_stored_filename)
             .unwrap_or_else(|| "attachment".to_string());
-        let canonical_source = source_path.canonicalize().map_err(|e| {
-            PebbleError::Internal(format!("Failed to resolve attachment source {source}: {e}"))
-        })?;
-        let staged_path = if canonical_source.starts_with(&canonical_message_dir) {
-            canonical_source
-        } else {
-            let target = message_dir.join(&filename);
-            copy_attachment_file_safely(source_path, &target, |_copied, _total| {})?
-        };
+        let attachment_dir = message_dir.join(pebble_core::new_id());
+        if let Err(error) = std::fs::create_dir_all(&attachment_dir) {
+            cleanup_staged_attachment_records(&records);
+            return Err(PebbleError::Internal(format!(
+                "Failed to create local attachment directory {}: {error}",
+                attachment_dir.display()
+            )));
+        }
+        let target = attachment_dir.join(&filename);
+        let staged_path =
+            match copy_attachment_file_safely(source_path, &target, |_copied, _total| {}) {
+                Ok(path) => path,
+                Err(error) => {
+                    let _ = std::fs::remove_dir_all(&attachment_dir);
+                    cleanup_staged_attachment_records(&records);
+                    return Err(error);
+                }
+            };
         let size = std::fs::metadata(&staged_path)
             .map(|metadata| metadata.len().min(i64::MAX as u64) as i64)
             .unwrap_or(0);
@@ -295,6 +303,25 @@ pub(crate) fn stage_local_attachment_records(
     }
 
     Ok(records)
+}
+
+pub(crate) fn cleanup_staged_attachment_records(records: &[Attachment]) {
+    for record in records {
+        let Some(path) = record.local_path.as_deref().map(Path::new) else {
+            continue;
+        };
+        if let Err(error) = std::fs::remove_file(path) {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(
+                    "Failed to remove staged attachment {}: {error}",
+                    path.display()
+                );
+            }
+        }
+        if let Some(parent) = path.parent() {
+            let _ = std::fs::remove_dir(parent);
+        }
+    }
 }
 
 #[tauri::command]
@@ -443,6 +470,77 @@ mod tests {
         copy_attachment_file_safely(&staged_path, &target, |_copied, _total| {})
             .expect("download should use staged copy, not the original file");
         assert_eq!(std::fs::read(target).expect("downloaded read"), b"payload");
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn stage_local_attachment_records_keeps_duplicate_filenames_distinct() {
+        let unique = pebble_core::new_id();
+        let base = std::env::temp_dir().join(format!("pebble-attachment-duplicates-{unique}"));
+        let first_dir = base.join("first");
+        let second_dir = base.join("second");
+        let attachments_root = base.join("attachments");
+        std::fs::create_dir_all(&first_dir).unwrap();
+        std::fs::create_dir_all(&second_dir).unwrap();
+        let first = first_dir.join("report.txt");
+        let second = second_dir.join("report.txt");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+
+        let records = stage_local_attachment_records(
+            &attachments_root,
+            "message-1",
+            &[
+                first.to_string_lossy().to_string(),
+                second.to_string_lossy().to_string(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].filename, "report.txt");
+        assert_eq!(records[1].filename, "report.txt");
+        assert_ne!(records[0].local_path, records[1].local_path);
+        assert_eq!(
+            std::fs::read(records[0].local_path.as_ref().unwrap()).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            std::fs::read(records[1].local_path.as_ref().unwrap()).unwrap(),
+            b"second"
+        );
+
+        let _ = std::fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn stage_local_attachment_records_cleans_partial_copy_on_error() {
+        let unique = pebble_core::new_id();
+        let base = std::env::temp_dir().join(format!("pebble-attachment-rollback-{unique}"));
+        let source_dir = base.join("source");
+        let attachments_root = base.join("attachments");
+        std::fs::create_dir_all(&source_dir).unwrap();
+        let valid = source_dir.join("valid.txt");
+        std::fs::write(&valid, b"payload").unwrap();
+        let missing = source_dir.join("missing.txt");
+
+        let result = stage_local_attachment_records(
+            &attachments_root,
+            "message-1",
+            &[
+                valid.to_string_lossy().to_string(),
+                missing.to_string_lossy().to_string(),
+            ],
+        );
+
+        assert!(result.is_err());
+        let message_dir = attachments_root.join("message-1");
+        let remaining_files = std::fs::read_dir(&message_dir)
+            .unwrap()
+            .flat_map(|entry| std::fs::read_dir(entry.unwrap().path()).unwrap())
+            .count();
+        assert_eq!(remaining_files, 0);
 
         let _ = std::fs::remove_dir_all(base);
     }

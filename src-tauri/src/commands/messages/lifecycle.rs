@@ -7,9 +7,10 @@ use tracing::{info, warn};
 
 use super::provider_dispatch::{parse_imap_uid, ConnectedProvider};
 use super::{
-    connect_gmail, connect_imap, connect_outlook, find_folder_by_role, find_message_folder,
-    queue_pending_remote_op, queue_pending_remote_op_for_local_commit, queued_remote_error,
-    refresh_search_document, remote_mutation_allows_local_commit, remove_search_documents,
+    classify_remote_delete_result, connect_gmail, connect_imap, connect_outlook,
+    find_folder_by_role, find_message_folder, queue_pending_remote_op,
+    queue_pending_remote_op_for_local_commit, queued_remote_error, refresh_search_document,
+    remote_delete_is_already_absent, remote_mutation_allows_local_commit, remove_search_documents,
     RemoteMutationOutcome,
 };
 use serde_json::json;
@@ -59,6 +60,15 @@ fn queue_permanent_delete_failure(
     )?;
     state.store.mark_pending_mail_op_failed(&op_id, error)?;
     Ok(())
+}
+
+fn finalize_permanent_local_delete(
+    state: &AppState,
+    message_id: &str,
+) -> std::result::Result<(), PebbleError> {
+    let ids = [message_id.to_string()];
+    state.store.hard_delete_messages(&ids)?;
+    remove_search_documents(state, &ids)
 }
 
 /// Returns "archived" or "unarchived" so the frontend can show the correct toast.
@@ -506,7 +516,7 @@ pub async fn delete_message(
                 } else {
                     provider.trash_message(&msg.remote_id).await
                 };
-                match result {
+                match classify_remote_delete_result(result, is_permanent) {
                     Ok(()) => RemoteMutationOutcome::Applied,
                     Err(e) => {
                         let error = e.to_string();
@@ -565,7 +575,10 @@ pub async fn delete_message(
         ProviderType::Outlook => match connect_outlook(&state, &msg.account_id).await {
             Ok(provider) => {
                 if is_permanent {
-                    match provider.delete_message_permanently(&msg.remote_id).await {
+                    match classify_remote_delete_result(
+                        provider.delete_message_permanently(&msg.remote_id).await,
+                        true,
+                    ) {
                         Ok(()) => RemoteMutationOutcome::Applied,
                         Err(e) => {
                             let error = e.to_string();
@@ -667,7 +680,7 @@ pub async fn delete_message(
                             imap.delete_message(&source_folder.remote_id, uid).await
                         };
                         let _ = imap.disconnect().await;
-                        match result {
+                        match classify_remote_delete_result(result, is_permanent) {
                             Ok(()) => RemoteMutationOutcome::Applied,
                             Err(e) => {
                                 let error = e.to_string();
@@ -1132,81 +1145,38 @@ pub async fn empty_trash(
     let mut total_deleted: u32 = 0;
     const PAGE_SIZE: u32 = 500;
 
-    loop {
-        let messages = state
+    // Materialize a stable command-start snapshot before the first remote
+    // mutation. Deleting acknowledged rows below therefore cannot shift the
+    // pagination window and skip later messages.
+    let messages = collect_paginated(PAGE_SIZE, |limit, offset| {
+        state
             .store
-            .list_messages_by_folder(&trash.id, PAGE_SIZE, 0)?;
-        if messages.is_empty() {
-            break;
+            .list_messages_by_folder(&trash.id, limit, offset)
+    })?;
+
+    if trash.remote_id.starts_with("__local_") {
+        let ids: Vec<String> = messages.iter().map(|message| message.id.clone()).collect();
+        if !ids.is_empty() {
+            state.store.hard_delete_messages(&ids)?;
+            remove_search_documents(&state, &ids)?;
+            total_deleted = ids.len() as u32;
         }
-
-        let mut ids_to_delete: Vec<String> = Vec::new();
-
-        if trash.remote_id.starts_with("__local_") {
-            ids_to_delete.extend(messages.iter().map(|m| m.id.clone()));
-        } else if let Some(ref conn) = conn {
-            match conn {
-                ConnectedProvider::Gmail(provider) => {
-                    for msg in &messages {
-                        match provider.delete_message_permanently(&msg.remote_id).await {
-                            Ok(()) => ids_to_delete.push(msg.id.clone()),
-                            Err(e) => {
-                                let error = e.to_string();
-                                warn!("Gmail permanent delete failed for {}: {error}", msg.id);
-                                queue_permanent_delete_failure(
-                                    &state,
-                                    &account_id,
-                                    &msg.id,
-                                    &msg.remote_id,
-                                    &trash.id,
-                                    &trash.remote_id,
-                                    &error,
-                                )?;
-                            }
+    } else if let Some(ref conn) = conn {
+        match conn {
+            ConnectedProvider::Gmail(provider) => {
+                for msg in &messages {
+                    match provider.delete_message_permanently(&msg.remote_id).await {
+                        Ok(()) => {
+                            finalize_permanent_local_delete(&state, &msg.id)?;
+                            total_deleted += 1;
                         }
-                    }
-                }
-                ConnectedProvider::Outlook(provider) => {
-                    for msg in &messages {
-                        match provider.delete_message_permanently(&msg.remote_id).await {
-                            Ok(()) => ids_to_delete.push(msg.id.clone()),
-                            Err(e) => {
-                                let error = e.to_string();
-                                warn!("Outlook permanent delete failed for {}: {error}", msg.id);
-                                queue_permanent_delete_failure(
-                                    &state,
-                                    &account_id,
-                                    &msg.id,
-                                    &msg.remote_id,
-                                    &trash.id,
-                                    &trash.remote_id,
-                                    &error,
-                                )?;
-                            }
+                        Err(e) if remote_delete_is_already_absent(&e) => {
+                            finalize_permanent_local_delete(&state, &msg.id)?;
+                            total_deleted += 1;
                         }
-                    }
-                }
-                ConnectedProvider::Imap(imap) => {
-                    for msg in &messages {
-                        if let Ok(uid) = parse_imap_uid(&msg.remote_id) {
-                            match imap.delete_message(&trash.remote_id, uid).await {
-                                Ok(()) => ids_to_delete.push(msg.id.clone()),
-                                Err(e) => {
-                                    let error = e.to_string();
-                                    warn!("IMAP permanent delete failed for {}: {error}", msg.id);
-                                    queue_permanent_delete_failure(
-                                        &state,
-                                        &account_id,
-                                        &msg.id,
-                                        &msg.remote_id,
-                                        &trash.id,
-                                        &trash.remote_id,
-                                        &error,
-                                    )?;
-                                }
-                            }
-                        } else {
-                            let error = format!("Invalid IMAP UID: {}", msg.remote_id);
+                        Err(e) => {
+                            let error = e.to_string();
+                            warn!("Gmail permanent delete failed for {}: {error}", msg.id);
                             queue_permanent_delete_failure(
                                 &state,
                                 &account_id,
@@ -1216,38 +1186,96 @@ pub async fn empty_trash(
                                 &trash.remote_id,
                                 &error,
                             )?;
+                            break;
                         }
                     }
                 }
             }
-        } else {
-            let error = connect_error
-                .as_deref()
-                .unwrap_or("Remote provider unavailable");
-            for msg in &messages {
-                queue_permanent_delete_failure(
-                    &state,
-                    &account_id,
-                    &msg.id,
-                    &msg.remote_id,
-                    &trash.id,
-                    &trash.remote_id,
-                    error,
-                )?;
+            ConnectedProvider::Outlook(provider) => {
+                for msg in &messages {
+                    match provider.delete_message_permanently(&msg.remote_id).await {
+                        Ok(()) => {
+                            finalize_permanent_local_delete(&state, &msg.id)?;
+                            total_deleted += 1;
+                        }
+                        Err(e) if remote_delete_is_already_absent(&e) => {
+                            finalize_permanent_local_delete(&state, &msg.id)?;
+                            total_deleted += 1;
+                        }
+                        Err(e) => {
+                            let error = e.to_string();
+                            warn!("Outlook permanent delete failed for {}: {error}", msg.id);
+                            queue_permanent_delete_failure(
+                                &state,
+                                &account_id,
+                                &msg.id,
+                                &msg.remote_id,
+                                &trash.id,
+                                &trash.remote_id,
+                                &error,
+                            )?;
+                            break;
+                        }
+                    }
+                }
+            }
+            ConnectedProvider::Imap(imap) => {
+                for msg in &messages {
+                    if let Ok(uid) = parse_imap_uid(&msg.remote_id) {
+                        match imap.delete_message(&trash.remote_id, uid).await {
+                            Ok(()) => {
+                                finalize_permanent_local_delete(&state, &msg.id)?;
+                                total_deleted += 1;
+                            }
+                            Err(e) if remote_delete_is_already_absent(&e) => {
+                                finalize_permanent_local_delete(&state, &msg.id)?;
+                                total_deleted += 1;
+                            }
+                            Err(e) => {
+                                let error = e.to_string();
+                                warn!("IMAP permanent delete failed for {}: {error}", msg.id);
+                                queue_permanent_delete_failure(
+                                    &state,
+                                    &account_id,
+                                    &msg.id,
+                                    &msg.remote_id,
+                                    &trash.id,
+                                    &trash.remote_id,
+                                    &error,
+                                )?;
+                                break;
+                            }
+                        }
+                    } else {
+                        let error = format!("Invalid IMAP UID: {}", msg.remote_id);
+                        queue_permanent_delete_failure(
+                            &state,
+                            &account_id,
+                            &msg.id,
+                            &msg.remote_id,
+                            &trash.id,
+                            &trash.remote_id,
+                            &error,
+                        )?;
+                        break;
+                    }
+                }
             }
         }
-
-        if ids_to_delete.is_empty() {
-            break;
-        }
-
-        let batch_count = ids_to_delete.len() as u32;
-        state.store.hard_delete_messages(&ids_to_delete)?;
-        remove_search_documents(&state, &ids_to_delete)?;
-        total_deleted += batch_count;
-
-        if batch_count < PAGE_SIZE {
-            break;
+    } else {
+        let error = connect_error
+            .as_deref()
+            .unwrap_or("Remote provider unavailable");
+        for msg in &messages {
+            queue_permanent_delete_failure(
+                &state,
+                &account_id,
+                &msg.id,
+                &msg.remote_id,
+                &trash.id,
+                &trash.remote_id,
+                error,
+            )?;
         }
     }
 
@@ -1262,9 +1290,61 @@ pub async fn empty_trash(
     Ok(total_deleted)
 }
 
+fn collect_paginated<T>(
+    page_size: u32,
+    mut load_page: impl FnMut(u32, u32) -> std::result::Result<Vec<T>, PebbleError>,
+) -> std::result::Result<Vec<T>, PebbleError> {
+    debug_assert!(page_size > 0);
+    let mut items = Vec::new();
+    let mut offset = 0_u32;
+    loop {
+        let page = load_page(page_size, offset)?;
+        let page_len = page.len() as u32;
+        items.extend(page);
+        if page_len < page_size {
+            break;
+        }
+        offset = offset.saturating_add(page_len);
+    }
+    Ok(items)
+}
+
 #[cfg(test)]
 mod remote_mutation_tests {
     use super::*;
+
+    #[test]
+    fn trash_snapshot_visits_every_page_without_reloading_failed_items() {
+        let source = ["m1", "m2", "m3", "m4", "m5"];
+        let mut offsets = Vec::new();
+
+        let snapshot = collect_paginated(2, |limit, offset| {
+            offsets.push(offset);
+            Ok(source
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .copied()
+                .collect::<Vec<_>>())
+        })
+        .unwrap();
+
+        assert_eq!(snapshot, source);
+        assert_eq!(offsets, vec![0, 2, 4]);
+    }
+
+    #[test]
+    fn permanent_delete_treats_remote_absence_as_idempotent_success() {
+        assert!(remote_delete_is_already_absent(&PebbleError::Network(
+            "Failed to permanently delete message (status 404 Not Found)".to_string()
+        )));
+        assert!(remote_delete_is_already_absent(&PebbleError::Sync(
+            "NO no such message".to_string()
+        )));
+        assert!(!remote_delete_is_already_absent(&PebbleError::Network(
+            "status 503 Service Unavailable".to_string()
+        )));
+    }
 
     #[test]
     fn remote_mutation_allows_local_commit_after_remote_ack_local_only_or_offline_queue() {

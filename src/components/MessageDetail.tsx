@@ -50,7 +50,13 @@ function formatRecipients(addresses: EmailAddress[]): string {
 
 export default function MessageDetail({ messageId, onBack, folderRole }: Props) {
   const { t } = useTranslation();
-  const [privacyMode, setPrivacyMode] = useState<PrivacyMode>(() => defaultPrivacyMode());
+  const [privacyOverride, setPrivacyOverride] = useState<{
+    messageId: string;
+    mode: PrivacyMode;
+  }>(() => ({ messageId, mode: defaultPrivacyMode() }));
+  const privacyMode = privacyOverride.messageId === messageId
+    ? privacyOverride.mode
+    : defaultPrivacyMode();
   const [showSnooze, setShowSnooze] = useState(false);
   const [showSelectionActions, setShowSelectionActions] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
   const [showTranslate, setShowTranslate] = useState<{ text: string; position: { x: number; y: number } } | null>(null);
@@ -68,22 +74,23 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
 
   // Reset bilingual state when messageId changes
   useEffect(() => {
+    setPrivacyOverride({ messageId, mode: defaultPrivacyMode() });
     resetBilingual();
   }, [messageId]); // eslint-disable-line react-hooks/exhaustive-deps
 
   function handleLoadImages() {
-    setPrivacyMode("LoadOnce");
+    setPrivacyOverride({ messageId, mode: "LoadOnce" });
   }
 
   async function handleTrustSender(trustType: "images" | "all") {
     if (message) {
-      if (trustType === "all") {
-        setPrivacyMode({ TrustSender: message.from_address });
-      } else {
-        setPrivacyMode("LoadOnce");
-      }
       try {
         await trustSender(message.account_id, message.from_address, trustType);
+        if (trustType === "all") {
+          setPrivacyOverride({ messageId, mode: { TrustSender: message.from_address } });
+        } else {
+          setPrivacyOverride({ messageId, mode: "LoadOnce" });
+        }
       } catch (err) {
         console.error("Failed to persist trusted sender:", err);
       }

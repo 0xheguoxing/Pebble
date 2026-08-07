@@ -1,3 +1,7 @@
+use crate::commands::encrypted_store::{
+    encrypt_account_auth_data, load_account_auth_data, load_secure_user_data,
+    store_secure_user_data,
+};
 use crate::commands::kanban::{
     encrypt_kanban_context_notes_for_state, load_kanban_context_notes_for_state,
     KANBAN_CONTEXT_NOTES_KEY,
@@ -64,10 +68,10 @@ fn decrypt_backup_secrets(
 fn collect_backup_secrets(state: &AppState) -> std::result::Result<BackupSecrets, PebbleError> {
     let mut account_auth = Vec::new();
     for account in state.store.list_accounts()? {
-        let Some(encrypted) = state.store.get_auth_data(&account.id)? else {
+        let Some(decrypted) = load_account_auth_data(&state.crypto, &state.store, &account.id)?
+        else {
             continue;
         };
-        let decrypted = state.crypto.decrypt(&encrypted)?;
         let auth_data = serde_json::from_slice(&decrypted).map_err(|e| {
             PebbleError::Internal(format!(
                 "Failed to parse decrypted auth data for {}: {e}",
@@ -161,7 +165,7 @@ fn prepare_restored_private_data(
                 account.account_id
             ))
         })?;
-        let encrypted = state.crypto.encrypt(&auth_bytes)?;
+        let encrypted = encrypt_account_auth_data(&state.crypto, &account.account_id, &auth_bytes)?;
         private_data.auth_data.push(RestoredAuthData {
             account_id: account.account_id,
             provider: account.provider,
@@ -307,6 +311,7 @@ pub async fn restore_from_webdav(
 
 const AUTO_BACKUP_CONFIG_KEY: &str = "auto-backup-config";
 const AUTO_BACKUP_CHECK_INTERVAL_SECS: u64 = 60;
+const SUPPORTED_AUTO_BACKUP_INTERVAL_MINUTES: &[u64] = &[30, 60, 180, 360, 720, 1440];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutoBackupConfig {
@@ -318,18 +323,29 @@ pub struct AutoBackupConfig {
     pub enabled: bool,
 }
 
+fn auto_backup_interval_duration(
+    interval_minutes: u64,
+) -> std::result::Result<std::time::Duration, PebbleError> {
+    if !SUPPORTED_AUTO_BACKUP_INTERVAL_MINUTES.contains(&interval_minutes) {
+        return Err(PebbleError::Internal(format!(
+            "Unsupported auto-backup interval: {interval_minutes} minutes"
+        )));
+    }
+    let seconds = interval_minutes
+        .checked_mul(60)
+        .ok_or_else(|| PebbleError::Internal("Auto-backup interval is too large".to_string()))?;
+    Ok(std::time::Duration::from_secs(seconds))
+}
+
 #[tauri::command]
 pub fn save_auto_backup_config(
     state: State<'_, AppState>,
     config: AutoBackupConfig,
 ) -> std::result::Result<(), PebbleError> {
+    auto_backup_interval_duration(config.interval_minutes)?;
     let json = serde_json::to_vec(&config)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize config: {e}")))?;
-    let encrypted = state.crypto.encrypt(&json)?;
-    state
-        .store
-        .set_secure_user_data(AUTO_BACKUP_CONFIG_KEY, &encrypted)?;
-    Ok(())
+    store_secure_user_data(&state.crypto, &state.store, AUTO_BACKUP_CONFIG_KEY, &json)
 }
 
 #[tauri::command]
@@ -343,12 +359,12 @@ fn load_auto_backup_config_inner(
     store: &pebble_store::Store,
     crypto: &pebble_crypto::CryptoService,
 ) -> std::result::Result<Option<AutoBackupConfig>, PebbleError> {
-    let Some(encrypted) = store.get_secure_user_data(AUTO_BACKUP_CONFIG_KEY)? else {
+    let Some(json) = load_secure_user_data(crypto, store, AUTO_BACKUP_CONFIG_KEY)? else {
         return Ok(None);
     };
-    let json = crypto.decrypt(&encrypted)?;
     let config: AutoBackupConfig = serde_json::from_slice(&json)
         .map_err(|e| PebbleError::Internal(format!("Failed to deserialize config: {e}")))?;
+    auto_backup_interval_duration(config.interval_minutes)?;
     Ok(Some(config))
 }
 
@@ -374,10 +390,20 @@ pub async fn run_auto_backup_worker(app: tauri::AppHandle) {
         let state = app.state::<AppState>();
         let config = match load_auto_backup_config_inner(&state.store, &state.crypto) {
             Ok(Some(c)) if c.enabled => c,
-            _ => continue,
+            Ok(_) => continue,
+            Err(error) => {
+                tracing::warn!("[auto-backup] invalid stored config; backup disabled: {error}");
+                continue;
+            }
         };
 
-        let backup_interval = std::time::Duration::from_secs(config.interval_minutes * 60);
+        let backup_interval = match auto_backup_interval_duration(config.interval_minutes) {
+            Ok(interval) => interval,
+            Err(error) => {
+                tracing::warn!("[auto-backup] invalid interval; backup disabled: {error}");
+                continue;
+            }
+        };
         if let Some(last) = last_backup_at {
             if last.elapsed() < backup_interval {
                 continue;
@@ -409,6 +435,19 @@ pub async fn run_auto_backup_worker(app: tauri::AppHandle) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn auto_backup_interval_accepts_only_supported_values() {
+        for minutes in [30, 60, 180, 360, 720, 1440] {
+            assert_eq!(
+                auto_backup_interval_duration(minutes).unwrap(),
+                std::time::Duration::from_secs(minutes * 60),
+            );
+        }
+        for minutes in [0, 15, 1441, u64::MAX] {
+            assert!(auto_backup_interval_duration(minutes).is_err());
+        }
+    }
 
     #[test]
     fn encrypted_backup_secrets_round_trip_without_plaintext_leaks() {

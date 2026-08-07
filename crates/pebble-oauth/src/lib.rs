@@ -221,7 +221,7 @@ impl OAuthManager {
 }
 
 pub fn build_http_client(network: &OAuthNetworkConfig) -> Result<reqwest::Client, OAuthError> {
-    let mut builder = reqwest::ClientBuilder::new();
+    let mut builder = reqwest::ClientBuilder::new().no_proxy();
     if let Some(proxy) = &network.proxy {
         let uri = proxy.socks5h_uri().map_err(OAuthError::Config)?;
         let reqwest_proxy = reqwest::Proxy::all(&uri)

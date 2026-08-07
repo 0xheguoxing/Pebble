@@ -13,7 +13,8 @@ use crate::parser::parse_raw_email;
 use crate::pop3::{Pop3MessageRef, Pop3Provider};
 use crate::realtime_policy::{RealtimePollPolicy, RealtimeRuntimeState, SyncTrigger};
 use crate::sync::{
-    persist_message_attachments_async, recv_sync_trigger, StoredMessage, SyncConfig, SyncError,
+    preserve_local_state_for_attachment_repair, recv_sync_trigger, remote_message_requires_fetch,
+    store_new_message_with_attachments_atomically, StoredMessage, SyncConfig, SyncError,
     SyncProgress, SyncWorkerBase,
 };
 use crate::thread::compute_thread_id;
@@ -230,6 +231,14 @@ impl Pop3SyncWorker {
             .get_existing_remote_ids_in_folder(&self.base.account_id, &inbox.id, &remote_ids)?
             .into_iter()
             .collect::<HashSet<_>>();
+        let incomplete = self
+            .base
+            .store
+            .get_incomplete_attachment_message_map_by_remote_ids(
+                &self.base.account_id,
+                Some(&inbox.id),
+                &remote_ids,
+            )?;
 
         if let Some(state) = self.base.store.get_sync_state(&self.base.account_id)? {
             if let Some(value) = state.extra.get(POP3_SEEN_UIDLS_KEY) {
@@ -240,6 +249,9 @@ impl Pop3SyncWorker {
                 }
             }
         }
+        known.retain(|remote_id| {
+            !remote_message_requires_fetch(true, incomplete.contains_key(remote_id))
+        });
         Ok(known)
     }
 
@@ -270,8 +282,19 @@ impl Pop3SyncWorker {
     ) -> Result<()> {
         let parsed = parse_raw_email(&raw)?;
         let now = now_timestamp();
+        let remote_ids = vec![message_ref.uid.clone()];
+        let incomplete = self
+            .base
+            .store
+            .get_incomplete_attachment_message_map_by_remote_ids(
+                &self.base.account_id,
+                Some(&inbox.id),
+                &remote_ids,
+            )?;
+        let repaired_local_id = incomplete.get(&message_ref.uid).cloned();
+        let repairing_incomplete = repaired_local_id.is_some();
         let mut msg = Message {
-            id: new_id(),
+            id: repaired_local_id.unwrap_or_else(new_id),
             account_id: self.base.account_id.clone(),
             remote_id: message_ref.uid.clone(),
             message_id_header: parsed.message_id_header.clone(),
@@ -306,20 +329,27 @@ impl Pop3SyncWorker {
             .get_thread_mappings_for_refs(&self.base.account_id, &refs)
             .unwrap_or_default();
         msg.thread_id = Some(compute_thread_id(&msg, &mappings));
-        self.base
-            .store
-            .insert_message(&msg, std::slice::from_ref(&inbox.id))?;
-        persist_message_attachments_async(
+        let mut folder_ids = vec![inbox.id.clone()];
+        if repairing_incomplete {
+            preserve_local_state_for_attachment_repair(
+                &self.base.store,
+                &mut msg,
+                &mut folder_ids,
+            )?;
+        }
+        store_new_message_with_attachments_atomically(
             Arc::clone(&self.base.store),
             self.base.attachments_dir.clone(),
-            msg.id.clone(),
+            msg.clone(),
+            folder_ids.clone(),
             parsed.attachments,
         )
-        .await;
+        .await?;
         self.base.emit_message(StoredMessage {
             message: msg,
-            folder_ids: vec![inbox.id.clone()],
-            notify: notify_new,
+            folder_ids,
+            notify: notify_new && !repairing_incomplete,
+            reconciliation: repairing_incomplete,
         });
         Ok(())
     }

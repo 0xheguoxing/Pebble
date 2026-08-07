@@ -9,6 +9,7 @@ pub mod compose;
 pub mod contacts;
 pub mod diagnostics;
 pub mod drafts;
+pub(crate) mod encrypted_store;
 pub mod folder_counts;
 pub mod folders;
 pub mod gmail_labels;

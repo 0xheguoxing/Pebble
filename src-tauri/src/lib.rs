@@ -414,33 +414,17 @@ pub fn run() {
             let app_for_reindex = app_handle.clone();
             let reindex_handle = tauri::async_runtime::spawn_blocking(move || {
                 // 1. Process any pending search ops left over from a previous crash.
-                let pending = store_for_reindex.list_search_pending().unwrap_or_default();
-                if !pending.is_empty() {
-                    tracing::info!("Recovering {} pending search operations from previous session", pending.len());
-                    let mut ids_to_clear = Vec::with_capacity(pending.len());
-                    for (msg_id, op) in &pending {
-                        match op.as_str() {
-                            "remove" => {
-                                let _ = search_for_reindex.remove_message(msg_id);
-                            }
-                            _ => {
-                                match store_for_reindex.get_message(msg_id) {
-                                    Ok(Some(msg)) if !msg.is_deleted => {
-                                        let folder_ids = store_for_reindex.get_message_folder_ids(msg_id).unwrap_or_default();
-                                        if folder_ids.is_empty() {
-                                            let _ = search_for_reindex.remove_message(msg_id);
-                                        } else {
-                                            let _ = search_for_reindex.index_message(&msg, &folder_ids);
-                                        }
-                                    }
-                                    _ => { let _ = search_for_reindex.remove_message(msg_id); }
-                                }
-                            }
-                        }
-                        ids_to_clear.push(msg_id.clone());
-                    }
-                    let _ = search_for_reindex.commit();
-                    let _ = store_for_reindex.clear_search_pending(&ids_to_clear);
+                match commands::indexing::recover_pending_search_operations(
+                    &store_for_reindex,
+                    &search_for_reindex,
+                ) {
+                    Ok(recovered) if recovered > 0 => tracing::info!(
+                        "Recovered {recovered} pending search operations from previous session"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        "Search recovery did not commit; pending operations were retained: {error}"
+                    ),
                 }
 
                 // 2. Full rebuild if schema changed or counts diverge.
@@ -468,11 +452,15 @@ pub fn run() {
                     match commands::indexing::do_reindex(&store_for_reindex, &search_for_reindex) {
                         Ok(n) => {
                             tracing::info!("Background reindex complete: {n} messages indexed");
+                            if let Err(error) = store_for_reindex.clear_all_search_pending() {
+                                tracing::warn!(
+                                    "Search rebuild committed but recovery markers could not be cleared: {error}"
+                                );
+                            }
                             let _ = app_for_reindex.emit("search:reindex-complete", n);
                         }
                         Err(e) => tracing::error!("Background reindex failed: {e}"),
                     }
-                    let _ = store_for_reindex.clear_all_search_pending();
                 }
             });
 
@@ -578,6 +566,7 @@ pub fn run() {
             commands::rules::delete_rule,
             commands::compose::send_email,
             commands::compose::stage_compose_attachment,
+            commands::compose::cleanup_staged_compose_attachment,
             commands::trusted_senders::trust_sender,
             commands::trusted_senders::list_trusted_senders,
             commands::trusted_senders::remove_trusted_sender,
@@ -627,6 +616,7 @@ pub fn run() {
             commands::user_data::delete_email_template,
             commands::user_data::get_email_signature,
             commands::user_data::set_email_signature,
+            commands::user_data::migrate_email_signature_if_absent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

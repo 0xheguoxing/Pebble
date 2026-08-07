@@ -165,7 +165,7 @@ pub struct GmailProvider {
 impl GmailProvider {
     pub fn new(access_token: String) -> Self {
         Self {
-            client: Client::new(),
+            client: http_client_with_proxy(None).expect("failed to build Gmail HTTP client"),
             access_token: RwLock::new(access_token),
         }
     }
@@ -505,6 +505,14 @@ mod proxy_tests {
     use super::*;
     use pebble_core::HttpProxyConfig;
 
+    #[tokio::test]
+    async fn gmail_provider_new_ignores_all_proxy() {
+        crate::provider::proxy_test_support::assert_client_builder_ignores_all_proxy(|| {
+            GmailProvider::new("access-token".to_string()).client
+        })
+        .await;
+    }
+
     #[test]
     fn gmail_provider_accepts_socks5_proxy() {
         let provider = GmailProvider::new_with_proxy(
@@ -792,6 +800,9 @@ impl DraftProvider for GmailProvider {
         let resp = self
             .delete(&format!("{GMAIL_API_BASE}/drafts/{draft_id}"))
             .await?;
+        if resp.status().as_u16() == 404 {
+            return Ok(());
+        }
         if !resp.status().is_success() {
             let status = resp.status();
             return Err(PebbleError::Network(format!(

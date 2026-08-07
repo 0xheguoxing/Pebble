@@ -10,6 +10,7 @@ const AES_GCM_MIN_PAYLOAD_SIZE: usize = 12 + 16;
 const DEFAULT_PBKDF2_ITERATIONS: u32 = 210_000;
 const ALGORITHM: &str = "aes-256-gcm";
 const KDF: &str = "pbkdf2-hmac-sha256";
+const BACKUP_SECRET_AAD: &[u8] = b"pebble.backup.secrets.v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PassphraseEncryptedBlob {
@@ -29,7 +30,7 @@ pub fn encrypt_with_passphrase(
     let mut salt = [0u8; SALT_SIZE];
     rand::thread_rng().fill_bytes(&mut salt);
     let key = derive_key(passphrase, &salt, DEFAULT_PBKDF2_ITERATIONS)?;
-    let ciphertext = crate::aes::encrypt(&key, plaintext)?;
+    let ciphertext = crate::aes::encrypt_enveloped(&key, plaintext, BACKUP_SECRET_AAD)?;
 
     Ok(PassphraseEncryptedBlob {
         algorithm: ALGORITHM.to_string(),
@@ -62,7 +63,7 @@ pub fn decrypt_with_passphrase(
     }
     let key = derive_key(passphrase, &salt, blob.iterations)?;
 
-    crate::aes::decrypt(&key, &ciphertext)
+    Ok(crate::aes::decrypt_enveloped(&key, &ciphertext, BACKUP_SECRET_AAD)?.plaintext)
 }
 
 fn validate_passphrase(passphrase: &str) -> Result<()> {
@@ -118,15 +119,33 @@ fn hex_encode(bytes: &[u8]) -> String {
 }
 
 fn hex_decode(s: &str) -> Result<Vec<u8>> {
-    if !s.len().is_multiple_of(2) {
-        return Err(PebbleError::Validation(
-            "Invalid backup secret hex length".to_string(),
-        ));
+    hex::decode(s)
+        .map_err(|error| PebbleError::Validation(format!("Invalid backup secret hex: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passphrase_encryption_emits_v1_envelope() {
+        let encrypted = encrypt_with_passphrase(b"backup secrets", "passphrase").unwrap();
+        let ciphertext = hex_decode(&encrypted.ciphertext_hex).unwrap();
+
+        assert!(ciphertext.starts_with(b"PEBBLE\0\x01"));
     }
 
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-        .collect::<std::result::Result<Vec<u8>, _>>()
-        .map_err(|e| PebbleError::Validation(format!("Invalid backup secret hex: {e}")))
+    #[test]
+    fn passphrase_decryption_reads_legacy_ciphertext() {
+        let mut encrypted = encrypt_with_passphrase(b"placeholder", "passphrase").unwrap();
+        let salt = hex_decode(&encrypted.salt_hex).unwrap();
+        let key = derive_key("passphrase", &salt, encrypted.iterations).unwrap();
+        let legacy = crate::aes::encrypt(&key, b"legacy backup secrets").unwrap();
+        encrypted.ciphertext_hex = hex_encode(&legacy);
+
+        assert_eq!(
+            decrypt_with_passphrase(&encrypted, "passphrase").unwrap(),
+            b"legacy backup secrets"
+        );
+    }
 }

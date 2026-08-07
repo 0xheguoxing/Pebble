@@ -210,6 +210,33 @@ describe("MessageItem", () => {
     expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["message", "message-1"] });
   });
 
+  it("rolls back optimistic star state and shows an error when persistence fails", async () => {
+    const snapshot = { messages: "before-star" };
+    const onToggleStar = vi.fn();
+    mocks.snapshotMessagesCache.mockReturnValueOnce(snapshot);
+    mocks.updateMessageFlags.mockRejectedValueOnce(new Error("star failed"));
+
+    render(
+      <MessageItem
+        message={makeMessage({ is_starred: false })}
+        isSelected={false}
+        onClick={vi.fn()}
+        onToggleStar={onToggleStar}
+      />,
+    );
+
+    fireEvent.mouseEnter(screen.getByRole("option"));
+    fireEvent.click(screen.getByRole("button", { name: "Star" }));
+
+    expect(onToggleStar).toHaveBeenCalledWith("message-1", true);
+    await waitFor(() => expect(onToggleStar).toHaveBeenLastCalledWith("message-1", false));
+    expect(mocks.restoreMessagesCache).toHaveBeenCalledWith(mocks.queryClient, snapshot);
+    expect(mocks.addToast).toHaveBeenCalledWith({
+      message: "Failed to star message",
+      type: "error",
+    });
+  });
+
   it("uses the custom batch checkbox control for row selection", () => {
     const onToggleBatchSelect = vi.fn();
 

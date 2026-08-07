@@ -343,14 +343,26 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
           <button
             onClick={(e) => {
               e.stopPropagation();
-              updateMessageFlags(message.id, undefined, !message.is_starred)
+              const nextStarred = !message.is_starred;
+              const previousLists = snapshotMessagesCache(queryClient);
+              onToggleStar?.(message.id, nextStarred);
+              updateMessageFlags(message.id, undefined, nextStarred)
                 .then(() => {
                   invalidateMessageViews();
                   queryClient.invalidateQueries({ queryKey: ["starred-messages"] });
                   queryClient.invalidateQueries({ queryKey: ["message", message.id] });
                 })
-                .catch(console.error);
-              if (onToggleStar) onToggleStar(message.id, !message.is_starred);
+                .catch(() => {
+                  restoreMessagesCache(queryClient, previousLists);
+                  onToggleStar?.(message.id, message.is_starred);
+                  invalidateMessageViews();
+                  queryClient.invalidateQueries({ queryKey: ["starred-messages"] });
+                  queryClient.invalidateQueries({ queryKey: ["message", message.id] });
+                  const failureMessage = message.is_starred
+                    ? t("messageActions.unstarFailed", "Failed to unstar message")
+                    : t("messageActions.starFailed", "Failed to star message");
+                  useToastStore.getState().addToast({ message: failureMessage, type: "error" });
+                });
             }}
             aria-label={message.is_starred ? t("messageActions.unstar") : t("messageActions.star")}
             aria-pressed={message.is_starred}

@@ -6,6 +6,7 @@ pub mod rendering;
 
 // Shared helpers used by flags and lifecycle submodules.
 
+use crate::commands::encrypted_store::load_account_auth_data;
 use crate::commands::network::{
     account_proxy_mode_from_auth_value, resolve_mail_proxy_from_mode, AccountProxyMode,
 };
@@ -35,6 +36,24 @@ pub(super) fn remote_mutation_allows_local_commit(outcome: RemoteMutationOutcome
             | RemoteMutationOutcome::QueuedLocalCommit
             | RemoteMutationOutcome::LocalOnly
     )
+}
+
+pub(super) fn remote_delete_is_already_absent(error: &PebbleError) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("status 404")
+        || message.contains("404 not found")
+        || message.contains("message not found")
+        || message.contains("no such message")
+}
+
+pub(super) fn classify_remote_delete_result(
+    result: std::result::Result<(), PebbleError>,
+    permanent: bool,
+) -> std::result::Result<(), PebbleError> {
+    match result {
+        Err(error) if permanent && remote_delete_is_already_absent(&error) => Ok(()),
+        result => result,
+    }
 }
 
 pub(super) fn queue_pending_remote_op(
@@ -184,10 +203,9 @@ pub(super) fn load_imap_config(
     crypto: &CryptoService,
     account_id: &str,
 ) -> std::result::Result<ImapConfig, PebbleError> {
-    let (mut config, proxy_mode): (ImapConfig, AccountProxyMode) = if let Some(encrypted) =
-        store.get_auth_data(account_id)?
+    let (mut config, proxy_mode): (ImapConfig, AccountProxyMode) = if let Some(decrypted) =
+        load_account_auth_data(crypto, store, account_id)?
     {
-        let decrypted = crypto.decrypt(&encrypted)?;
         let value: serde_json::Value = serde_json::from_slice(&decrypted)
             .map_err(|e| PebbleError::Internal(format!("Failed to parse config: {e}")))?;
         let proxy_mode = account_proxy_mode_from_auth_value(&value);
@@ -231,8 +249,9 @@ pub(super) fn load_pop3_config(
     crypto: &CryptoService,
     account_id: &str,
 ) -> std::result::Result<Pop3Config, PebbleError> {
-    let (imap_config, proxy_mode) = if let Some(encrypted) = store.get_auth_data(account_id)? {
-        let decrypted = crypto.decrypt(&encrypted)?;
+    let (imap_config, proxy_mode) = if let Some(decrypted) =
+        load_account_auth_data(crypto, store, account_id)?
+    {
         let value: serde_json::Value = serde_json::from_slice(&decrypted)
             .map_err(|e| PebbleError::Internal(format!("Failed to parse config: {e}")))?;
         let proxy_mode = account_proxy_mode_from_auth_value(&value);

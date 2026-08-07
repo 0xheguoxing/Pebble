@@ -12,7 +12,6 @@ pub struct KeyStore;
 trait DekCredential {
     fn get_secret(&self) -> std::result::Result<Vec<u8>, keyring::Error>;
     fn set_secret(&self, secret: &[u8]) -> std::result::Result<(), keyring::Error>;
-    fn delete_credential(&self) -> std::result::Result<(), keyring::Error>;
 }
 
 impl DekCredential for keyring::Entry {
@@ -22,10 +21,6 @@ impl DekCredential for keyring::Entry {
 
     fn set_secret(&self, secret: &[u8]) -> std::result::Result<(), keyring::Error> {
         keyring::Entry::set_secret(self, secret)
-    }
-
-    fn delete_credential(&self) -> std::result::Result<(), keyring::Error> {
-        keyring::Entry::delete_credential(self)
     }
 }
 
@@ -86,26 +81,16 @@ fn get_or_create_dek_from_credential(
                 return Ok(key);
             }
 
-            warn!(
-                "Stored DEK has an invalid format (len={}); replacing it",
+            Err(PebbleError::Auth(format!(
+                "Stored DEK has an invalid format (len={}); refusing to overwrite it",
                 secret.len()
-            );
-            replace_dek(credential)
+            )))
         }
         Err(keyring::Error::NoEntry) => {
             info!("No DEK found, generating new one");
             generate_and_store_dek(credential)
         }
         Err(e) => Err(PebbleError::Auth(format!("Keyring read error: {e}"))),
-    }
-}
-
-fn replace_dek(credential: &impl DekCredential) -> Result<Zeroizing<[u8; DEK_LEN]>> {
-    match credential.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => generate_and_store_dek(credential),
-        Err(e) => Err(PebbleError::Auth(format!(
-            "Failed to delete invalid DEK: {e}"
-        ))),
     }
 }
 
@@ -126,7 +111,6 @@ mod tests {
 
     struct FakeCredential {
         secret: RefCell<Option<Vec<u8>>>,
-        deletes: Cell<usize>,
         writes: Cell<usize>,
     }
 
@@ -134,7 +118,6 @@ mod tests {
         fn with_secret(secret: Vec<u8>) -> Self {
             Self {
                 secret: RefCell::new(Some(secret)),
-                deletes: Cell::new(0),
                 writes: Cell::new(0),
             }
         }
@@ -142,7 +125,6 @@ mod tests {
         fn without_secret() -> Self {
             Self {
                 secret: RefCell::new(None),
-                deletes: Cell::new(0),
                 writes: Cell::new(0),
             }
         }
@@ -162,28 +144,17 @@ mod tests {
             self.secret.borrow_mut().replace(secret.to_vec());
             Ok(())
         }
-
-        fn delete_credential(&self) -> std::result::Result<(), keyring::Error> {
-            self.deletes.set(self.deletes.get() + 1);
-            self.secret.borrow_mut().take();
-            Ok(())
-        }
     }
 
     #[test]
-    fn invalid_stored_dek_is_replaced_with_new_hex_encoded_dek() {
+    fn invalid_stored_dek_is_rejected_without_overwriting_it() {
         let credential = FakeCredential::with_secret(vec![7u8; 50]);
 
-        let dek = get_or_create_dek_from_credential(&credential).unwrap();
+        let error = get_or_create_dek_from_credential(&credential).unwrap_err();
 
-        assert_eq!(dek.len(), DEK_LEN);
-        assert_eq!(
-            credential.secret.borrow().as_ref().unwrap().len(),
-            DEK_LEN * 2
-        );
-        assert_eq!(&*credential.stored_key(), &*dek);
-        assert_eq!(credential.deletes.get(), 1);
-        assert_eq!(credential.writes.get(), 1);
+        assert!(error.to_string().contains("invalid format"));
+        assert_eq!(credential.secret.borrow().as_deref(), Some(&[7u8; 50][..]));
+        assert_eq!(credential.writes.get(), 0);
     }
 
     #[test]
@@ -198,7 +169,6 @@ mod tests {
             credential.secret.borrow().as_deref().unwrap(),
             hex::encode(raw_key).as_bytes()
         );
-        assert_eq!(credential.deletes.get(), 0);
         assert_eq!(credential.writes.get(), 1);
     }
 
@@ -210,7 +180,6 @@ mod tests {
         let dek = get_or_create_dek_from_credential(&credential).unwrap();
 
         assert_eq!(&*dek, &raw_key);
-        assert_eq!(credential.deletes.get(), 0);
         assert_eq!(credential.writes.get(), 0);
     }
 
@@ -225,7 +194,6 @@ mod tests {
             DEK_LEN * 2
         );
         assert_eq!(&*credential.stored_key(), &*dek);
-        assert_eq!(credential.deletes.get(), 0);
         assert_eq!(credential.writes.get(), 1);
     }
 }

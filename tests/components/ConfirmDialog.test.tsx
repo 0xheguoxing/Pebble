@@ -77,4 +77,39 @@ describe("ConfirmDialog", () => {
 
     expect(onCancel).not.toHaveBeenCalled();
   });
+
+  it("keeps actions inert and focus contained while a destructive action is busy", () => {
+    const onCancel = vi.fn();
+    const onConfirm = vi.fn();
+    render(
+      <ConfirmDialog
+        title="Discard draft?"
+        message="Cleaning up the saved draft."
+        confirmLabel="Discard"
+        busyConfirmLabel="Discarding..."
+        destructive
+        busy
+        onConfirm={onConfirm}
+        onCancel={onCancel}
+      />,
+    );
+
+    const dialog = screen.getByRole("dialog");
+    const cancelButton = screen.getByRole("button", { name: "Cancel" });
+    const confirmButton = screen.getByRole("button", { name: "Discarding..." });
+    expect(dialog.getAttribute("aria-busy")).toBe("true");
+    expect(cancelButton.getAttribute("aria-disabled")).toBe("true");
+    expect(confirmButton.getAttribute("aria-disabled")).toBe("true");
+
+    fireEvent.click(cancelButton);
+    fireEvent.click(confirmButton);
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(onCancel).not.toHaveBeenCalled();
+    expect(onConfirm).not.toHaveBeenCalled();
+
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(confirmButton);
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(cancelButton);
+  });
 });

@@ -4,7 +4,8 @@ use super::network::{
     AccountProxyMode, AccountProxySetting,
 };
 use crate::account_colors::default_account_color;
-use crate::state::AppState;
+use crate::commands::encrypted_store::{load_account_auth_data, store_account_auth_data};
+use crate::state::{AppState, OAuthAccountLockRegistry};
 use pebble_core::{
     new_id, now_timestamp, Account, HttpProxyConfig, OAuthTokens, PebbleError, ProviderType,
 };
@@ -15,6 +16,18 @@ use pebble_store::Store;
 use std::sync::Arc;
 use tauri::State;
 use tracing::debug;
+
+async fn oauth_account_lock(
+    registry: &OAuthAccountLockRegistry,
+    account_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = registry.lock().await;
+    Arc::clone(
+        locks
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
@@ -482,9 +495,7 @@ fn persist_stored_oauth_auth_data_raw(
 ) -> Result<(), PebbleError> {
     let config_bytes = serde_json::to_vec(stored)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize OAuth auth data: {e}")))?;
-    let encrypted = crypto.encrypt(&config_bytes)?;
-    store.set_auth_data(account_id, &encrypted)?;
-    Ok(())
+    store_account_auth_data(crypto, store, account_id, &config_bytes)
 }
 
 fn read_stored_oauth_auth_data_raw(
@@ -492,10 +503,9 @@ fn read_stored_oauth_auth_data_raw(
     store: &Store,
     account_id: &str,
 ) -> Result<Option<StoredOAuthAuthData>, PebbleError> {
-    let Some(encrypted) = store.get_auth_data(account_id)? else {
+    let Some(decrypted) = load_account_auth_data(crypto, store, account_id)? else {
         return Ok(None);
     };
-    let decrypted = crypto.decrypt(&encrypted)?;
     decode_stored_oauth_auth_data(&decrypted).map(Some)
 }
 
@@ -558,6 +568,7 @@ pub(crate) fn build_oauth_token_refresher(
     fallback_access_token: String,
     crypto: Arc<CryptoService>,
     store: Arc<Store>,
+    account_locks: OAuthAccountLockRegistry,
     account_id: String,
 ) -> TokenRefresher {
     match refresh_token {
@@ -566,15 +577,18 @@ pub(crate) fn build_oauth_token_refresher(
                 let config = oauth_config.clone();
                 let crypto = Arc::clone(&crypto);
                 let store = Arc::clone(&store);
+                let account_locks = Arc::clone(&account_locks);
                 let account_id = account_id.clone();
                 let initial_rt = initial_rt.clone();
                 Box::pin(async move {
+                    let account_lock = oauth_account_lock(&account_locks, &account_id).await;
+                    let _account_guard = account_lock.lock().await;
                     // Read the latest refresh token from the encrypted store.
                     // OAuth providers (especially Microsoft) may rotate refresh tokens
                     // on each use, so the initially captured token may be stale.
-                    let (rt, network) = match store.get_auth_data(&account_id)? {
-                        Some(encrypted) => {
-                            let decrypted = crypto.decrypt(&encrypted)?;
+                    let (rt, network) = match load_account_auth_data(&crypto, &store, &account_id)?
+                    {
+                        Some(decrypted) => {
                             let stored = decode_stored_oauth_auth_data(&decrypted)?;
                             let effective_proxy = effective_oauth_proxy(&crypto, &store, &stored)?;
                             (
@@ -623,6 +637,8 @@ pub(crate) async fn ensure_account_oauth_auth(
     account_id: &str,
     provider: &str,
 ) -> Result<ResolvedOAuthAuth, PebbleError> {
+    let account_lock = oauth_account_lock(&state.oauth_account_locks, account_id).await;
+    let _account_guard = account_lock.lock().await;
     let stored = read_stored_oauth_auth_data_raw(&state.crypto, &state.store, account_id)?
         .ok_or_else(|| {
             PebbleError::Internal(format!("No auth data found for account {account_id}"))
@@ -835,6 +851,8 @@ pub async fn update_oauth_account_proxy_setting(
     proxy_host: Option<String>,
     proxy_port: Option<u16>,
 ) -> std::result::Result<(), PebbleError> {
+    let account_lock = oauth_account_lock(&state.oauth_account_locks, &account_id).await;
+    let _account_guard = account_lock.lock().await;
     ensure_oauth_account_provider(&state, &account_id)?;
     let setting = account_proxy_setting_from_parts(mode, proxy_host, proxy_port, "OAuth proxy")?;
     let stored = read_stored_oauth_auth_data_raw(&state.crypto, &state.store, &account_id)?
@@ -855,6 +873,31 @@ mod tests {
 
     fn env_lock() -> &'static Mutex<()> {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    #[tokio::test]
+    async fn oauth_rmw_lock_is_shared_per_account_but_not_across_accounts() {
+        let registry: OAuthAccountLockRegistry =
+            Arc::new(tokio::sync::Mutex::new(Default::default()));
+        let first = oauth_account_lock(&registry, "account-a").await;
+        let same_account = oauth_account_lock(&registry, "account-a").await;
+        let other_account = oauth_account_lock(&registry, "account-b").await;
+
+        assert!(Arc::ptr_eq(&first, &same_account));
+        assert!(!Arc::ptr_eq(&first, &other_account));
+
+        let guard = first.lock().await;
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(10), same_account.lock())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(10), other_account.lock())
+                .await
+                .is_ok()
+        );
+        drop(guard);
     }
 
     struct EnvVarGuard {

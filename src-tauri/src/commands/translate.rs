@@ -1,22 +1,40 @@
 use super::network::get_global_proxy_raw;
+use crate::commands::encrypted_store::{ACTIVE_TRANSLATE_CONFIG_ID, TRANSLATE_CONFIG_PURPOSE};
 use crate::state::AppState;
 use pebble_core::{now_timestamp, PebbleError, TranslateConfig};
+use pebble_crypto::CryptoService;
+use pebble_store::Store;
 use pebble_translate::types::{TranslateProviderConfig, TranslateResult};
 use pebble_translate::TranslateService;
 use tauri::State;
 
 /// Decode a hex string to bytes.
 fn hex_decode(s: &str) -> std::result::Result<Vec<u8>, PebbleError> {
-    if !s.len().is_multiple_of(2) {
+    let bytes = s.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
         return Err(PebbleError::Internal(
             "Invalid hex string length".to_string(),
         ));
     }
-    (0..s.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&s[i..i + 2], 16))
-        .collect::<Result<Vec<u8>, _>>()
-        .map_err(|e| PebbleError::Internal(format!("Invalid hex: {e}")))
+    bytes
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])
+                .ok_or_else(|| PebbleError::Internal("Invalid hex digit".to_string()))?;
+            let low = hex_nibble(pair[1])
+                .ok_or_else(|| PebbleError::Internal("Invalid hex digit".to_string()))?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 /// Encode bytes to a hex string.
@@ -30,16 +48,31 @@ pub(crate) fn decrypt_config(
     state: &AppState,
     stored: &str,
 ) -> std::result::Result<String, PebbleError> {
+    decrypt_config_with_store(&state.crypto, &state.store, stored)
+}
+
+fn decrypt_config_with_store(
+    crypto: &CryptoService,
+    store: &Store,
+    stored: &str,
+) -> std::result::Result<String, PebbleError> {
     if serde_json::from_str::<serde_json::Value>(stored).is_ok() {
         // Legacy plaintext config — migrate to encrypted form in-place.
-        let encrypted = encrypt_config(state, stored)?;
-        state.store.update_translate_config_blob(&encrypted)?;
+        let encrypted = encrypt_config_with_crypto(crypto, stored)?;
+        store.compare_exchange_translate_config_blob(stored, &encrypted)?;
         return Ok(stored.to_string());
     }
     let bytes = hex_decode(stored)?;
-    let decrypted = state.crypto.decrypt(&bytes)?;
-    String::from_utf8(decrypted)
-        .map_err(|e| PebbleError::Internal(format!("Invalid UTF-8 in decrypted config: {e}")))
+    let needs_migration = pebble_crypto::CryptoService::ciphertext_needs_migration(&bytes);
+    let decrypted =
+        crypto.decrypt_for(TRANSLATE_CONFIG_PURPOSE, ACTIVE_TRANSLATE_CONFIG_ID, &bytes)?;
+    let plaintext = String::from_utf8(decrypted)
+        .map_err(|e| PebbleError::Internal(format!("Invalid UTF-8 in decrypted config: {e}")))?;
+    if needs_migration {
+        let encrypted = encrypt_config_with_crypto(crypto, &plaintext)?;
+        store.compare_exchange_translate_config_blob(stored, &encrypted)?;
+    }
+    Ok(plaintext)
 }
 
 /// Encrypt a plaintext config string for storage.
@@ -47,7 +80,18 @@ pub(crate) fn encrypt_config(
     state: &AppState,
     plaintext: &str,
 ) -> std::result::Result<String, PebbleError> {
-    let encrypted = state.crypto.encrypt(plaintext.as_bytes())?;
+    encrypt_config_with_crypto(&state.crypto, plaintext)
+}
+
+fn encrypt_config_with_crypto(
+    crypto: &CryptoService,
+    plaintext: &str,
+) -> std::result::Result<String, PebbleError> {
+    let encrypted = crypto.encrypt_for(
+        TRANSLATE_CONFIG_PURPOSE,
+        ACTIVE_TRANSLATE_CONFIG_ID,
+        plaintext.as_bytes(),
+    )?;
     Ok(hex_encode(&encrypted))
 }
 
@@ -186,4 +230,85 @@ pub async fn test_translate_connection(
     )
     .await?;
     Ok(result.translated)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pebble_store::Store;
+
+    fn save_config(store: &Store, config: &str) {
+        let now = now_timestamp();
+        store
+            .save_translate_config(&TranslateConfig {
+                id: ACTIVE_TRANSLATE_CONFIG_ID.to_string(),
+                provider_type: "deepl".to_string(),
+                config: config.to_string(),
+                is_enabled: true,
+                created_at: now,
+                updated_at: now,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn legacy_encrypted_translate_config_is_lazily_migrated_to_v1() {
+        let crypto = pebble_crypto::CryptoService::from_key([11_u8; 32]);
+        let store = Store::open_in_memory().unwrap();
+        let plaintext = r#"{"api_key":"secret"}"#;
+        let legacy = hex_encode(&crypto.encrypt(plaintext.as_bytes()).unwrap());
+        save_config(&store, &legacy);
+
+        assert_eq!(
+            decrypt_config_with_store(&crypto, &store, &legacy).unwrap(),
+            plaintext
+        );
+
+        let migrated_hex = store.get_translate_config().unwrap().unwrap().config;
+        let migrated = hex_decode(&migrated_hex).unwrap();
+        assert!(!pebble_crypto::CryptoService::ciphertext_needs_migration(
+            &migrated
+        ));
+        assert_eq!(
+            crypto
+                .decrypt_for(
+                    TRANSLATE_CONFIG_PURPOSE,
+                    ACTIVE_TRANSLATE_CONFIG_ID,
+                    &migrated,
+                )
+                .unwrap(),
+            plaintext.as_bytes()
+        );
+    }
+
+    #[test]
+    fn plaintext_translate_config_is_lazily_migrated_to_v1() {
+        let crypto = pebble_crypto::CryptoService::from_key([11_u8; 32]);
+        let store = Store::open_in_memory().unwrap();
+        let plaintext = r#"{"api_key":"secret"}"#;
+        save_config(&store, plaintext);
+
+        assert_eq!(
+            decrypt_config_with_store(&crypto, &store, plaintext).unwrap(),
+            plaintext
+        );
+
+        let migrated_hex = store.get_translate_config().unwrap().unwrap().config;
+        let migrated = hex_decode(&migrated_hex).unwrap();
+        assert!(!pebble_crypto::CryptoService::ciphertext_needs_migration(
+            &migrated
+        ));
+    }
+
+    #[test]
+    fn translate_config_rejects_non_ascii_hex_without_panicking() {
+        let result = std::panic::catch_unwind(|| hex_decode("aéx"));
+
+        assert!(
+            result.is_ok(),
+            "invalid translate config hex must not panic"
+        );
+        let error = result.unwrap().unwrap_err().to_string();
+        assert!(error.contains("Invalid hex"));
+    }
 }

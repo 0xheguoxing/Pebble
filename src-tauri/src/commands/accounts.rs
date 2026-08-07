@@ -1,4 +1,5 @@
 use crate::account_colors::default_account_color;
+use crate::commands::encrypted_store::{load_account_auth_data, store_account_auth_data};
 use crate::commands::network::{
     account_proxy_setting_from_parts, get_global_proxy_raw, http_proxy_from_mail_proxy,
     is_inherit_proxy_mode, mail_proxy_from_http, normalize_account_proxy_setting,
@@ -402,8 +403,7 @@ pub async fn add_account(
 
         // Encrypt credentials and store as auth_data
         let config_bytes = serialize_account_credentials(&credentials)?;
-        let encrypted = state.crypto.encrypt(&config_bytes)?;
-        state.store.set_auth_data(&account.id, &encrypted)?;
+        store_account_auth_data(&state.crypto, &state.store, &account.id, &config_bytes)?;
 
         // Store non-secret metadata in sync_state
         let provider_slug = match &provider {
@@ -478,34 +478,32 @@ pub async fn update_account(
     // Parse the existing encrypted blob into a typed view. If the row is
     // missing (first-time edit, or a legacy OAuth-only account moving to
     // IMAP), seed a blank template that the mutations below can fill in.
-    let mut creds: AccountCredentials = match state.store.get_auth_data(&account_id)? {
-        Some(encrypted) => {
-            let decrypted = state.crypto.decrypt(&encrypted)?;
-            deserialize_account_credentials(&decrypted)?
-        }
-        None => AccountCredentials {
-            proxy_mode: AccountProxyMode::Inherit,
-            imap: ImapConfig {
-                host: String::new(),
-                port: 0,
-                username: String::new(),
-                password: String::new(),
-                security: ConnectionSecurity::default(),
-                accept_invalid_certs: false,
-                proxy: None,
+    let mut creds: AccountCredentials =
+        match load_account_auth_data(&state.crypto, &state.store, &account_id)? {
+            Some(decrypted) => deserialize_account_credentials(&decrypted)?,
+            None => AccountCredentials {
+                proxy_mode: AccountProxyMode::Inherit,
+                imap: ImapConfig {
+                    host: String::new(),
+                    port: 0,
+                    username: String::new(),
+                    password: String::new(),
+                    security: ConnectionSecurity::default(),
+                    accept_invalid_certs: false,
+                    proxy: None,
+                },
+                smtp: SmtpConfig {
+                    host: String::new(),
+                    port: 0,
+                    username: String::new(),
+                    password: String::new(),
+                    security: ConnectionSecurity::default(),
+                    accept_invalid_certs: false,
+                    proxy: None,
+                },
+                allow_plaintext: false,
             },
-            smtp: SmtpConfig {
-                host: String::new(),
-                port: 0,
-                username: String::new(),
-                password: String::new(),
-                security: ConnectionSecurity::default(),
-                accept_invalid_certs: false,
-                proxy: None,
-            },
-            allow_plaintext: false,
-        },
-    };
+        };
 
     let updated_proxy = if proxy_host.is_some() || proxy_port.is_some() {
         Some(
@@ -592,8 +590,7 @@ pub async fn update_account(
         .update_account(&account_id, &email, &display_name, account_color.as_deref())?;
 
     let config_bytes = serialize_account_credentials(&creds)?;
-    let encrypted = state.crypto.encrypt(&config_bytes)?;
-    state.store.set_auth_data(&account_id, &encrypted)?;
+    store_account_auth_data(&state.crypto, &state.store, &account_id, &config_bytes)?;
 
     Ok(())
 }
@@ -621,13 +618,12 @@ pub async fn get_account_proxy_setting(
         ));
     }
 
-    let Some(encrypted) = state.store.get_auth_data(&account_id)? else {
+    let Some(decrypted) = load_account_auth_data(&state.crypto, &state.store, &account_id)? else {
         return Ok(AccountProxySetting {
             mode: AccountProxyMode::Inherit,
             proxy: None,
         });
     };
-    let decrypted = state.crypto.decrypt(&encrypted)?;
     let credentials = deserialize_account_credentials(&decrypted)?;
     Ok(account_proxy_setting_from_credentials(&credentials))
 }
@@ -679,17 +675,15 @@ pub async fn update_account_proxy_setting(
     }
 
     let setting = account_proxy_setting_from_parts(mode, proxy_host, proxy_port, "Account proxy")?;
-    let Some(encrypted) = state.store.get_auth_data(&account_id)? else {
+    let Some(decrypted) = load_account_auth_data(&state.crypto, &state.store, &account_id)? else {
         return Err(PebbleError::Internal(format!(
             "No auth data found for account {account_id}"
         )));
     };
-    let decrypted = state.crypto.decrypt(&encrypted)?;
     let mut credentials = deserialize_account_credentials(&decrypted)?;
     set_account_proxy_setting_on_credentials(&mut credentials, setting);
     let config_bytes = serialize_account_credentials(&credentials)?;
-    let encrypted = state.crypto.encrypt(&config_bytes)?;
-    state.store.set_auth_data(&account_id, &encrypted)?;
+    store_account_auth_data(&state.crypto, &state.store, &account_id, &config_bytes)?;
     Ok(())
 }
 
@@ -868,11 +862,8 @@ pub async fn test_account_connection(
     }
 
     if matches!(account.provider, ProviderType::Pop3) {
-        let existing = state
-            .store
-            .get_auth_data(&account_id)?
+        let decrypted = load_account_auth_data(&state.crypto, &state.store, &account_id)?
             .ok_or_else(|| PebbleError::Internal("No auth data found".into()))?;
-        let decrypted = state.crypto.decrypt(&existing)?;
         let credentials = deserialize_account_credentials(&decrypted)?;
         let proxy = resolve_mail_proxy_from_mode(
             &state.crypto,
@@ -892,11 +883,8 @@ pub async fn test_account_connection(
         return Pop3Provider::test_connection(&config).await;
     }
 
-    let existing = state
-        .store
-        .get_auth_data(&account_id)?
+    let decrypted = load_account_auth_data(&state.crypto, &state.store, &account_id)?
         .ok_or_else(|| PebbleError::Internal("No auth data found".into()))?;
-    let decrypted = state.crypto.decrypt(&existing)?;
     let mut credentials = deserialize_account_credentials(&decrypted)?;
     credentials.imap.proxy = resolve_mail_proxy_from_mode(
         &state.crypto,
