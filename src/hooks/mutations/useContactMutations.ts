@@ -5,11 +5,7 @@ import {
   setContactFavorite,
   type ContactInput,
 } from "@/lib/api";
-import {
-  contactQueryKey,
-  contactsQueryRoot,
-  contactSuggestionsQueryRoot,
-} from "@/hooks/queries/useContactsQuery";
+import { contactsQueryRoot, contactSuggestionsQueryRoot } from "@/hooks/queries/useContactsQuery";
 
 async function invalidateContactCaches(queryClient: ReturnType<typeof useQueryClient>) {
   await Promise.all([
@@ -23,8 +19,7 @@ export function useContactMutations() {
 
   const save = useMutation({
     mutationFn: (input: ContactInput) => saveContact(input),
-    onSuccess: async (contact) => {
-      queryClient.setQueryData(contactQueryKey(contact.id), contact);
+    onSuccess: async () => {
       await invalidateContactCaches(queryClient);
     },
   });
@@ -37,8 +32,7 @@ export function useContactMutations() {
       contactId: string;
       suppressAddresses?: boolean;
     }) => deleteContact(contactId, suppressAddresses),
-    onSuccess: async (_data, { contactId }) => {
-      queryClient.removeQueries({ queryKey: contactQueryKey(contactId) });
+    onSuccess: async () => {
       await invalidateContactCaches(queryClient);
     },
   });

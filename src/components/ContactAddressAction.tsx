@@ -1,8 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import { ContactRound, UserPlus } from "lucide-react";
 import { useTranslation } from "react-i18next";
-import { listContacts, type Contact, type ContactInput } from "@/lib/api";
+import { type ContactInput } from "@/lib/api";
 import { useAccountsQuery } from "@/hooks/queries";
+import {
+  contactByAddressQueryKey,
+  useContactByAddressQuery,
+} from "@/hooks/queries/useContactsQuery";
 import { useContactMutations } from "@/hooks/mutations";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
@@ -20,11 +25,10 @@ export default function ContactAddressAction({
   address,
 }: ContactAddressActionProps) {
   const { t } = useTranslation();
+  const queryClient = useQueryClient();
   const normalizedAddress = address.trim().toLowerCase();
   const { data: accounts = [] } = useAccountsQuery();
   const { save } = useContactMutations();
-  const [contact, setContact] = useState<Contact | null>(null);
-  const [loading, setLoading] = useState(true);
   const [editorOpen, setEditorOpen] = useState(false);
   const addToast = useToastStore((state) => state.addToast);
 
@@ -32,33 +36,10 @@ export default function ContactAddressAction({
     account.id === accountId
     && account.email.trim().toLowerCase() === normalizedAddress
   )), [accountId, accounts, normalizedAddress]);
-
-  useEffect(() => {
-    let cancelled = false;
-    if (!normalizedAddress || isSelf) {
-      setLoading(false);
-      setContact(null);
-      return () => { cancelled = true; };
-    }
-
-    setLoading(true);
-    listContacts(address, false, 20, 0)
-      .then((contacts) => {
-        if (cancelled) return;
-        const exact = contacts.find((candidate) => candidate.emails.some((email) => (
-          email.address.trim().toLowerCase() === normalizedAddress
-        )));
-        setContact(exact ?? null);
-      })
-      .catch(() => {
-        if (!cancelled) setContact(null);
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-
-    return () => { cancelled = true; };
-  }, [address, isSelf, normalizedAddress]);
+  const { data: contact = null, isLoading: loading } = useContactByAddressQuery(
+    normalizedAddress,
+    !isSelf,
+  );
 
   if (isSelf || !normalizedAddress) return null;
 
@@ -71,7 +52,7 @@ export default function ContactAddressAction({
 
   const handleSave = async (input: ContactInput) => {
     const saved = await save.mutateAsync(input);
-    setContact(saved);
+    queryClient.setQueryData(contactByAddressQueryKey(normalizedAddress), saved);
     setEditorOpen(false);
     addToast({ message: t("contacts.saveSuccess", "Contact saved"), type: "success" });
   };

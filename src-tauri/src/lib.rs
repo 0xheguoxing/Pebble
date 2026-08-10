@@ -576,7 +576,7 @@ pub fn run() {
             commands::cloud_sync::load_auto_backup_config,
             commands::cloud_sync::delete_auto_backup_config,
             commands::contacts::list_contacts,
-            commands::contacts::get_contact,
+            commands::contacts::get_contact_by_email,
             commands::contacts::save_contact,
             commands::contacts::delete_contact,
             commands::contacts::set_contact_favorite,

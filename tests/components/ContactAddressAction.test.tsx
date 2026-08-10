@@ -1,7 +1,8 @@
+import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { Contact } from "@/lib/api";
-import { listContacts } from "@/lib/api";
+import { getContactByEmail } from "@/lib/api";
 import { useUIStore } from "@/stores/ui.store";
 import ContactAddressAction from "@/components/ContactAddressAction";
 
@@ -18,7 +19,7 @@ vi.mock("react-i18next", () => ({
 }));
 
 vi.mock("@/lib/api", () => ({
-  listContacts: vi.fn(),
+  getContactByEmail: vi.fn(),
 }));
 
 vi.mock("@/hooks/queries", () => ({
@@ -46,17 +47,26 @@ const alice: Contact = {
   updated_at: 1,
 };
 
+function renderAction(element: React.ReactElement) {
+  const queryClient = new QueryClient({
+    defaultOptions: { queries: { retry: false } },
+  });
+  return render(
+    <QueryClientProvider client={queryClient}>{element}</QueryClientProvider>,
+  );
+}
+
 describe("ContactAddressAction", () => {
   beforeEach(() => {
     vi.clearAllMocks();
     mocks.accounts = [{ id: "account-1", email: "me@example.com" }];
-    vi.mocked(listContacts).mockResolvedValue([]);
+    vi.mocked(getContactByEmail).mockResolvedValue(null);
     mocks.save.mockResolvedValue(alice);
     useUIStore.setState({ activeView: "inbox", pendingContactId: null });
   });
 
   it("opens a prefilled editor for an unsaved participant", async () => {
-    render(
+    renderAction(
       <ContactAddressAction
         accountId="account-1"
         name="Sender"
@@ -64,9 +74,11 @@ describe("ContactAddressAction", () => {
       />,
     );
 
-    fireEvent.click(await screen.findByRole("button", {
+    const addButton = await screen.findByRole("button", {
       name: "Add sender@example.com to contacts",
-    }));
+    });
+    await waitFor(() => expect((addButton as HTMLButtonElement).disabled).toBe(false));
+    fireEvent.click(addButton);
 
     expect(screen.getByRole("dialog", { name: "New contact" })).toBeTruthy();
     expect((screen.getByLabelText("Name") as HTMLInputElement).value).toBe("Sender");
@@ -74,8 +86,8 @@ describe("ContactAddressAction", () => {
   });
 
   it("opens an existing contact in the contacts view", async () => {
-    vi.mocked(listContacts).mockResolvedValue([alice]);
-    render(
+    vi.mocked(getContactByEmail).mockResolvedValue(alice);
+    renderAction(
       <ContactAddressAction
         accountId="account-1"
         name="Alice"
@@ -94,7 +106,7 @@ describe("ContactAddressAction", () => {
   });
 
   it("does not offer contact actions for the current account address", async () => {
-    render(
+    renderAction(
       <ContactAddressAction
         accountId="account-1"
         name="Me"
@@ -102,7 +114,29 @@ describe("ContactAddressAction", () => {
       />,
     );
 
-    await waitFor(() => expect(listContacts).not.toHaveBeenCalled());
+    await waitFor(() => expect(getContactByEmail).not.toHaveBeenCalled());
     expect(screen.queryByRole("button")).toBeNull();
+  });
+
+  it("deduplicates identical participant lookups through the query cache", async () => {
+    renderAction(
+      <>
+        <ContactAddressAction
+          accountId="account-1"
+          name="Alice"
+          address="Alice@example.com"
+        />
+        <ContactAddressAction
+          accountId="account-1"
+          name="Alice duplicate"
+          address=" alice@EXAMPLE.com "
+        />
+      </>,
+    );
+
+    await waitFor(() => {
+      expect(getContactByEmail).toHaveBeenCalledTimes(1);
+      expect(getContactByEmail).toHaveBeenCalledWith("alice@example.com");
+    });
   });
 });

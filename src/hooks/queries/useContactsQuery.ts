@@ -1,6 +1,6 @@
 import { keepPreviousData, useQuery } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
-import { listContacts, type Contact } from "@/lib/api";
+import { getContactByEmail, listContacts, type Contact } from "@/lib/api";
 
 export const contactsQueryRoot = ["contacts"] as const;
 export const contactSuggestionsQueryRoot = ["contact-suggestions"] as const;
@@ -19,7 +19,11 @@ export const contactsQueryKey = ({
   offset,
 }: ContactsQueryOptions) => ["contacts", query, favoriteOnly, limit, offset] as const;
 
-export const contactQueryKey = (contactId: string) => ["contact", contactId] as const;
+export const contactByAddressQueryKey = (address: string) => [
+  ...contactsQueryRoot,
+  "by-address",
+  address.trim().toLowerCase(),
+] as const;
 
 export const contactSuggestionsQueryKey = (accountId: string, query: string) =>
   ["contact-suggestions", accountId, query] as const;
@@ -62,5 +66,15 @@ export function useContactsQuery(options: ContactsQueryOptions) {
     queryFn: () => listContactPages(debouncedOptions),
     placeholderData: keepPreviousData,
     staleTime: 30_000,
+  });
+}
+
+export function useContactByAddressQuery(address: string, enabled = true) {
+  const normalizedAddress = address.trim().toLowerCase();
+  return useQuery({
+    queryKey: contactByAddressQueryKey(normalizedAddress),
+    queryFn: () => getContactByEmail(normalizedAddress),
+    enabled: enabled && normalizedAddress.length > 0,
+    staleTime: 5 * 60_000,
   });
 }

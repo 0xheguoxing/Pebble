@@ -715,8 +715,8 @@ export async function listContacts(
   return invoke<Contact[]>("list_contacts", { query, favoriteOnly, limit, offset });
 }
 
-export async function getContact(contactId: string): Promise<Contact | null> {
-  return invoke<Contact | null>("get_contact", { contactId });
+export async function getContactByEmail(address: string): Promise<Contact | null> {
+  return invoke<Contact | null>("get_contact_by_email", { address });
 }
 
 export async function saveContact(input: ContactInput): Promise<Contact> {

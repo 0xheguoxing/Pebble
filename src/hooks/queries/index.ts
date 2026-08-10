@@ -30,8 +30,9 @@ export {
 } from "./usePendingMailOpsQuery";
 export {
   useContactsQuery,
+  useContactByAddressQuery,
   contactsQueryKey,
-  contactQueryKey,
+  contactByAddressQueryKey,
   contactSuggestionsQueryKey,
   contactsQueryRoot,
   contactSuggestionsQueryRoot,
