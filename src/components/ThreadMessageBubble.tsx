@@ -6,6 +6,8 @@ import type { Message, RenderedHtml } from "@/lib/api";
 import { defaultPrivacyMode } from "@/lib/privacyMode";
 import { sanitizeHtml } from "@/lib/sanitizeHtml";
 import { ShadowDomEmail } from "./ShadowDomEmail";
+import ContactAddressAction from "./ContactAddressAction";
+import { uniqueContactParticipants } from "./contact-participants";
 
 interface Props {
   message: Message;
@@ -23,6 +25,11 @@ export default function ThreadMessageBubble({ message, defaultExpanded = false }
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(defaultExpanded);
   const [rendered, setRendered] = useState<RenderedHtml | null>(null);
+  const contactParticipants = uniqueContactParticipants(
+    { name: message.from_name, address: message.from_address },
+    message.to_list,
+    message.cc_list,
+  );
 
   useEffect(() => {
     if (expanded && !rendered) {
@@ -82,6 +89,19 @@ export default function ThreadMessageBubble({ message, defaultExpanded = false }
                 {t("thread.cc", "Cc:")} {message.cc_list.map((r: { address: string }) => r.address).join(", ")}
               </div>
             )}
+            <div
+              aria-label={t("contacts.participantActions", "Contact actions")}
+              style={{ display: "flex", alignItems: "center", gap: "3px", marginTop: "5px" }}
+            >
+              {contactParticipants.map((participant) => (
+                <ContactAddressAction
+                  key={participant.address.toLowerCase()}
+                  accountId={message.account_id}
+                  name={participant.name}
+                  address={participant.address}
+                />
+              ))}
+            </div>
           </div>
           {/* Body content */}
           {rendered?.html ? (

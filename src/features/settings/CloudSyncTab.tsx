@@ -361,6 +361,7 @@ export default function CloudSyncTab() {
       t("cloudSync.restorePreviewRules", "Rules: {{count}}", { count: preview.rule_count }),
       t("cloudSync.restorePreviewKanban", "Kanban cards: {{count}}", { count: preview.kanban_card_count }),
       t("cloudSync.restorePreviewKanbanNotes", "Kanban notes: {{count}}", { count: preview.kanban_note_count }),
+      t("cloudSync.restorePreviewContacts", "Contacts: {{count}}", { count: preview.contact_count }),
     ];
 
     if (preview.has_encrypted_secrets) {
@@ -383,7 +384,7 @@ export default function CloudSyncTab() {
       "",
       t(
         "cloudSync.restoreConfirm",
-        "This will replace local rules and Kanban cards/notes, merge account metadata, and restore encrypted secrets when present. Continue?",
+        "This will replace local rules, Kanban cards/notes, and contacts; merge account metadata; and restore encrypted secrets when present. Continue?",
       ),
     );
 
@@ -416,7 +417,7 @@ export default function CloudSyncTab() {
       >
         {t(
           "cloudSync.description",
-          "Back up rules, Kanban cards and notes, and account metadata to WebDAV. Account passwords, OAuth tokens, and API keys can be included with a separate backup encryption password.",
+          "Back up contacts, rules, Kanban cards and notes, and account metadata to WebDAV. Account passwords, OAuth tokens, and API keys can be included with a separate backup encryption password.",
         )}
         {" "}
         <span style={{ color: "var(--color-warning, #e67e22)" }}>
@@ -443,7 +444,7 @@ export default function CloudSyncTab() {
       >
         {t(
           "cloudSync.scopeNotice",
-          "WebDAV backup includes settings, rules, Kanban cards, and Kanban notes. Optional encrypted secrets include account passwords, OAuth tokens, and translation API keys. Message bodies and attachments are not included unless you saved text into a Kanban note.",
+          "WebDAV backup includes contacts, settings, rules, Kanban cards, and Kanban notes. Optional encrypted secrets include account passwords, OAuth tokens, and translation API keys. Message bodies and attachments are not included unless you saved text into a Kanban note.",
         )}
       </p>
 

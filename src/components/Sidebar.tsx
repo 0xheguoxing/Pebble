@@ -12,6 +12,7 @@ import {
   Search,
   Clock,
   Star,
+  ContactRound,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useUIStore } from "../stores/ui.store";
@@ -322,7 +323,7 @@ export default function Sidebar() {
         }}
       />
 
-      {/* Bottom nav: Snoozed + Kanban + Settings */}
+      {/* Bottom nav: Contacts + Snoozed + Kanban + Settings */}
       <nav
         aria-label={t("sidebar.tools", "Tools")}
         style={{
@@ -332,6 +333,14 @@ export default function Sidebar() {
           gap: "1px",
         }}
       >
+        <SidebarButton
+          icon={<ContactRound size={16} />}
+          label={t("sidebar.contacts", "Contacts")}
+          isActive={activeView === "contacts"}
+          collapsed={sidebarCollapsed}
+          style={buttonBase}
+          onClick={() => safeSetActiveView("contacts")}
+        />
         <SidebarButton
           icon={<Clock size={16} />}
           label={t("sidebar.snoozed", "Snoozed")}

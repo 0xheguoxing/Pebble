@@ -19,6 +19,8 @@ import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
 import SelectionActionPopover from "./SelectionActionPopover";
 import type { EmailAddress } from "@/lib/api";
+import ContactAddressAction from "./ContactAddressAction";
+import { uniqueContactParticipants } from "./contact-participants";
 
 interface Props {
   messageId: string;
@@ -229,6 +231,11 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
 
   const recipientLine = formatRecipients(message.to_list);
   const ccLine = formatRecipients(message.cc_list);
+  const contactParticipants = uniqueContactParticipants(
+    { name: message.from_name, address: message.from_address },
+    message.to_list,
+    message.cc_list,
+  );
 
   return (
     <div
@@ -353,6 +360,19 @@ export default function MessageDetail({ messageId, onBack, folderRole }: Props) 
                 {t("messageDetail.cc", "Cc:")}&nbsp;{ccLine}
               </span>
             )}
+          </div>
+          <div
+            aria-label={t("contacts.participantActions", "Contact actions")}
+            style={{ display: "flex", alignItems: "center", gap: "3px", margin: "3px 0" }}
+          >
+            {contactParticipants.map((participant) => (
+              <ContactAddressAction
+                key={participant.address.toLowerCase()}
+                accountId={message.account_id}
+                name={participant.name}
+                address={participant.address}
+              />
+            ))}
           </div>
           <div style={{ fontSize: "12px", color: "var(--color-text-secondary)" }}>
             {formatFullDate(message.date)}

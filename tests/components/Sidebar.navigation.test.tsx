@@ -27,6 +27,7 @@ vi.mock("react-i18next", () => ({
         "sidebar.archive": "Archive",
         "sidebar.spam": "Spam",
         "sidebar.starred": "Starred",
+        "sidebar.contacts": "Contacts",
         "sidebar.snoozed": "Snoozed",
         "sidebar.kanban": "Kanban",
         "sidebar.settings": "Settings",
@@ -97,6 +98,7 @@ describe("Sidebar navigation", () => {
   });
 
   it.each([
+    ["Contacts", "contacts"],
     ["Snoozed", "snoozed"],
     ["Kanban", "kanban"],
     ["Settings", "settings"],
@@ -125,6 +127,7 @@ describe("Sidebar navigation", () => {
     render(<Sidebar />);
 
     expect(screen.getByRole("button", { name: "Snoozed" }).getAttribute("type")).toBe("button");
+    expect(screen.getByRole("button", { name: "Contacts" }).getAttribute("type")).toBe("button");
     expect(screen.getByRole("button", { name: "Kanban" }).getAttribute("type")).toBe("button");
     expect(screen.getByRole("button", { name: "Settings" }).getAttribute("type")).toBe("button");
   });

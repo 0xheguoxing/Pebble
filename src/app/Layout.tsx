@@ -27,6 +27,7 @@ import AppBackground from "./AppBackground";
 const loadSettingsView = () => import("../features/settings/SettingsView");
 const loadComposeView = () => import("../features/compose/ComposeView");
 const loadKanbanView = () => import("../features/kanban/KanbanView");
+const loadContactsView = () => import("../features/contacts/ContactsView");
 const loadSearchView = () => import("../features/search/SearchView");
 const loadSnoozedView = () => import("../features/snoozed/SnoozedView");
 const loadStarredView = () => import("../features/starred/StarredView");
@@ -34,6 +35,7 @@ const preloadLazyViews = createLazyViewPreloader([
   loadSettingsView,
   loadComposeView,
   loadKanbanView,
+  loadContactsView,
   loadSearchView,
   loadSnoozedView,
   loadStarredView,
@@ -42,6 +44,7 @@ const preloadLazyViews = createLazyViewPreloader([
 const SettingsView = lazy(loadSettingsView);
 const ComposeView = lazy(loadComposeView);
 const KanbanView = lazy(loadKanbanView);
+const ContactsView = lazy(loadContactsView);
 const SearchView = lazy(loadSearchView);
 const SnoozedView = lazy(loadSnoozedView);
 const StarredView = lazy(loadStarredView);
@@ -137,6 +140,7 @@ export default function Layout() {
             <Suspense fallback={<ViewLoadingFallback />}>
               {displayedView === "inbox" && <InboxView />}
               {displayedView === "kanban" && <KanbanView />}
+              {displayedView === "contacts" && <ContactsView />}
               {displayedView === "settings" && <SettingsView />}
               {displayedView === "search" && <SearchView />}
               {displayedView === "snoozed" && <SnoozedView />}

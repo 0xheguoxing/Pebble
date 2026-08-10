@@ -13,8 +13,9 @@ use pebble_crypto::passphrase::{
     decrypt_with_passphrase, encrypt_with_passphrase, PassphraseEncryptedBlob,
 };
 use pebble_store::cloud_sync::{
-    preview_backup, BackupPreview, BackupSecretSummary, RestoredAuthData, RestoredPrivateData,
-    RestoredSecureUserData, SettingsBackup, WebDavClient, SETTINGS_BACKUP_FILENAME,
+    preview_backup, serialize_backup, BackupPreview, BackupSecretSummary, RestoredAuthData,
+    RestoredPrivateData, RestoredSecureUserData, SettingsBackup, WebDavClient,
+    SETTINGS_BACKUP_FILENAME,
 };
 use serde::{Deserialize, Serialize};
 use tauri::{Emitter, Manager, State};
@@ -201,8 +202,7 @@ fn build_backup_data(
         .map_err(|e| PebbleError::Internal(format!("Failed to build backup payload: {e}")))?;
     backup.kanban_context_notes = load_kanban_context_notes_for_state(state)?;
     attach_encrypted_secrets(state, &mut backup, secret_passphrase)?;
-    serde_json::to_vec_pretty(&backup)
-        .map_err(|e| PebbleError::Internal(format!("Failed to serialize backup payload: {e}")))
+    serialize_backup(&backup)
 }
 
 fn restore_backup_data(

@@ -1,21 +1,38 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ContactAutocomplete from "../../src/components/ContactAutocomplete";
-import { searchContacts } from "../../src/lib/api";
+import {
+  searchContactSuggestions,
+  suppressContactSuggestion,
+  type ContactSuggestion,
+} from "../../src/lib/api";
 
 vi.mock("react-i18next", () => ({
   useTranslation: () => ({ t: (_key: string, fallback?: string) => fallback ?? _key }),
 }));
 
 vi.mock("../../src/lib/api", () => ({
-  searchContacts: vi.fn(),
+  searchContactSuggestions: vi.fn(),
+  suppressContactSuggestion: vi.fn(),
 }));
 
 vi.mock("../../src/stores/toast.store", () => ({
   useToastStore: { getState: () => ({ addToast: vi.fn() }) },
 }));
 
-const searchContactsMock = vi.mocked(searchContacts);
+const searchContactSuggestionsMock = vi.mocked(searchContactSuggestions);
+
+function suggestion(overrides: Partial<ContactSuggestion>): ContactSuggestion {
+  return {
+    contact_id: null,
+    name: null,
+    address: "person@example.com",
+    source: "recent",
+    is_favorite: false,
+    last_interaction_at: 1,
+    ...overrides,
+  };
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -26,9 +43,13 @@ function deferred<T>() {
 }
 
 describe("ContactAutocomplete", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    searchContactSuggestionsMock.mockReset();
+  });
+
   afterEach(() => {
     vi.useRealTimers();
-    searchContactsMock.mockReset();
   });
 
   it("forwards form identity and label association to the combobox input", () => {
@@ -73,7 +94,6 @@ describe("ContactAutocomplete", () => {
 
     const input = screen.getByRole("combobox", { name: "To" }) as HTMLInputElement;
     fireEvent.change(input, { target: { value: "typed@example.com" } });
-
     expect(onInputValueChange).toHaveBeenCalledWith("typed@example.com");
 
     rerender(
@@ -94,11 +114,104 @@ describe("ContactAutocomplete", () => {
     expect(input.value).toBe("typed@example.com");
   });
 
+  it("shows saved and recent sources and selects only the address", async () => {
+    searchContactSuggestionsMock.mockResolvedValue([
+      suggestion({
+        contact_id: "contact-1",
+        name: "Alice",
+        address: "alice@example.com",
+        source: "saved",
+        is_favorite: true,
+        last_interaction_at: null,
+      }),
+      suggestion({ name: "Alex", address: "alex@example.com", last_interaction_at: 100 }),
+    ]);
+    const onChange = vi.fn();
+    render(<ContactAutocomplete value={[]} onChange={onChange} accountId="account-1" />);
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "al" } });
+
+    expect(await screen.findByText("Saved contact")).toBeTruthy();
+    expect(screen.getByText("Recent")).toBeTruthy();
+    fireEvent.click(screen.getByRole("option", { name: /Alice.*alice@example.com/i }));
+    expect(onChange).toHaveBeenCalledWith(["alice@example.com"]);
+  });
+
+  it("filters selected addresses without case sensitivity and supports keyboard selection", async () => {
+    searchContactSuggestionsMock.mockResolvedValue([
+      suggestion({
+        contact_id: "contact-1",
+        name: "Alice",
+        address: "ALICE@example.com",
+        source: "saved",
+        last_interaction_at: null,
+      }),
+      suggestion({ name: "Bob", address: "bob@example.com", last_interaction_at: 50 }),
+    ]);
+    const onChange = vi.fn();
+    render(
+      <ContactAutocomplete
+        value={["alice@example.com"]}
+        onChange={onChange}
+        accountId="account-1"
+      />,
+    );
+
+    const input = screen.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "example" } });
+
+    await waitFor(() => expect(searchContactSuggestions).toHaveBeenCalled());
+    expect(screen.queryByText("ALICE@example.com")).toBeNull();
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(onChange).toHaveBeenCalledWith(["alice@example.com", "bob@example.com"]);
+  });
+
+  it("removes a recent suggestion without selecting it", async () => {
+    searchContactSuggestionsMock.mockResolvedValue([
+      suggestion({ name: "Alex", address: "alex@example.com", last_interaction_at: 100 }),
+    ]);
+    vi.mocked(suppressContactSuggestion).mockResolvedValue(undefined);
+    const onChange = vi.fn();
+    render(<ContactAutocomplete value={[]} onChange={onChange} accountId="account-1" />);
+
+    fireEvent.change(screen.getByRole("combobox"), { target: { value: "alex" } });
+    const removeButton = await screen.findByRole("button", {
+      name: "Remove suggestion alex@example.com",
+    });
+    fireEvent.click(removeButton);
+
+    await waitFor(() => {
+      expect(suppressContactSuggestion).toHaveBeenCalledWith("alex@example.com");
+      expect(screen.queryByText("alex@example.com")).toBeNull();
+    });
+    expect(onChange).not.toHaveBeenCalled();
+  });
+
+  it("lets Tab leave a recent suggestion without committing it", async () => {
+    searchContactSuggestionsMock.mockResolvedValue([
+      suggestion({ name: "Alex", address: "alex@example.com", last_interaction_at: 100 }),
+    ]);
+    render(<ContactAutocomplete value={[]} onChange={vi.fn()} accountId="account-1" />);
+
+    const input = screen.getByRole("combobox");
+    fireEvent.change(input, { target: { value: "alex" } });
+    const removeButton = await screen.findByRole("button", {
+      name: "Remove suggestion alex@example.com",
+    });
+
+    expect(removeButton.closest('[role="option"]')).toBeNull();
+    expect(fireEvent.keyDown(input, { key: "Tab" })).toBe(true);
+    expect(input.getAttribute("aria-expanded")).toBe("false");
+  });
+
   it("ignores an older search response that resolves after the latest query", async () => {
     vi.useFakeTimers();
-    const older = deferred<Array<{ name: string | null; address: string }>>();
-    const latest = deferred<Array<{ name: string | null; address: string }>>();
-    searchContactsMock.mockReturnValueOnce(older.promise).mockReturnValueOnce(latest.promise);
+    const older = deferred<ContactSuggestion[]>();
+    const latest = deferred<ContactSuggestion[]>();
+    searchContactSuggestionsMock
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(latest.promise);
 
     render(
       <ContactAutocomplete
@@ -116,13 +229,13 @@ describe("ContactAutocomplete", () => {
     act(() => vi.advanceTimersByTime(200));
 
     await act(async () => {
-      latest.resolve([{ name: "Newest", address: "new@example.com" }]);
+      latest.resolve([suggestion({ name: "Newest", address: "new@example.com" })]);
       await latest.promise;
     });
     expect(screen.getByRole("option").textContent).toContain("new@example.com");
 
     await act(async () => {
-      older.resolve([{ name: "Outdated", address: "old@example.com" }]);
+      older.resolve([suggestion({ name: "Outdated", address: "old@example.com" })]);
       await older.promise;
     });
 
@@ -132,8 +245,8 @@ describe("ContactAutocomplete", () => {
 
   it("ignores a pending response after switching accounts", async () => {
     vi.useFakeTimers();
-    const oldAccountSearch = deferred<Array<{ name: string | null; address: string }>>();
-    searchContactsMock.mockReturnValueOnce(oldAccountSearch.promise);
+    const oldAccountSearch = deferred<ContactSuggestion[]>();
+    searchContactSuggestionsMock.mockReturnValueOnce(oldAccountSearch.promise);
 
     const { rerender } = render(
       <ContactAutocomplete value={[]} onChange={vi.fn()} accountId="account-1" />,
@@ -141,11 +254,11 @@ describe("ContactAutocomplete", () => {
     fireEvent.change(screen.getByRole("combobox"), { target: { value: "alice" } });
     act(() => vi.advanceTimersByTime(200));
 
-    rerender(
-      <ContactAutocomplete value={[]} onChange={vi.fn()} accountId="account-2" />,
-    );
+    rerender(<ContactAutocomplete value={[]} onChange={vi.fn()} accountId="account-2" />);
     await act(async () => {
-      oldAccountSearch.resolve([{ name: "Old account", address: "old@example.com" }]);
+      oldAccountSearch.resolve([
+        suggestion({ name: "Old account", address: "old@example.com" }),
+      ]);
       await oldAccountSearch.promise;
     });
 
@@ -154,8 +267,8 @@ describe("ContactAutocomplete", () => {
 
   it("filters a contact selected externally while its search is pending", async () => {
     vi.useFakeTimers();
-    const pendingSearch = deferred<Array<{ name: string | null; address: string }>>();
-    searchContactsMock.mockReturnValueOnce(pendingSearch.promise);
+    const pendingSearch = deferred<ContactSuggestion[]>();
+    searchContactSuggestionsMock.mockReturnValueOnce(pendingSearch.promise);
 
     const { rerender } = render(
       <ContactAutocomplete value={[]} onChange={vi.fn()} accountId="account-1" />,
@@ -171,7 +284,7 @@ describe("ContactAutocomplete", () => {
       />,
     );
     await act(async () => {
-      pendingSearch.resolve([{ name: "Alice", address: "alice@example.com" }]);
+      pendingSearch.resolve([suggestion({ name: "Alice", address: "ALICE@example.com" })]);
       await pendingSearch.promise;
     });
 

@@ -110,6 +110,12 @@ vi.mock("../../src/components/ShadowDomEmail", () => ({
   ShadowDomEmail: ({ html }: { html: string }) => <div>{html}</div>,
 }));
 
+vi.mock("../../src/components/ContactAddressAction", () => ({
+  default: ({ address }: { address: string }) => (
+    <span data-testid="contact-address-action">{address}</span>
+  ),
+}));
+
 function setSelectedText(text: string) {
   Object.defineProperty(window, "getSelection", {
     configurable: true,
@@ -173,9 +179,19 @@ describe("MessageDetail selected-text context actions", () => {
   it("shows message recipients instead of the account email in the header", () => {
     render(<MessageDetail messageId="message-1" onBack={vi.fn()} />);
 
-    expect(screen.getByText(/destination@example\.com/)).toBeTruthy();
-    expect(screen.getByText(/cc@example\.com/)).toBeTruthy();
+    expect(screen.getAllByText(/destination@example\.com/).length).toBeGreaterThan(0);
+    expect(screen.getAllByText(/cc@example\.com/).length).toBeGreaterThan(0);
     expect(screen.queryByText(/current@example\.com/)).toBeNull();
+  });
+
+  it("offers contact actions for the sender and each visible recipient", () => {
+    render(<MessageDetail messageId="message-1" onBack={vi.fn()} />);
+
+    expect(screen.getAllByTestId("contact-address-action").map((node) => node.textContent)).toEqual([
+      "sender@example.com",
+      "destination@example.com",
+      "cc@example.com",
+    ]);
   });
 
   it("does not carry a sender trust override to the next message", async () => {

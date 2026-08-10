@@ -126,4 +126,10 @@ describe("command palette mail commands", () => {
     expect(mocks.updateMessageFlags).toHaveBeenCalledWith("message-1", undefined, true);
     expect(mocks.queryClient.invalidateQueries).not.toHaveBeenCalledWith({ queryKey: ["folder-unread-counts"] });
   });
+
+  it("navigates to contacts from the command palette", async () => {
+    await command("nav:contacts").execute();
+
+    expect(mocks.uiState.setActiveView).toHaveBeenCalledWith("contacts");
+  });
 });

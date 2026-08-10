@@ -6,7 +6,7 @@ import { readStartHiddenToTrayPreference, START_HIDDEN_TO_TRAY_KEY } from "@/lib
 import { useComposeStore } from "./compose.store";
 import { useMailStore } from "./mail.store";
 
-export type ActiveView = "inbox" | "kanban" | "settings" | "search" | "snoozed" | "starred" | "compose";
+export type ActiveView = "inbox" | "kanban" | "contacts" | "settings" | "search" | "snoozed" | "starred" | "compose";
 export type SettingsTab = "accounts" | "general" | "proxy" | "appearance" | "privacy" | "rules" | "remoteWrites" | "translation" | "shortcuts" | "cloudSync" | "about";
 export type Theme = "light" | "dark" | "system";
 export type { Language } from "@/lib/language";
@@ -147,8 +147,11 @@ interface UIState {
   startHiddenToTray: boolean;
   setStartHiddenToTray: (enabled: boolean) => void;
   previousView: ActiveView;
+  pendingContactId: string | null;
   toggleSidebar: () => void;
   setActiveView: (view: ActiveView) => void;
+  openContactInContacts: (contactId: string) => void;
+  clearPendingContact: () => void;
   openMessageInInbox: (messageId: string) => void;
   setTheme: (theme: Theme) => void;
   setBackgroundImage: (image: { path: string; filename: string }) => void;
@@ -200,6 +203,7 @@ export const useUIStore = create<UIState>((set) => ({
     set({ startHiddenToTray: enabled });
   },
   previousView: "inbox",
+  pendingContactId: null,
   toggleSidebar: () =>
     set((state) => ({ sidebarCollapsed: !state.sidebarCollapsed })),
   setActiveView: (view) => {
@@ -227,6 +231,11 @@ export const useUIStore = create<UIState>((set) => ({
 
     set({ activeView: view });
   },
+  openContactInContacts: (contactId) => set({
+    activeView: "contacts",
+    pendingContactId: contactId,
+  }),
+  clearPendingContact: () => set({ pendingContactId: null }),
   openMessageInInbox: (messageId) => {
     useMailStore.setState({
       selectedMessageId: messageId,

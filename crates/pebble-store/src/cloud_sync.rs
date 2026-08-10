@@ -3,7 +3,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::Store;
+use crate::{contacts::list_all_contacts_for_backup_with_conn, Store};
 
 /// Maximum accepted size for a settings backup download.
 /// Settings backups (accounts metadata, rules, kanban cards, translate config)
@@ -12,8 +12,36 @@ use crate::Store;
 pub const MAX_BACKUP_SIZE_BYTES: usize = 16 * 1024 * 1024;
 
 /// Highest backup schema version this build understands.
-pub const BACKUP_SCHEMA_VERSION: u32 = 1;
+pub const BACKUP_SCHEMA_VERSION: u32 = 2;
 pub const SETTINGS_BACKUP_FILENAME: &str = "pebble-settings-backup.json";
+
+fn validate_backup_schema(backup: &SettingsBackup) -> Result<()> {
+    if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
+        return Err(PebbleError::Validation(format!(
+            "Unsupported backup version {} (this build supports up to {})",
+            backup.version, BACKUP_SCHEMA_VERSION
+        )));
+    }
+    if backup.version >= 2 && backup.contacts.is_none() {
+        return Err(PebbleError::Validation(
+            "Backup version 2 is missing the required contacts field".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn serialize_backup(backup: &SettingsBackup) -> Result<Vec<u8>> {
+    let json = serde_json::to_vec_pretty(backup)
+        .map_err(|e| PebbleError::Internal(format!("Failed to serialize settings: {e}")))?;
+    if json.len() > MAX_BACKUP_SIZE_BYTES {
+        return Err(PebbleError::Validation(format!(
+            "Backup file is too large ({} bytes, max {})",
+            json.len(),
+            MAX_BACKUP_SIZE_BYTES
+        )));
+    }
+    Ok(json)
+}
 
 fn validate_backup_payload_shape(data: &[u8]) -> Result<()> {
     let data = data.strip_prefix(&[0xEF, 0xBB, 0xBF]).unwrap_or(data);
@@ -56,6 +84,7 @@ pub struct BackupPreview {
     pub rule_count: usize,
     pub kanban_card_count: usize,
     pub kanban_note_count: usize,
+    pub contact_count: usize,
     pub has_translate_config: bool,
     pub has_encrypted_secrets: bool,
     pub secret_account_count: usize,
@@ -77,12 +106,7 @@ pub fn preview_backup(data: &[u8]) -> Result<BackupPreview> {
     let backup: SettingsBackup = serde_json::from_slice(data).map_err(|e| {
         PebbleError::Validation(format!("Backup file is not a valid settings backup: {e}"))
     })?;
-    if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-        return Err(PebbleError::Validation(format!(
-            "Unsupported backup version {} (this build supports up to {})",
-            backup.version, BACKUP_SCHEMA_VERSION
-        )));
-    }
+    validate_backup_schema(&backup)?;
     Ok(BackupPreview {
         version: backup.version,
         exported_at: backup.exported_at,
@@ -90,6 +114,7 @@ pub fn preview_backup(data: &[u8]) -> Result<BackupPreview> {
         rule_count: backup.rules.len(),
         kanban_card_count: backup.kanban_cards.len(),
         kanban_note_count: backup.kanban_context_notes.len(),
+        contact_count: backup.contacts.as_ref().map(Vec::len).unwrap_or(0),
         has_translate_config: backup
             .translate_config
             .as_ref()
@@ -120,6 +145,8 @@ pub struct SettingsBackup {
     pub kanban_cards: Vec<pebble_core::KanbanCard>,
     #[serde(default)]
     pub kanban_context_notes: HashMap<String, String>,
+    #[serde(default)]
+    pub contacts: Option<Vec<pebble_core::Contact>>,
     pub translate_config: Option<pebble_core::TranslateConfig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret_summary: Option<BackupSecretSummary>,
@@ -294,7 +321,7 @@ impl WebDavClient {
 }
 
 impl Store {
-    /// Export settings (accounts without passwords, rules, kanban cards, translate config) as JSON bytes.
+    /// Export settings (accounts without passwords, rules, kanban cards, contacts, translate config) as JSON bytes.
     pub fn export_settings(&self) -> Result<Vec<u8>> {
         let accounts = self.list_accounts()?;
         let account_backups: Vec<AccountBackup> = accounts
@@ -310,6 +337,12 @@ impl Store {
 
         let rules = self.list_rules()?;
         let kanban_cards = self.list_kanban_cards(None)?;
+        let contacts = self.with_read(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let contacts = list_all_contacts_for_backup_with_conn(&tx)?;
+            tx.commit()?;
+            Ok(contacts)
+        })?;
         // Redact translate config — never export API keys or encrypted secrets
         let translate_config = self.get_translate_config()?.map(|mut tc| {
             tc.config = String::new();
@@ -317,20 +350,19 @@ impl Store {
         });
 
         let backup = SettingsBackup {
-            version: 1,
+            version: BACKUP_SCHEMA_VERSION,
             exported_at: pebble_core::now_timestamp(),
             accounts: account_backups,
             rules,
             kanban_cards,
             kanban_context_notes: HashMap::new(),
+            contacts: Some(contacts),
             translate_config,
             secret_summary: None,
             encrypted_secrets: None,
         };
 
-        let json = serde_json::to_vec_pretty(&backup)
-            .map_err(|e| PebbleError::Internal(format!("Failed to serialize settings: {e}")))?;
-        Ok(json)
+        serialize_backup(&backup)
     }
 
     /// Import settings from JSON bytes, upserting into the store.
@@ -349,12 +381,7 @@ impl Store {
         validate_backup_payload_shape(data)?;
         let backup: SettingsBackup = serde_json::from_slice(data)
             .map_err(|e| PebbleError::Validation(format!("Failed to deserialize settings: {e}")))?;
-        if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-            return Err(PebbleError::Validation(format!(
-                "Unsupported backup version {} (this build supports up to {})",
-                backup.version, BACKUP_SCHEMA_VERSION
-            )));
-        }
+        validate_backup_schema(&backup)?;
 
         self.with_write(|conn| {
             let tx = conn.unchecked_transaction()
@@ -429,6 +456,14 @@ impl Store {
                 Self::upsert_kanban_card_with_conn(&tx, card)?;
             }
 
+            // Contacts were added in schema v2. A v1 restore must preserve
+            // local contacts because the older file could not contain them.
+            if backup.version >= 2 {
+                if let Some(contacts) = &backup.contacts {
+                    crate::contacts::replace_contacts_with_conn(&tx, contacts)?;
+                }
+            }
+
             // Upsert translate config — skip if config field is empty (redacted export)
             if let Some(tc) = &backup.translate_config {
                 if !tc.config.is_empty() {
@@ -458,12 +493,7 @@ impl Store {
         validate_backup_payload_shape(data)?;
         let backup: SettingsBackup = serde_json::from_slice(data)
             .map_err(|e| PebbleError::Validation(format!("Failed to deserialize settings: {e}")))?;
-        if backup.version == 0 || backup.version > BACKUP_SCHEMA_VERSION {
-            return Err(PebbleError::Validation(format!(
-                "Unsupported backup version {} (this build supports up to {})",
-                backup.version, BACKUP_SCHEMA_VERSION
-            )));
-        }
+        validate_backup_schema(&backup)?;
 
         self.with_write(|conn| {
             let tx = conn
@@ -533,6 +563,12 @@ impl Store {
                 .map_err(|e| PebbleError::Storage(e.to_string()))?;
             for card in &backup.kanban_cards {
                 Self::upsert_kanban_card_with_conn(&tx, card)?;
+            }
+
+            if backup.version >= 2 {
+                if let Some(contacts) = &backup.contacts {
+                    crate::contacts::replace_contacts_with_conn(&tx, contacts)?;
+                }
             }
 
             if let Some(tc) = &backup.translate_config {
@@ -758,15 +794,42 @@ mod tests {
         };
         store.save_translate_config(&tc).unwrap();
 
+        store
+            .save_contact(&ContactInput {
+                id: None,
+                display_name: "Alice Example".to_string(),
+                notes: "Met at RustConf".to_string(),
+                is_favorite: true,
+                emails: vec![
+                    ContactEmailInput {
+                        id: None,
+                        address: "alice@example.com".to_string(),
+                        label: ContactEmailLabel::Work,
+                        is_primary: true,
+                    },
+                    ContactEmailInput {
+                        id: None,
+                        address: "alice@home.example".to_string(),
+                        label: ContactEmailLabel::Personal,
+                        is_primary: false,
+                    },
+                ],
+            })
+            .unwrap();
+
         // Export
         let data = store.export_settings().unwrap();
         let backup: SettingsBackup = serde_json::from_slice(&data).unwrap();
-        assert_eq!(backup.version, 1);
+        assert_eq!(backup.version, 2);
         assert_eq!(backup.accounts.len(), 1);
         assert_eq!(backup.accounts[0].email, "test@example.com");
         assert_eq!(backup.accounts[0].color.as_deref(), Some("#22c55e"));
         assert_eq!(backup.rules.len(), 1);
         assert_eq!(backup.rules[0].name, "Auto-archive");
+        let backed_up_contacts = backup.contacts.as_ref().unwrap();
+        assert_eq!(backed_up_contacts.len(), 1);
+        assert_eq!(backed_up_contacts[0].emails.len(), 2);
+        assert!(backed_up_contacts[0].is_favorite);
         assert!(backup.translate_config.is_some());
         // Config field should be redacted (empty) in export
         assert_eq!(backup.translate_config.as_ref().unwrap().config, "");
@@ -784,6 +847,21 @@ mod tests {
         let rules = store2.list_rules().unwrap();
         assert_eq!(rules.len(), 1);
         assert_eq!(rules[0].name, "Auto-archive");
+
+        let contacts = store2.list_contacts(None, false, 200, 0).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].display_name, "Alice Example");
+        assert_eq!(contacts[0].notes, "Met at RustConf");
+        assert_eq!(contacts[0].emails.len(), 2);
+        assert!(contacts[0].is_favorite);
+        assert_eq!(
+            contacts[0]
+                .emails
+                .iter()
+                .find(|email| email.is_primary)
+                .map(|email| email.address.as_str()),
+            Some("alice@example.com")
+        );
 
         // Translate config should NOT be imported when config is redacted
         let tc_loaded = store2.get_translate_config().unwrap();
@@ -838,6 +916,149 @@ mod tests {
         assert!(preview.has_encrypted_secrets);
         assert_eq!(preview.secret_account_count, 2);
         assert!(preview.has_translate_secret);
+    }
+
+    #[test]
+    fn version_one_backup_has_no_contacts_and_preserves_local_contacts() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_contact(&ContactInput {
+                id: None,
+                display_name: "Local contact".to_string(),
+                notes: String::new(),
+                is_favorite: false,
+                emails: vec![ContactEmailInput {
+                    id: None,
+                    address: "local@example.com".to_string(),
+                    label: ContactEmailLabel::Other,
+                    is_primary: true,
+                }],
+            })
+            .unwrap();
+        let backup = serde_json::json!({
+            "version": 1,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "translate_config": null
+        });
+        let data = serde_json::to_vec(&backup).unwrap();
+
+        let preview = preview_backup(&data).unwrap();
+        assert_eq!(preview.contact_count, 0);
+        store.import_settings(&data).unwrap();
+
+        let contacts = store.list_contacts(None, false, 200, 0).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].display_name, "Local contact");
+    }
+
+    #[test]
+    fn version_two_backup_requires_contacts_field() {
+        let backup = serde_json::json!({
+            "version": 2,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "translate_config": null
+        });
+        let data = serde_json::to_vec(&backup).unwrap();
+
+        let error = preview_backup(&data).unwrap_err().to_string();
+
+        assert!(error.contains("contacts"));
+        assert!(error.contains("version 2"));
+    }
+
+    #[test]
+    fn export_rejects_backup_that_cannot_be_restored_due_to_size() {
+        let store = Store::open_in_memory().unwrap();
+        let notes = "x".repeat(2000);
+        store
+            .with_write(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                for index in 0..8_500 {
+                    let contact_id = format!("contact-{index}");
+                    let email_id = format!("email-{index}");
+                    let address = format!("user{index}@example.com");
+                    tx.execute(
+                        "INSERT INTO contacts
+                            (id, display_name, notes, is_favorite, created_at, updated_at)
+                         VALUES (?1, ?2, ?3, 0, 1, 1)",
+                        rusqlite::params![contact_id, address, notes],
+                    )?;
+                    tx.execute(
+                        "INSERT INTO contact_emails
+                            (id, contact_id, address, normalized_address, label, is_primary, created_at)
+                         VALUES (?1, ?2, ?3, ?3, 'other', 1, 1)",
+                        rusqlite::params![email_id, contact_id, address],
+                    )?;
+                }
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
+
+        let error = store.export_settings().unwrap_err().to_string();
+
+        assert!(error.contains("too large"));
+        assert!(error.contains(&MAX_BACKUP_SIZE_BYTES.to_string()));
+    }
+
+    #[test]
+    fn version_two_contact_restore_rolls_back_on_duplicate_email() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_contact(&ContactInput {
+                id: None,
+                display_name: "Keep me".to_string(),
+                notes: String::new(),
+                is_favorite: false,
+                emails: vec![ContactEmailInput {
+                    id: None,
+                    address: "keep@example.com".to_string(),
+                    label: ContactEmailLabel::Other,
+                    is_primary: true,
+                }],
+            })
+            .unwrap();
+        let contact = |id: &str, email_id: &str| {
+            serde_json::json!({
+                "id": id,
+                "display_name": id,
+                "notes": "",
+                "is_favorite": false,
+                "emails": [{
+                    "id": email_id,
+                    "address": "duplicate@example.com",
+                    "label": "other",
+                    "is_primary": true
+                }],
+                "created_at": 1,
+                "updated_at": 1
+            })
+        };
+        let backup = serde_json::json!({
+            "version": 2,
+            "exported_at": now_timestamp(),
+            "accounts": [],
+            "rules": [],
+            "kanban_cards": [],
+            "kanban_context_notes": {},
+            "contacts": [contact("first", "first-email"), contact("second", "second-email")],
+            "translate_config": null
+        });
+
+        assert!(store
+            .import_settings(&serde_json::to_vec(&backup).unwrap())
+            .is_err());
+        let contacts = store.list_contacts(None, false, 200, 0).unwrap();
+        assert_eq!(contacts.len(), 1);
+        assert_eq!(contacts[0].display_name, "Keep me");
     }
 
     #[test]
@@ -938,6 +1159,7 @@ mod tests {
             }],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
@@ -983,6 +1205,7 @@ mod tests {
             }],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
@@ -1095,6 +1318,7 @@ mod tests {
                 updated_at: now,
             }],
             kanban_context_notes: HashMap::new(),
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
@@ -1128,6 +1352,7 @@ mod tests {
             rules: vec![],
             kanban_cards: vec![],
             kanban_context_notes: HashMap::new(),
+            contacts: None,
             translate_config: None,
             secret_summary: None,
             encrypted_secrets: None,
