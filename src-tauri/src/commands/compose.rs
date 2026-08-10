@@ -1,6 +1,9 @@
 use std::path::{Path, PathBuf};
 
-use crate::commands::attachments::{sanitize_stored_filename, stage_local_attachment_records};
+use crate::commands::attachments::{
+    cleanup_staged_attachment_records, sanitize_stored_filename, stage_local_attachment_records,
+};
+use crate::commands::encrypted_store::load_account_auth_data;
 use crate::commands::messages::refresh_search_document;
 use crate::commands::network::{account_proxy_mode_from_auth_value, resolve_mail_proxy_from_mode};
 use crate::commands::oauth::ensure_account_oauth_auth;
@@ -120,7 +123,8 @@ pub(crate) fn ensure_local_outgoing_folder(
     Ok(Folder { id, ..folder })
 }
 
-pub(crate) fn save_outgoing_message_locally(
+#[cfg(test)]
+fn save_outgoing_message_locally(
     store: &Store,
     account: &Account,
     outgoing: &OutgoingMessage,
@@ -128,6 +132,25 @@ pub(crate) fn save_outgoing_message_locally(
     attachments_dir: &Path,
 ) -> std::result::Result<Message, PebbleError> {
     let folder = ensure_local_outgoing_folder(store, &account.id, state)?;
+    let (message, attachments) = stage_outgoing_message(account, outgoing, state, attachments_dir)?;
+
+    if let Err(error) = store.replace_message_with_attachments(
+        &message,
+        std::slice::from_ref(&folder.id),
+        &attachments,
+    ) {
+        cleanup_staged_attachment_records(&attachments);
+        return Err(error);
+    }
+    Ok(message)
+}
+
+fn stage_outgoing_message(
+    account: &Account,
+    outgoing: &OutgoingMessage,
+    state: LocalOutgoingState,
+    attachments_dir: &Path,
+) -> std::result::Result<(Message, Vec<pebble_core::Attachment>), PebbleError> {
     let now = now_timestamp();
     let id = new_id();
     let prefix = match state {
@@ -165,28 +188,7 @@ pub(crate) fn save_outgoing_message_locally(
         updated_at: now,
     };
 
-    store.replace_message_with_attachments(&message, &[folder.id], &attachments)?;
-    Ok(message)
-}
-
-fn save_outgoing_message_and_refresh_search(
-    state: &AppState,
-    account: &Account,
-    outgoing: &OutgoingMessage,
-    outgoing_state: LocalOutgoingState,
-    attachments_dir: &Path,
-) -> std::result::Result<Message, PebbleError> {
-    let message = save_outgoing_message_locally(
-        &state.store,
-        account,
-        outgoing,
-        outgoing_state,
-        attachments_dir,
-    )?;
-    if let Err(e) = refresh_search_document(state, &message.id) {
-        warn!("Failed to index outgoing message {}: {e}", message.id);
-    }
-    Ok(message)
+    Ok((message, attachments))
 }
 
 pub(crate) fn outgoing_message_from_stored(
@@ -214,10 +216,9 @@ pub(crate) fn load_smtp_config(
     crypto: &CryptoService,
     account_id: &str,
 ) -> std::result::Result<SmtpConfig, PebbleError> {
-    let encrypted = store.get_auth_data(account_id)?.ok_or_else(|| {
+    let decrypted = load_account_auth_data(crypto, store, account_id)?.ok_or_else(|| {
         PebbleError::Internal(format!("No auth data found for account {account_id}"))
     })?;
-    let decrypted = crypto.decrypt(&encrypted)?;
     let config: serde_json::Value = serde_json::from_slice(&decrypted)
         .map_err(|e| PebbleError::Internal(format!("Failed to parse decrypted config: {e}")))?;
 
@@ -241,7 +242,6 @@ pub(crate) async fn send_imap_smtp_message(
     outgoing: &OutgoingMessage,
 ) -> std::result::Result<(), PebbleError> {
     let smtp_config = load_smtp_config(&state.store, &state.crypto, &account.id)?;
-
     let sender = SmtpSender::new(
         smtp_config.host,
         smtp_config.port,
@@ -252,6 +252,14 @@ pub(crate) async fn send_imap_smtp_message(
         smtp_config.proxy,
     );
 
+    send_smtp_message(&sender, account, outgoing).await
+}
+
+async fn send_smtp_message(
+    sender: &SmtpSender,
+    account: &Account,
+    outgoing: &OutgoingMessage,
+) -> std::result::Result<(), PebbleError> {
     let to = outgoing
         .to
         .iter()
@@ -283,44 +291,177 @@ pub(crate) async fn send_imap_smtp_message(
         .await
 }
 
-fn should_queue_send_failure(error: &PebbleError) -> bool {
+fn send_call_outcome_is_unknown(error: &PebbleError) -> bool {
     matches!(error, PebbleError::Network(_))
 }
 
-fn queue_failed_send(
+pub(super) fn send_outcome_unknown_message(error: &PebbleError) -> String {
+    format!(
+        "Remote send outcome is unknown: {error}. Check Sent before dismissing or sending again."
+    )
+}
+
+struct PreparedOutgoingSend {
+    message: Message,
+    attachments: Vec<pebble_core::Attachment>,
+    op_id: String,
+    sent_folder_id: Option<String>,
+    delete_placeholder_after_send: bool,
+}
+
+pub(super) const SEND_FINALIZE_DELETE_PLACEHOLDER: &str = "delete_placeholder";
+pub(super) const SEND_FINALIZE_MOVE_TO_SENT: &str = "move_to_sent";
+
+pub(super) fn send_finalize_deletes_placeholder(payload: &serde_json::Value) -> bool {
+    payload
+        .get("local_finalize")
+        .and_then(serde_json::Value::as_str)
+        == Some(SEND_FINALIZE_DELETE_PLACEHOLDER)
+}
+
+fn prepare_outgoing_send_locally(
     state: &AppState,
     account: &Account,
     outgoing: &OutgoingMessage,
-    error: &PebbleError,
-) -> std::result::Result<String, PebbleError> {
-    let message = save_outgoing_message_locally(
-        &state.store,
+) -> std::result::Result<PreparedOutgoingSend, PebbleError> {
+    let outbox =
+        ensure_local_outgoing_folder(&state.store, &account.id, LocalOutgoingState::Queued)?;
+    let delete_placeholder_after_send = matches!(
+        account.provider,
+        ProviderType::Gmail | ProviderType::Outlook
+    );
+    let sent_folder_id = if delete_placeholder_after_send {
+        None
+    } else {
+        Some(ensure_local_outgoing_folder(&state.store, &account.id, LocalOutgoingState::Sent)?.id)
+    };
+    let (message, attachments) = stage_outgoing_message(
         account,
         outgoing,
         LocalOutgoingState::Queued,
         &state.attachments_dir,
     )?;
-    let op_id = state.store.insert_pending_mail_op(
-        &account.id,
-        &message.id,
-        "send",
-        &serde_json::json!({
-            "provider_account_id": account.id,
-            "remote_id": message.remote_id,
-            "op": "send",
-            "payload": {
-                "queued_due_to": error.to_string(),
+    let payload = serde_json::json!({
+        "provider_account_id": message.account_id,
+        "remote_id": message.remote_id,
+        "op": "send",
+        "payload": {
+            "local_finalize": if delete_placeholder_after_send {
+                SEND_FINALIZE_DELETE_PLACEHOLDER
+            } else {
+                SEND_FINALIZE_MOVE_TO_SENT
             },
-        })
-        .to_string(),
-    )?;
+            "sent_folder_id": sent_folder_id,
+        },
+    });
+    let op_id = match state.store.prepare_outgoing_send(
+        &message,
+        std::slice::from_ref(&outbox.id),
+        &attachments,
+        &payload.to_string(),
+    ) {
+        Ok(op_id) => op_id,
+        Err(error) => {
+            cleanup_staged_attachment_records(&attachments);
+            return Err(error);
+        }
+    };
     if let Err(e) = refresh_search_document(state, &message.id) {
         warn!(
-            "Failed to index queued outgoing message {}: {e}",
+            "Failed to index prepared outgoing message {}: {e}",
             message.id
         );
     }
-    Ok(op_id)
+    Ok(PreparedOutgoingSend {
+        message,
+        attachments,
+        op_id,
+        sent_folder_id,
+        delete_placeholder_after_send,
+    })
+}
+
+fn accept_post_dispatch_transition(
+    result: std::result::Result<(), PebbleError>,
+    op_id: &str,
+    phase: &str,
+) -> std::result::Result<(), PebbleError> {
+    if let Err(error) = result {
+        warn!(
+            "Send operation {op_id} could not persist its {phase} transition: {error}; leaving the durable in-progress row for conservative startup recovery"
+        );
+    }
+    Ok(())
+}
+
+fn definite_send_failure_command_result(
+    provider_error: PebbleError,
+    cleanup_error: Option<&PebbleError>,
+    op_id: &str,
+) -> std::result::Result<(), PebbleError> {
+    if let Some(cleanup_error) = cleanup_error {
+        warn!(
+            "Send operation {op_id} had a definite provider failure, but local cleanup also failed: {cleanup_error}; preserving the original provider error so the draft remains retryable"
+        );
+    }
+    Err(provider_error)
+}
+
+enum PreparedSendTransport {
+    Gmail(GmailProvider),
+    Outlook(OutlookProvider),
+    Smtp(SmtpSender),
+}
+
+impl PreparedSendTransport {
+    async fn send(
+        &self,
+        account: &Account,
+        outgoing: &OutgoingMessage,
+    ) -> std::result::Result<(), PebbleError> {
+        match self {
+            Self::Gmail(provider) => provider.send_message(outgoing).await,
+            Self::Outlook(provider) => provider.send_message(outgoing).await,
+            Self::Smtp(sender) => send_smtp_message(sender, account, outgoing).await,
+        }
+    }
+}
+
+async fn prepare_send_transport(
+    state: &AppState,
+    account: &Account,
+) -> std::result::Result<PreparedSendTransport, PebbleError> {
+    match account.provider {
+        ProviderType::Gmail => {
+            let auth = ensure_account_oauth_auth(state, &account.id, "gmail").await?;
+            Ok(PreparedSendTransport::Gmail(GmailProvider::new_with_proxy(
+                auth.tokens.access_token,
+                auth.proxy,
+            )?))
+        }
+        ProviderType::Outlook => {
+            let auth = ensure_account_oauth_auth(state, &account.id, "outlook").await?;
+            Ok(PreparedSendTransport::Outlook(
+                OutlookProvider::new_with_proxy(
+                    auth.tokens.access_token,
+                    account.id.clone(),
+                    auth.proxy,
+                )?,
+            ))
+        }
+        ProviderType::Imap | ProviderType::Pop3 => {
+            let smtp_config = load_smtp_config(&state.store, &state.crypto, &account.id)?;
+            Ok(PreparedSendTransport::Smtp(SmtpSender::new(
+                smtp_config.host,
+                smtp_config.port,
+                smtp_config.username,
+                smtp_config.password,
+                smtp_config.security,
+                smtp_config.accept_invalid_certs,
+                smtp_config.proxy,
+            )))
+        }
+    }
 }
 
 #[tauri::command]
@@ -360,59 +501,88 @@ pub async fn send_email(
         attachment_paths: attachment_paths.clone(),
     };
 
-    if matches!(
-        account.provider,
-        ProviderType::Gmail | ProviderType::Outlook
-    ) {
-        let provider_name = match account.provider {
-            ProviderType::Gmail => "gmail",
-            ProviderType::Outlook => "outlook",
-            _ => unreachable!(),
-        };
-        let auth = ensure_account_oauth_auth(&state, &account_id, provider_name).await?;
-        let result = match account.provider {
-            ProviderType::Gmail => {
-                let provider = GmailProvider::new_with_proxy(auth.tokens.access_token, auth.proxy)?;
-                provider.send_message(&outgoing).await
-            }
-            ProviderType::Outlook => {
-                let provider = OutlookProvider::new_with_proxy(
-                    auth.tokens.access_token,
-                    account_id,
-                    auth.proxy,
-                )?;
-                provider.send_message(&outgoing).await
-            }
-            _ => unreachable!(),
-        };
-        if let Err(e) = result {
-            if should_queue_send_failure(&e) {
-                queue_failed_send(&state, &account, &outgoing, &e)?;
-                let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
-                return Ok(());
-            }
-            return Err(e);
-        }
-        return Ok(());
-    }
+    // Resolve credentials/configuration before creating an in-progress send.
+    // Errors here are known pre-dispatch failures and remain safe to return.
+    let transport = prepare_send_transport(&state, &account).await?;
+    let prepared = prepare_outgoing_send_locally(&state, &account, &outgoing)?;
+    let durable_attachment_paths = prepared
+        .attachments
+        .iter()
+        .filter_map(|attachment| attachment.local_path.clone())
+        .collect();
+    let durable_outgoing =
+        outgoing_message_from_stored(&prepared.message, durable_attachment_paths);
 
-    match send_imap_smtp_message(&state, &account, &outgoing).await {
+    match transport.send(&account, &durable_outgoing).await {
         Ok(()) => {
-            save_outgoing_message_and_refresh_search(
-                &state,
-                &account,
-                &outgoing,
-                LocalOutgoingState::Sent,
-                &state.attachments_dir,
-            )?;
-            Ok(())
-        }
-        Err(e) if should_queue_send_failure(&e) => {
-            queue_failed_send(&state, &account, &outgoing, &e)?;
+            if let Err(receipt_error) = state
+                .store
+                .mark_pending_mail_op_remote_succeeded(&prepared.op_id)
+            {
+                let transition = state.store.mark_pending_mail_op_outcome_unknown(
+                    &prepared.op_id,
+                    &send_outcome_unknown_message(&receipt_error),
+                );
+                let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
+                return accept_post_dispatch_transition(
+                    transition,
+                    &prepared.op_id,
+                    "outcome-unknown",
+                );
+            }
+            if let Err(finalize_error) = state.store.complete_outgoing_send(
+                &prepared.message.id,
+                &prepared.op_id,
+                prepared.sent_folder_id.as_deref(),
+            ) {
+                // The remote receipt is durable, so this retry only performs
+                // the local Sent-folder commit and can never resend the mail.
+                let transition = state
+                    .store
+                    .mark_pending_mail_op_failed(&prepared.op_id, &finalize_error.to_string());
+                let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
+                return accept_post_dispatch_transition(
+                    transition,
+                    &prepared.op_id,
+                    "local-finalize retry",
+                );
+            }
+            if prepared.delete_placeholder_after_send {
+                cleanup_staged_attachment_records(&prepared.attachments);
+            }
+            if let Err(error) = refresh_search_document(&state, &prepared.message.id) {
+                warn!(
+                    "Failed to index sent outgoing message {}: {error}",
+                    prepared.message.id
+                );
+            }
             let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
             Ok(())
         }
-        Err(e) => Err(e),
+        Err(error) if send_call_outcome_is_unknown(&error) => {
+            let transition = state.store.mark_pending_mail_op_outcome_unknown(
+                &prepared.op_id,
+                &send_outcome_unknown_message(&error),
+            );
+            let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
+            accept_post_dispatch_transition(transition, &prepared.op_id, "outcome-unknown")
+        }
+        Err(error) => {
+            let transition = state
+                .store
+                .discard_prepared_outgoing_send(&prepared.message.id, &prepared.op_id);
+            if transition.is_ok() {
+                cleanup_staged_attachment_records(&prepared.attachments);
+                if let Err(index_error) = refresh_search_document(&state, &prepared.message.id) {
+                    warn!(
+                        "Failed to remove discarded outgoing message {} from search: {index_error}",
+                        prepared.message.id
+                    );
+                }
+            }
+            let _ = app.emit(events::MAIL_PENDING_OPS_CHANGED, ());
+            definite_send_failure_command_result(error, transition.as_ref().err(), &prepared.op_id)
+        }
     }
 }
 
@@ -422,6 +592,7 @@ mod tests {
     use crate::commands::messages::refresh_search_document_with_store;
     use pebble_core::{now_timestamp, Account, FolderRole};
     use pebble_search::TantivySearch;
+    use pebble_store::pending_ops::{PendingMailOpStatus, MAX_PENDING_MAIL_OP_ATTEMPTS};
     use pebble_store::Store;
 
     fn test_account() -> Account {
@@ -454,6 +625,46 @@ mod tests {
 
     fn temp_attachments_dir(prefix: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!("{prefix}-{}", new_id()))
+    }
+
+    fn prepare_test_send(
+        store: &Store,
+        account: &Account,
+        attachments_dir: &Path,
+    ) -> (
+        Message,
+        Vec<pebble_core::Attachment>,
+        String,
+        Folder,
+        Folder,
+    ) {
+        let outbox =
+            ensure_local_outgoing_folder(store, &account.id, LocalOutgoingState::Queued).unwrap();
+        let sent =
+            ensure_local_outgoing_folder(store, &account.id, LocalOutgoingState::Sent).unwrap();
+        let (message, attachments) = stage_outgoing_message(
+            account,
+            &outgoing_message(),
+            LocalOutgoingState::Queued,
+            attachments_dir,
+        )
+        .unwrap();
+        let op_id = store
+            .prepare_outgoing_send(
+                &message,
+                std::slice::from_ref(&outbox.id),
+                &attachments,
+                &serde_json::json!({
+                    "op": "send",
+                    "payload": {
+                        "local_finalize": SEND_FINALIZE_MOVE_TO_SENT,
+                        "sent_folder_id": sent.id,
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+        (message, attachments, op_id, outbox, sent)
     }
 
     #[test]
@@ -490,7 +701,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_send_is_saved_to_local_outbox_folder_for_retry() {
+    fn failed_send_is_saved_to_local_outbox_folder() {
         let store = Store::open_in_memory().unwrap();
         let account = test_account();
         store.insert_account(&account).unwrap();
@@ -517,6 +728,176 @@ mod tests {
         assert!(saved.remote_id.starts_with("local-outbox-"));
 
         let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[test]
+    fn network_send_failure_is_recorded_for_manual_review_not_retry() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let attachments_dir = temp_attachments_dir("pebble-unknown-send-attachments");
+        let (_message, _attachments, op_id, _outbox, _sent) =
+            prepare_test_send(&store, &account, &attachments_dir);
+        let network_error = PebbleError::Network("connection closed after DATA".to_string());
+
+        store
+            .mark_pending_mail_op_outcome_unknown(
+                &op_id,
+                &send_outcome_unknown_message(&network_error),
+            )
+            .unwrap();
+
+        let op = store.list_pending_mail_ops(&account.id).unwrap().remove(0);
+        assert_eq!(op.status, PendingMailOpStatus::Failed);
+        assert_eq!(op.attempts, MAX_PENDING_MAIL_OP_ATTEMPTS);
+        assert!(op
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("Check Sent")));
+        assert!(store
+            .list_retryable_pending_mail_ops(10)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[test]
+    fn crash_after_dispatch_before_response_becomes_manual_review_on_startup() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let attachments_dir = temp_attachments_dir("pebble-interrupted-send");
+        let (message, _attachments, op_id, outbox, _sent) =
+            prepare_test_send(&store, &account, &attachments_dir);
+
+        // Inject a process boundary after remote dispatch: no response or
+        // remote_succeeded receipt was persisted, so the operation is still
+        // in_progress when startup recovery runs.
+        store.reset_in_progress_pending_mail_ops().unwrap();
+
+        let op = store
+            .list_pending_mail_ops(&account.id)
+            .unwrap()
+            .into_iter()
+            .find(|op| op.id == op_id)
+            .unwrap();
+        assert_eq!(op.status, PendingMailOpStatus::Failed);
+        assert_eq!(op.attempts, MAX_PENDING_MAIL_OP_ATTEMPTS);
+        assert!(op
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outcome is unknown")));
+        assert!(store
+            .list_retryable_pending_mail_ops(10)
+            .unwrap()
+            .is_empty());
+        assert!(store.get_message(&message.id).unwrap().is_some());
+        assert_eq!(
+            store.get_message_folder_ids(&message.id).unwrap(),
+            vec![outbox.id]
+        );
+
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[test]
+    fn successful_prepared_send_finishes_in_sent_without_active_operation() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let attachments_dir = temp_attachments_dir("pebble-successful-prepared-send");
+        let (message, _attachments, op_id, outbox, sent) =
+            prepare_test_send(&store, &account, &attachments_dir);
+
+        store.mark_pending_mail_op_remote_succeeded(&op_id).unwrap();
+        store
+            .complete_outgoing_send(&message.id, &op_id, Some(&sent.id))
+            .unwrap();
+
+        assert_eq!(
+            store.get_message_folder_ids(&message.id).unwrap(),
+            vec![sent.id]
+        );
+        assert_ne!(
+            store.get_message_folder_ids(&message.id).unwrap(),
+            vec![outbox.id]
+        );
+        let op = store.list_pending_mail_ops(&account.id).unwrap().remove(0);
+        assert_eq!(op.status, PendingMailOpStatus::Done);
+        assert!(store
+            .list_active_pending_mail_ops(None, 10)
+            .unwrap()
+            .is_empty());
+
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[test]
+    fn api_send_finalize_deletes_placeholder_to_avoid_sync_duplicates() {
+        let store = Store::open_in_memory().unwrap();
+        let mut account = test_account();
+        account.provider = ProviderType::Gmail;
+        store.insert_account(&account).unwrap();
+        let attachments_dir = temp_attachments_dir("pebble-api-send-placeholder");
+        let outbox =
+            ensure_local_outgoing_folder(&store, &account.id, LocalOutgoingState::Queued).unwrap();
+        let (message, attachments) = stage_outgoing_message(
+            &account,
+            &outgoing_message(),
+            LocalOutgoingState::Queued,
+            &attachments_dir,
+        )
+        .unwrap();
+        let op_id = store
+            .prepare_outgoing_send(
+                &message,
+                std::slice::from_ref(&outbox.id),
+                &attachments,
+                &serde_json::json!({
+                    "op": "send",
+                    "payload": {
+                        "local_finalize": SEND_FINALIZE_DELETE_PLACEHOLDER,
+                    }
+                })
+                .to_string(),
+            )
+            .unwrap();
+
+        store.mark_pending_mail_op_remote_succeeded(&op_id).unwrap();
+        store
+            .complete_outgoing_send(&message.id, &op_id, None)
+            .unwrap();
+
+        assert!(store.get_message(&message.id).unwrap().is_none());
+        assert!(store
+            .list_attachments_by_message(&message.id)
+            .unwrap()
+            .is_empty());
+        assert!(store.list_pending_mail_ops(&account.id).unwrap().is_empty());
+        cleanup_staged_attachment_records(&attachments);
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[test]
+    fn post_dispatch_transition_write_failure_is_accepted_not_returned_for_retry() {
+        let result = accept_post_dispatch_transition(
+            Err(PebbleError::Storage(
+                "injected transition failure".to_string(),
+            )),
+            "send-op",
+            "outcome-unknown",
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn definite_provider_failure_stays_retryable_when_local_cleanup_fails() {
+        let provider_error = PebbleError::Auth("provider rejected sender".to_string());
+        let cleanup_error = PebbleError::Storage("injected cleanup failure".to_string());
+        let result =
+            definite_send_failure_command_result(provider_error, Some(&cleanup_error), "send-op");
+        assert!(matches!(result, Err(PebbleError::Auth(_))));
     }
 
     #[test]
@@ -621,6 +1002,36 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(base);
     }
+
+    #[test]
+    fn compose_staging_cleanup_deletes_only_the_staged_file_and_empty_directory() {
+        let attachments_dir = temp_attachments_dir("pebble-compose-cleanup");
+        let staged =
+            stage_compose_attachment_bytes(&attachments_dir, "report.pdf", b"payload").unwrap();
+        let staged_parent = staged.parent().unwrap().to_path_buf();
+
+        cleanup_staged_compose_attachment_path(&attachments_dir, &staged).unwrap();
+
+        assert!(!staged.exists());
+        assert!(!staged_parent.exists());
+        assert!(attachments_dir.join("compose_staging").exists());
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[test]
+    fn compose_staging_cleanup_rejects_files_outside_the_staging_directory() {
+        let base = temp_attachments_dir("pebble-compose-cleanup-outside");
+        let attachments_dir = base.join("attachments");
+        let outside = base.join("keep.txt");
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+        std::fs::write(&outside, b"keep").unwrap();
+
+        let result = cleanup_staged_compose_attachment_path(&attachments_dir, &outside);
+
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
+        let _ = std::fs::remove_dir_all(base);
+    }
 }
 
 pub(crate) fn stage_compose_attachment_bytes(
@@ -659,6 +1070,55 @@ pub(crate) fn stage_compose_attachment_bytes(
     Ok(staged_path)
 }
 
+pub(crate) fn cleanup_staged_compose_attachment_path(
+    attachments_dir: &Path,
+    path: &Path,
+) -> std::result::Result<(), PebbleError> {
+    let staging_dir = attachments_dir.join("compose_staging");
+    let canonical_staging_dir = staging_dir.canonicalize().map_err(|e| {
+        PebbleError::Internal(format!(
+            "Failed to resolve compose attachment staging directory {}: {e}",
+            staging_dir.display()
+        ))
+    })?;
+    let canonical_path = path.canonicalize().map_err(|e| {
+        PebbleError::Internal(format!(
+            "Failed to resolve staged compose attachment {}: {e}",
+            path.display()
+        ))
+    })?;
+    let parent = canonical_path.parent().ok_or_else(|| {
+        PebbleError::Validation("Staged compose attachment has no parent directory".to_string())
+    })?;
+    if !canonical_path.starts_with(&canonical_staging_dir)
+        || parent.parent() != Some(canonical_staging_dir.as_path())
+        || !canonical_path.is_file()
+    {
+        return Err(PebbleError::Validation(format!(
+            "Path is not a staged compose attachment: {}",
+            canonical_path.display()
+        )));
+    }
+
+    std::fs::remove_file(&canonical_path).map_err(|e| {
+        PebbleError::Internal(format!(
+            "Failed to remove staged compose attachment {}: {e}",
+            canonical_path.display()
+        ))
+    })?;
+    if let Err(error) = std::fs::remove_dir(parent) {
+        if error.kind() != std::io::ErrorKind::DirectoryNotEmpty
+            && error.kind() != std::io::ErrorKind::NotFound
+        {
+            return Err(PebbleError::Internal(format!(
+                "Failed to remove staged compose attachment directory {}: {error}",
+                parent.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn stage_compose_attachment(
     state: State<'_, AppState>,
@@ -667,4 +1127,12 @@ pub async fn stage_compose_attachment(
 ) -> std::result::Result<String, PebbleError> {
     let staged = stage_compose_attachment_bytes(&state.attachments_dir, &filename, &bytes)?;
     Ok(staged.to_string_lossy().into_owned())
+}
+
+#[tauri::command]
+pub async fn cleanup_staged_compose_attachment(
+    state: State<'_, AppState>,
+    path: String,
+) -> std::result::Result<(), PebbleError> {
+    cleanup_staged_compose_attachment_path(&state.attachments_dir, Path::new(&path))
 }

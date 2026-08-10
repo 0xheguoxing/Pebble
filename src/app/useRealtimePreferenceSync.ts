@@ -2,27 +2,25 @@ import { useEffect } from "react";
 import { setNotificationsEnabled, setRealtimePreference } from "@/lib/api";
 import { useUIStore } from "@/stores/ui.store";
 
+let realtimePreferenceTransition = Promise.resolve();
+
+function enqueueRealtimePreference(mode: "realtime" | "balanced" | "battery" | "manual") {
+  const transition = realtimePreferenceTransition
+    .catch(() => {})
+    .then(() => setRealtimePreference(mode));
+  realtimePreferenceTransition = transition;
+  void transition.catch(() => {});
+}
+
 export function useRealtimePreferenceSync() {
   const realtimeMode = useUIStore((state) => state.realtimeMode);
   const notificationsEnabled = useUIStore((state) => state.notificationsEnabled);
 
   useEffect(() => {
-    let cancelled = false;
+    void setNotificationsEnabled(notificationsEnabled).catch(() => {});
+  }, [notificationsEnabled]);
 
-    async function syncRealtimePreference() {
-      try {
-        await setNotificationsEnabled(notificationsEnabled);
-      } catch {}
-
-      if (cancelled) return;
-
-      setRealtimePreference(realtimeMode).catch(() => {});
-    }
-
-    syncRealtimePreference();
-
-    return () => {
-      cancelled = true;
-    };
+  useEffect(() => {
+    enqueueRealtimePreference(realtimeMode);
   }, [realtimeMode]);
 }

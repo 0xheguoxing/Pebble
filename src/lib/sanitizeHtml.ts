@@ -211,3 +211,26 @@ export function sanitizeHtml(html: string): string {
   });
   return cssNodes + normalizeLinkAttributes(filterStylesheetLinks(filterInlineStyles(sanitized)));
 }
+
+/**
+ * Sanitize HTML before placing an untrusted message inside the compose UI.
+ * Unlike the isolated message renderer, compose quotes live in the app's light DOM,
+ * so document-level CSS and remotely loaded resources must not be retained.
+ */
+export function sanitizeComposeQuoteHtml(html: string): string {
+  const template = document.createElement("template");
+  template.innerHTML = sanitizeHtml(html);
+
+  template.content.querySelectorAll("style, link").forEach((element) => element.remove());
+  template.content.querySelectorAll<HTMLElement>("[src], [srcset], [background], [poster]").forEach((element) => {
+    element.removeAttribute("srcset");
+    for (const attribute of ["src", "background", "poster"]) {
+      const value = element.getAttribute(attribute)?.trim() ?? "";
+      if (/^(?:https?:)?\/\//i.test(value)) {
+        element.removeAttribute(attribute);
+      }
+    }
+  });
+
+  return template.innerHTML;
+}

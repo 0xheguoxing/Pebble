@@ -18,7 +18,8 @@ use crate::provider::gmail::{
 };
 use crate::realtime_policy::{RealtimePollPolicy, RealtimeRuntimeState, SyncTrigger};
 use crate::sync::{
-    persist_message_attachments_async, recv_sync_trigger, StoredMessage, SyncConfig, SyncError,
+    recv_sync_trigger, remote_message_requires_fetch,
+    store_new_message_with_attachments_atomically, StoredMessage, SyncConfig, SyncError,
     SyncWorkerBase,
 };
 use crate::thread::compute_thread_id;
@@ -129,6 +130,200 @@ where
     }
 
     Ok(all_refs)
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GmailHistoryPage {
+    history: Option<Vec<GmailHistoryEntry>>,
+    #[serde(rename = "historyId")]
+    history_id: Option<String>,
+    #[serde(rename = "nextPageToken")]
+    next_page_token: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GmailHistoryEntry {
+    #[serde(rename = "messagesAdded")]
+    messages_added: Option<Vec<GmailHistoryMessage>>,
+    #[serde(rename = "messagesDeleted")]
+    messages_deleted: Option<Vec<GmailHistoryMessage>>,
+    #[serde(rename = "labelsAdded")]
+    labels_added: Option<Vec<GmailHistoryLabelChange>>,
+    #[serde(rename = "labelsRemoved")]
+    labels_removed: Option<Vec<GmailHistoryLabelChange>>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GmailHistoryMessage {
+    message: GmailHistoryMessageRef,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GmailHistoryLabelChange {
+    message: GmailHistoryMessageRef,
+    #[serde(rename = "labelIds")]
+    label_ids: Vec<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct GmailHistoryMessageRef {
+    id: String,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GmailHistoryLabelAction {
+    Add,
+    Remove,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GmailHistoryLabelMutation {
+    remote_id: String,
+    label_id: String,
+    action: GmailHistoryLabelAction,
+}
+
+fn gmail_history_label_mutations(entries: &[GmailHistoryEntry]) -> Vec<GmailHistoryLabelMutation> {
+    let mut sequence = 0usize;
+    let mut last_events: HashMap<(String, String), (usize, GmailHistoryLabelAction)> =
+        HashMap::new();
+
+    for entry in entries {
+        for (changes, action) in [
+            (&entry.labels_added, GmailHistoryLabelAction::Add),
+            (&entry.labels_removed, GmailHistoryLabelAction::Remove),
+        ] {
+            for change in changes.iter().flatten() {
+                for label_id in &change.label_ids {
+                    last_events.insert(
+                        (change.message.id.clone(), label_id.clone()),
+                        (sequence, action),
+                    );
+                    sequence += 1;
+                }
+            }
+        }
+    }
+
+    let mut final_events = last_events
+        .into_iter()
+        .map(|((remote_id, label_id), (sequence, action))| {
+            (
+                sequence,
+                GmailHistoryLabelMutation {
+                    remote_id,
+                    label_id,
+                    action,
+                },
+            )
+        })
+        .collect::<Vec<_>>();
+    final_events.sort_by_key(|(sequence, _)| *sequence);
+    final_events
+        .into_iter()
+        .map(|(_, mutation)| mutation)
+        .collect()
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct GmailHistoryFlagChange {
+    remote_id: String,
+    is_read: Option<bool>,
+    is_starred: Option<bool>,
+}
+
+fn gmail_history_flag_changes(entries: &[GmailHistoryEntry]) -> Vec<GmailHistoryFlagChange> {
+    let mut by_message: HashMap<String, (usize, Option<bool>, Option<bool>)> = HashMap::new();
+    for (sequence, mutation) in gmail_history_label_mutations(entries)
+        .into_iter()
+        .enumerate()
+    {
+        let entry = by_message
+            .entry(mutation.remote_id)
+            .or_insert((sequence, None, None));
+        entry.0 = sequence;
+        match mutation.label_id.as_str() {
+            "UNREAD" => {
+                entry.1 = Some(matches!(mutation.action, GmailHistoryLabelAction::Remove));
+            }
+            "STARRED" => {
+                entry.2 = Some(matches!(mutation.action, GmailHistoryLabelAction::Add));
+            }
+            _ => {}
+        }
+    }
+
+    let mut changes = by_message
+        .into_iter()
+        .filter_map(|(remote_id, (sequence, is_read, is_starred))| {
+            (is_read.is_some() || is_starred.is_some()).then_some((
+                sequence,
+                GmailHistoryFlagChange {
+                    remote_id,
+                    is_read,
+                    is_starred,
+                },
+            ))
+        })
+        .collect::<Vec<_>>();
+    changes.sort_by_key(|(sequence, _)| *sequence);
+    changes.into_iter().map(|(_, change)| change).collect()
+}
+
+enum GmailHistoryPageFetch {
+    Page(GmailHistoryPage),
+    CursorExpired,
+}
+
+struct GmailHistoryBatch {
+    entries: Vec<GmailHistoryEntry>,
+    history_id: Option<String>,
+    cursor_expired: bool,
+}
+
+fn gmail_history_cursor_expired(status: reqwest::StatusCode) -> bool {
+    status == reqwest::StatusCode::NOT_FOUND
+}
+
+async fn collect_paginated_gmail_history<F, Fut>(
+    _history_id: &str,
+    mut fetch_page: F,
+) -> Result<GmailHistoryBatch>
+where
+    F: FnMut(Option<String>) -> Fut,
+    Fut: Future<Output = Result<GmailHistoryPageFetch>>,
+{
+    let mut entries = Vec::new();
+    let mut history_id = None;
+    let mut page_token = None;
+
+    loop {
+        let page = match fetch_page(page_token.take()).await? {
+            GmailHistoryPageFetch::Page(page) => page,
+            GmailHistoryPageFetch::CursorExpired => {
+                return Ok(GmailHistoryBatch {
+                    entries: Vec::new(),
+                    history_id: None,
+                    cursor_expired: true,
+                });
+            }
+        };
+        entries.extend(page.history.unwrap_or_default());
+        if page.history_id.is_some() {
+            history_id = page.history_id;
+        }
+
+        match page.next_page_token {
+            Some(token) if !token.is_empty() => page_token = Some(token),
+            _ => break,
+        }
+    }
+
+    Ok(GmailHistoryBatch {
+        entries,
+        history_id,
+        cursor_expired: false,
+    })
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -246,6 +441,7 @@ impl GmailSyncWorker {
             message,
             folder_ids,
             notify: false,
+            reconciliation: false,
         });
     }
 
@@ -263,20 +459,36 @@ impl GmailSyncWorker {
             attachments,
         } = fetched;
 
+        let remote_ids = vec![message.remote_id.clone()];
+        let incomplete = self
+            .base
+            .store
+            .get_incomplete_attachment_message_map_by_remote_ids(
+                &self.base.account_id,
+                None,
+                &remote_ids,
+            )?;
+        let repairing_incomplete = if let Some(local_id) = incomplete.get(&message.remote_id) {
+            message.id = local_id.clone();
+            true
+        } else {
+            false
+        };
+
         let thread_id = compute_thread_id(&message, thread_mappings);
         message.thread_id = Some(thread_id);
 
         let folder_ids =
             resolve_folder_ids(folders_by_remote, &visible_label_ids, fallback_folder_id);
 
-        self.base.store.insert_message(&message, &folder_ids)?;
-        persist_message_attachments_async(
+        store_new_message_with_attachments_atomically(
             Arc::clone(&self.base.store),
             self.base.attachments_dir.clone(),
-            message.id.clone(),
+            message.clone(),
+            folder_ids.clone(),
             attachments,
         )
-        .await;
+        .await?;
 
         if let (Some(mid), Some(tid)) = (&message.message_id_header, &message.thread_id) {
             thread_mappings.insert(mid.clone(), tid.clone());
@@ -284,7 +496,8 @@ impl GmailSyncWorker {
         self.base.emit_message(StoredMessage {
             message,
             folder_ids,
-            notify,
+            notify: notify && !repairing_incomplete,
+            reconciliation: repairing_incomplete,
         });
 
         Ok(true)
@@ -501,13 +714,27 @@ impl GmailSyncWorker {
             .store
             .get_existing_message_map_by_remote_ids(&self.base.account_id, &remote_ids)
             .unwrap_or_default();
+        let incomplete = self
+            .base
+            .store
+            .get_incomplete_attachment_message_map_by_remote_ids(
+                &self.base.account_id,
+                None,
+                &remote_ids,
+            )
+            .unwrap_or_default();
 
         let mut outcome = GmailLabelSyncOutcome::default();
 
         // Separate already-existing messages (just add folder) from new ones to fetch
         let mut to_fetch = Vec::new();
         for msg_ref in msg_refs {
-            if let Some(local_id) = existing.get(&msg_ref.id) {
+            if remote_message_requires_fetch(
+                existing.contains_key(&msg_ref.id),
+                incomplete.contains_key(&msg_ref.id),
+            ) {
+                to_fetch.push(msg_ref.id.clone());
+            } else if let Some(local_id) = existing.get(&msg_ref.id) {
                 if let Err(e) = self.base.store.add_message_to_folder(local_id, &folder_id) {
                     outcome.failure_count += 1;
                     warn!(
@@ -587,75 +814,73 @@ impl GmailSyncWorker {
             }
         };
 
-        let url = format!(
-            "https://www.googleapis.com/gmail/v1/users/me/history?startHistoryId={history_id}"
-        );
-        let resp = self.provider.get(&url).await?;
+        let history_cursor = history_id.clone();
+        let provider = Arc::clone(&self.provider);
+        let history = collect_paginated_gmail_history(&history_id, move |page_token| {
+            let provider = Arc::clone(&provider);
+            let history_cursor = history_cursor.clone();
+            async move {
+                let mut url =
+                    reqwest::Url::parse("https://www.googleapis.com/gmail/v1/users/me/history")
+                        .map_err(|e| {
+                            PebbleError::Network(format!("Build Gmail history URL: {e}"))
+                        })?;
+                {
+                    let mut query = url.query_pairs_mut();
+                    query.append_pair("startHistoryId", &history_cursor);
+                    if let Some(page_token) = page_token {
+                        query.append_pair("pageToken", &page_token);
+                    }
+                }
 
-        #[derive(serde::Deserialize)]
-        struct HistoryList {
-            history: Option<Vec<HistoryEntry>>,
-            #[serde(rename = "historyId")]
-            history_id: Option<String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct HistoryEntry {
-            #[serde(rename = "messagesAdded")]
-            messages_added: Option<Vec<HistoryMsg>>,
-            #[serde(rename = "messagesDeleted")]
-            messages_deleted: Option<Vec<HistoryMsg>>,
-            #[serde(rename = "labelsAdded")]
-            labels_added: Option<Vec<HistoryLabelChange>>,
-            #[serde(rename = "labelsRemoved")]
-            labels_removed: Option<Vec<HistoryLabelChange>>,
-        }
-        #[derive(serde::Deserialize)]
-        struct HistoryMsg {
-            message: MsgRef,
-        }
-        #[derive(serde::Deserialize)]
-        struct HistoryLabelChange {
-            message: MsgRef,
-            #[serde(rename = "labelIds")]
-            label_ids: Vec<String>,
-        }
-        #[derive(serde::Deserialize)]
-        struct MsgRef {
-            id: String,
-        }
+                let resp = provider.get(url.as_str()).await?;
+                let status = resp.status();
+                if gmail_history_cursor_expired(status) {
+                    return Ok(GmailHistoryPageFetch::CursorExpired);
+                }
+                if !status.is_success() {
+                    let body = resp.text().await.unwrap_or_default();
+                    return Err(PebbleError::Network(format!(
+                        "Gmail history request failed with status {status}: {body}"
+                    )));
+                }
 
-        let history: HistoryList = resp
-            .json()
-            .await
-            .map_err(|e| pebble_core::PebbleError::Network(format!("Parse history: {e}")))?;
+                let page = resp.json::<GmailHistoryPage>().await.map_err(|e| {
+                    PebbleError::Network(format!("Parse Gmail history response: {e}"))
+                })?;
+                Ok(GmailHistoryPageFetch::Page(page))
+            }
+        })
+        .await?;
+
+        if history.cursor_expired {
+            warn!(
+                "Gmail history cursor expired for account {}; running a full resync",
+                self.base.account_id
+            );
+            self.base
+                .store
+                .update_sync_state(&self.base.account_id, |state| {
+                    state.last_sync_cursor = None;
+                })?;
+            return self.initial_sync().await;
+        }
 
         let mut new_ids = Vec::new();
         let mut deleted_ids = Vec::new();
-        let mut labels_added = Vec::new();
-        let mut labels_removed = Vec::new();
         let mut failure_count = 0usize;
+        let label_mutations = gmail_history_label_mutations(&history.entries);
+        let flag_changes = gmail_history_flag_changes(&history.entries);
 
-        if let Some(entries) = &history.history {
-            for entry in entries {
-                if let Some(ref added) = entry.messages_added {
-                    for m in added {
-                        new_ids.push(m.message.id.clone());
-                    }
+        for entry in &history.entries {
+            if let Some(ref added) = entry.messages_added {
+                for m in added {
+                    new_ids.push(m.message.id.clone());
                 }
-                if let Some(ref deleted) = entry.messages_deleted {
-                    for m in deleted {
-                        deleted_ids.push(m.message.id.clone());
-                    }
-                }
-                if let Some(ref added) = entry.labels_added {
-                    for change in added {
-                        labels_added.push((change.message.id.clone(), change.label_ids.clone()));
-                    }
-                }
-                if let Some(ref removed) = entry.labels_removed {
-                    for change in removed {
-                        labels_removed.push((change.message.id.clone(), change.label_ids.clone()));
-                    }
+            }
+            if let Some(ref deleted) = entry.messages_deleted {
+                for m in deleted {
+                    deleted_ids.push(m.message.id.clone());
                 }
             }
         }
@@ -667,6 +892,39 @@ impl GmailSyncWorker {
             .into_iter()
             .map(|folder| (folder.remote_id, folder.id))
             .collect();
+
+        for change in flag_changes {
+            match self
+                .base
+                .store
+                .find_message_id_by_remote(&self.base.account_id, &change.remote_id)
+            {
+                Ok(Some(local_id)) => {
+                    match self.base.store.update_message_flags(
+                        &local_id,
+                        change.is_read,
+                        change.is_starred,
+                    ) {
+                        Ok(()) => self.emit_message_refresh(&local_id),
+                        Err(e) => {
+                            failure_count += 1;
+                            warn!(
+                                "Failed to update Gmail flags for message {}: {}",
+                                change.remote_id, e
+                            );
+                        }
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    failure_count += 1;
+                    warn!(
+                        "Failed to look up Gmail flag-change message {}: {}",
+                        change.remote_id, e
+                    );
+                }
+            }
+        }
 
         // Handle deletions
         if !deleted_ids.is_empty() {
@@ -699,26 +957,33 @@ impl GmailSyncWorker {
             info!("Deleted {} messages via history", deleted_ids.len());
         }
 
-        for (remote_id, label_ids) in labels_removed {
+        for mutation in label_mutations {
+            if visible_label_ids(std::slice::from_ref(&mutation.label_id)).is_empty() {
+                continue;
+            }
+            let remote_id = mutation.remote_id;
             match self
                 .base
                 .store
                 .find_message_id_by_remote(&self.base.account_id, &remote_id)
             {
                 Ok(Some(local_id)) => {
-                    for label_id in visible_label_ids(&label_ids) {
-                        if let Some(folder_id) = folders_by_remote.get(&label_id) {
-                            if let Err(e) = self
+                    if let Some(folder_id) = folders_by_remote.get(&mutation.label_id) {
+                        let result = match mutation.action {
+                            GmailHistoryLabelAction::Add => {
+                                self.base.store.add_message_to_folder(&local_id, folder_id)
+                            }
+                            GmailHistoryLabelAction::Remove => self
                                 .base
                                 .store
-                                .remove_message_from_folder(&local_id, folder_id)
-                            {
-                                failure_count += 1;
-                                warn!(
-                                    "Failed to remove Gmail label {} from message {}: {}",
-                                    label_id, remote_id, e
-                                );
-                            }
+                                .remove_message_from_folder(&local_id, folder_id),
+                        };
+                        if let Err(e) = result {
+                            failure_count += 1;
+                            warn!(
+                                "Failed to apply Gmail label {} {:?} for message {}: {}",
+                                mutation.label_id, mutation.action, remote_id, e
+                            );
                         }
                     }
                     self.emit_message_refresh(&local_id);
@@ -727,40 +992,7 @@ impl GmailSyncWorker {
                 Err(e) => {
                     failure_count += 1;
                     warn!(
-                        "Failed to look up Gmail label removal message {}: {}",
-                        remote_id, e
-                    );
-                }
-            }
-        }
-
-        for (remote_id, label_ids) in labels_added {
-            match self
-                .base
-                .store
-                .find_message_id_by_remote(&self.base.account_id, &remote_id)
-            {
-                Ok(Some(local_id)) => {
-                    for label_id in visible_label_ids(&label_ids) {
-                        if let Some(folder_id) = folders_by_remote.get(&label_id) {
-                            if let Err(e) =
-                                self.base.store.add_message_to_folder(&local_id, folder_id)
-                            {
-                                failure_count += 1;
-                                warn!(
-                                    "Failed to add Gmail label {} to message {}: {}",
-                                    label_id, remote_id, e
-                                );
-                            }
-                        }
-                    }
-                    self.emit_message_refresh(&local_id);
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    failure_count += 1;
-                    warn!(
-                        "Failed to look up Gmail label addition message {}: {}",
+                        "Failed to look up Gmail label-change message {}: {}",
                         remote_id, e
                     );
                 }
@@ -783,12 +1015,32 @@ impl GmailSyncWorker {
                     HashMap::new()
                 }
             };
+            let incomplete = match self
+                .base
+                .store
+                .get_incomplete_attachment_message_map_by_remote_ids(
+                    &self.base.account_id,
+                    None,
+                    &new_ids,
+                ) {
+                Ok(incomplete) => incomplete,
+                Err(e) => {
+                    failure_count += 1;
+                    warn!("Failed to inspect incomplete Gmail history messages: {e}");
+                    HashMap::new()
+                }
+            };
 
             // Emit refresh for already-known messages; collect truly new IDs.
             let to_fetch: Vec<String> = new_ids
                 .into_iter()
                 .filter(|gid| {
-                    if let Some(local_id) = existing.get(gid) {
+                    if remote_message_requires_fetch(
+                        existing.contains_key(gid),
+                        incomplete.contains_key(gid),
+                    ) {
+                        true
+                    } else if let Some(local_id) = existing.get(gid) {
                         self.emit_message_refresh(local_id);
                         false
                     } else {
@@ -1191,5 +1443,150 @@ mod tests {
                 ("INBOX".to_string(), 2, Some("page-2".to_string())),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn collect_paginated_gmail_history_fetches_every_page() {
+        let mut pages = VecDeque::from([
+            serde_json::from_value::<GmailHistoryPage>(serde_json::json!({
+                "history": [{"messagesAdded": [{"message": {"id": "gmail-1"}}]}],
+                "historyId": "history-2",
+                "nextPageToken": "page-2"
+            }))
+            .unwrap(),
+            serde_json::from_value::<GmailHistoryPage>(serde_json::json!({
+                "history": [{"messagesAdded": [{"message": {"id": "gmail-2"}}]}],
+                "historyId": "history-2"
+            }))
+            .unwrap(),
+        ]);
+        let mut requested_tokens = Vec::new();
+
+        let batch = collect_paginated_gmail_history("history-1", |page_token| {
+            requested_tokens.push(page_token);
+            let page = pages.pop_front().expect("expected a history page request");
+            async move { Ok(GmailHistoryPageFetch::Page(page)) }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            batch
+                .entries
+                .iter()
+                .flat_map(|entry| entry.messages_added.iter().flatten())
+                .map(|message| message.message.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gmail-1", "gmail-2"]
+        );
+        assert_eq!(batch.history_id.as_deref(), Some("history-2"));
+        assert_eq!(requested_tokens, vec![None, Some("page-2".to_string())]);
+    }
+
+    #[tokio::test]
+    async fn collect_paginated_gmail_history_reports_expired_cursor() {
+        let batch = collect_paginated_gmail_history("expired-history", |_| async {
+            Ok(GmailHistoryPageFetch::CursorExpired)
+        })
+        .await
+        .unwrap();
+
+        assert!(batch.cursor_expired);
+        assert!(batch.entries.is_empty());
+        assert!(batch.history_id.is_none());
+    }
+
+    #[test]
+    fn gmail_history_404_means_cursor_expired() {
+        assert!(gmail_history_cursor_expired(reqwest::StatusCode::NOT_FOUND));
+        assert!(!gmail_history_cursor_expired(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR
+        ));
+    }
+
+    #[test]
+    fn gmail_history_labels_update_read_and_starred_flags() {
+        let page = serde_json::from_value::<GmailHistoryPage>(serde_json::json!({
+            "history": [
+                {"labelsAdded": [{
+                    "message": {"id": "gmail-1"},
+                    "labelIds": ["UNREAD", "STARRED"]
+                }]},
+                {"labelsRemoved": [{
+                    "message": {"id": "gmail-2"},
+                    "labelIds": ["UNREAD", "STARRED"]
+                }]}
+            ],
+            "historyId": "history-2"
+        }))
+        .unwrap();
+
+        let changes = gmail_history_flag_changes(&page.history.unwrap());
+
+        assert_eq!(changes.len(), 2);
+        assert_eq!(changes[0].remote_id, "gmail-1");
+        assert_eq!(changes[0].is_read, Some(false));
+        assert_eq!(changes[0].is_starred, Some(true));
+        assert_eq!(changes[1].remote_id, "gmail-2");
+        assert_eq!(changes[1].is_read, Some(true));
+        assert_eq!(changes[1].is_starred, Some(false));
+    }
+
+    #[test]
+    fn gmail_history_label_add_then_remove_finishes_without_label() {
+        let page = serde_json::from_value::<GmailHistoryPage>(serde_json::json!({
+            "history": [
+                {"labelsAdded": [{
+                    "message": {"id": "gmail-1"},
+                    "labelIds": ["Label_Projects"]
+                }]},
+                {"labelsRemoved": [{
+                    "message": {"id": "gmail-1"},
+                    "labelIds": ["Label_Projects"]
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            gmail_history_label_mutations(&page.history.unwrap()),
+            vec![GmailHistoryLabelMutation {
+                remote_id: "gmail-1".to_string(),
+                label_id: "Label_Projects".to_string(),
+                action: GmailHistoryLabelAction::Remove,
+            }]
+        );
+    }
+
+    #[test]
+    fn gmail_history_label_remove_then_add_finishes_with_label() {
+        let page = serde_json::from_value::<GmailHistoryPage>(serde_json::json!({
+            "history": [
+                {"labelsRemoved": [{
+                    "message": {"id": "gmail-1"},
+                    "labelIds": ["Label_Projects"]
+                }]},
+                {"labelsAdded": [{
+                    "message": {"id": "gmail-1"},
+                    "labelIds": ["Label_Projects"]
+                }]}
+            ]
+        }))
+        .unwrap();
+
+        assert_eq!(
+            gmail_history_label_mutations(&page.history.unwrap()),
+            vec![GmailHistoryLabelMutation {
+                remote_id: "gmail-1".to_string(),
+                label_id: "Label_Projects".to_string(),
+                action: GmailHistoryLabelAction::Add,
+            }]
+        );
+    }
+
+    #[test]
+    fn gmail_history_label_failures_keep_cursor_for_retry() {
+        assert!(!can_advance_gmail_cursor(1));
+        assert!(can_advance_gmail_cursor(0));
     }
 }

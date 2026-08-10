@@ -560,6 +560,10 @@ export async function stageComposeAttachment(filename: string, bytes: number[]):
   return invoke<string>("stage_compose_attachment", { filename, bytes });
 }
 
+export async function cleanupStagedComposeAttachment(path: string): Promise<void> {
+  return invoke<void>("cleanup_staged_compose_attachment", { path });
+}
+
 // ─── Batch Operations ───────────────────────────────────────────────────────
 
 export async function batchArchive(messageIds: string[]): Promise<number> {

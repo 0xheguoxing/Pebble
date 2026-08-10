@@ -357,7 +357,49 @@ impl Store {
 
     pub fn reset_in_progress_pending_mail_ops(&self) -> Result<()> {
         self.with_write(|conn| {
-            conn.execute(
+            let tx = conn.unchecked_transaction()?;
+            let interrupted_sends = {
+                let mut stmt = tx.prepare(
+                    "SELECT id, payload_json
+                     FROM pending_mail_ops
+                     WHERE status = ?1 AND op_type = 'send'",
+                )?;
+                let rows = stmt.query_map(
+                    params![PendingMailOpStatus::InProgress.as_str()],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )?;
+                rows.collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            let now = pebble_core::now_timestamp();
+            for (id, payload_json) in interrupted_sends {
+                let remote_succeeded = serde_json::from_str::<serde_json::Value>(&payload_json)
+                    .ok()
+                    .and_then(|payload| {
+                        payload
+                            .get("remote_succeeded")
+                            .and_then(serde_json::Value::as_bool)
+                    })
+                    .unwrap_or(false);
+                if !remote_succeeded {
+                    tx.execute(
+                        "UPDATE pending_mail_ops
+                         SET status = ?1,
+                             attempts = ?2,
+                             last_error = ?3,
+                             updated_at = ?4,
+                             next_retry_at = NULL
+                         WHERE id = ?5",
+                        params![
+                            PendingMailOpStatus::Failed.as_str(),
+                            MAX_PENDING_MAIL_OP_ATTEMPTS,
+                            "Send outcome is unknown after interruption; it was not retried automatically to avoid a duplicate. Check Sent before dismissing or sending again.",
+                            now,
+                            id,
+                        ],
+                    )?;
+                }
+            }
+            tx.execute(
                 "UPDATE pending_mail_ops
                  SET status = ?1,
                      updated_at = ?2,
@@ -365,8 +407,62 @@ impl Store {
                  WHERE status = ?3",
                 params![
                     PendingMailOpStatus::Pending.as_str(),
-                    pebble_core::now_timestamp(),
+                    now,
                     PendingMailOpStatus::InProgress.as_str(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    pub fn mark_pending_mail_op_remote_succeeded(&self, id: &str) -> Result<()> {
+        self.with_write(|conn| {
+            let payload_json = conn
+                .query_row(
+                    "SELECT payload_json FROM pending_mail_ops WHERE id = ?1",
+                    params![id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?
+                .ok_or_else(|| PebbleError::Storage(format!("Pending mail op not found: {id}")))?;
+            let mut payload: serde_json::Value =
+                serde_json::from_str(&payload_json).map_err(|error| {
+                    PebbleError::Storage(format!("Invalid pending op payload: {error}"))
+                })?;
+            let object = payload.as_object_mut().ok_or_else(|| {
+                PebbleError::Storage("Pending op payload must be a JSON object".to_string())
+            })?;
+            object.insert(
+                "remote_succeeded".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            conn.execute(
+                "UPDATE pending_mail_ops
+                 SET payload_json = ?1, updated_at = ?2
+                 WHERE id = ?3",
+                params![payload.to_string(), pebble_core::now_timestamp(), id],
+            )?;
+            Ok(())
+        })
+    }
+
+    pub fn mark_pending_mail_op_outcome_unknown(&self, id: &str, error: &str) -> Result<()> {
+        self.with_write(|conn| {
+            conn.execute(
+                "UPDATE pending_mail_ops
+                 SET status = ?1,
+                     attempts = ?2,
+                     last_error = ?3,
+                     updated_at = ?4,
+                     next_retry_at = NULL
+                 WHERE id = ?5",
+                params![
+                    PendingMailOpStatus::Failed.as_str(),
+                    MAX_PENDING_MAIL_OP_ATTEMPTS,
+                    error,
+                    pebble_core::now_timestamp(),
+                    id,
                 ],
             )?;
             Ok(())
@@ -704,5 +800,129 @@ mod tests {
         assert_eq!(retryable.len(), 1);
         assert_eq!(retryable[0].id, op_id);
         assert_eq!(retryable[0].status, PendingMailOpStatus::Pending);
+    }
+
+    #[test]
+    fn interrupted_send_without_remote_receipt_is_not_retried_automatically() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id);
+        store.insert_folder(&folder).unwrap();
+        let message = test_message(&account.id);
+        store.insert_message(&message, &[folder.id]).unwrap();
+
+        let archive_id = store
+            .insert_pending_mail_op(&account.id, &message.id, "archive", "{}")
+            .unwrap();
+        let unknown_send_id = store
+            .insert_pending_mail_op(
+                &account.id,
+                &message.id,
+                "send",
+                r#"{"op":"send","payload":{}}"#,
+            )
+            .unwrap();
+        let confirmed_send_id = store
+            .insert_pending_mail_op(
+                &account.id,
+                &message.id,
+                "send",
+                r#"{"op":"send","payload":{}}"#,
+            )
+            .unwrap();
+        store
+            .mark_pending_mail_op_remote_succeeded(&confirmed_send_id)
+            .unwrap();
+        for id in [&archive_id, &unknown_send_id, &confirmed_send_id] {
+            store.mark_pending_mail_op_in_progress(id).unwrap();
+        }
+
+        store.reset_in_progress_pending_mail_ops().unwrap();
+
+        let ops = store.list_pending_mail_ops(&account.id).unwrap();
+        let unknown_send = ops.iter().find(|op| op.id == unknown_send_id).unwrap();
+        assert_eq!(unknown_send.status, PendingMailOpStatus::Failed);
+        assert_eq!(unknown_send.attempts, MAX_PENDING_MAIL_OP_ATTEMPTS);
+        assert!(unknown_send
+            .last_error
+            .as_deref()
+            .is_some_and(|error| error.contains("outcome is unknown")));
+        assert_eq!(unknown_send.next_retry_at, None);
+
+        let retryable_ids: Vec<_> = store
+            .list_retryable_pending_mail_ops(10)
+            .unwrap()
+            .into_iter()
+            .map(|op| op.id)
+            .collect();
+        assert!(retryable_ids.contains(&archive_id));
+        assert!(retryable_ids.contains(&confirmed_send_id));
+        assert!(!retryable_ids.contains(&unknown_send_id));
+    }
+
+    #[test]
+    fn pending_send_records_remote_success_before_local_finalize() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id);
+        store.insert_folder(&folder).unwrap();
+        let message = test_message(&account.id);
+        store.insert_message(&message, &[folder.id]).unwrap();
+        let op_id = store
+            .insert_pending_mail_op(
+                &account.id,
+                &message.id,
+                "send",
+                r#"{"op":"send","payload":{}}"#,
+            )
+            .unwrap();
+
+        store.mark_pending_mail_op_remote_succeeded(&op_id).unwrap();
+
+        let op = store.list_pending_mail_ops(&account.id).unwrap().remove(0);
+        let payload: serde_json::Value = serde_json::from_str(&op.payload_json).unwrap();
+        assert_eq!(payload["remote_succeeded"], true);
+    }
+
+    #[test]
+    fn unknown_send_outcome_is_visible_but_never_retryable() {
+        let store = Store::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id);
+        store.insert_folder(&folder).unwrap();
+        let message = test_message(&account.id);
+        store.insert_message(&message, &[folder.id]).unwrap();
+        let op_id = store
+            .insert_pending_mail_op(&account.id, &message.id, "send", "{}")
+            .unwrap();
+        store.mark_pending_mail_op_in_progress(&op_id).unwrap();
+
+        store
+            .mark_pending_mail_op_outcome_unknown(
+                &op_id,
+                "Send outcome is unknown; check Sent before sending again.",
+            )
+            .unwrap();
+
+        assert!(store
+            .list_retryable_pending_mail_ops(10)
+            .unwrap()
+            .is_empty());
+        let op = store.list_pending_mail_ops(&account.id).unwrap().remove(0);
+        assert_eq!(op.status, PendingMailOpStatus::Failed);
+        assert_eq!(op.attempts, MAX_PENDING_MAIL_OP_ATTEMPTS);
+        assert!(op.last_error.unwrap().contains("check Sent"));
+        let summary = store.pending_mail_ops_summary(Some(&account.id)).unwrap();
+        assert_eq!(summary.failed_count, 1);
+
+        assert_eq!(
+            store
+                .dismiss_failed_pending_mail_ops(Some(&account.id))
+                .unwrap(),
+            1
+        );
     }
 }

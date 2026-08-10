@@ -1,4 +1,4 @@
-import { fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { MessageSummary } from "../../../src/lib/api";
 
@@ -8,6 +8,7 @@ const setSelectedMessage = vi.fn((messageId: string | null) => {
 });
 const useStarredMessagesQuery = vi.fn();
 const listStarredMessages = vi.fn();
+let latestToggleStar: ((messageId: string, newStarred: boolean) => void) | undefined;
 
 const mockMailState = {
   activeAccountId: "account-1",
@@ -55,12 +56,15 @@ vi.mock("../../../src/components/MessageItem", () => ({
     message: MessageSummary;
     onClick: () => void;
     onToggleStar?: (messageId: string, newStarred: boolean) => void;
-  }) => (
-    <div data-testid={`message-${message.id}`}>
-      <button onClick={onClick}>{message.subject}</button>
-      <button onClick={() => onToggleStar?.(message.id, false)}>unstar</button>
-    </div>
-  ),
+  }) => {
+    latestToggleStar = onToggleStar;
+    return (
+      <div data-testid={`message-${message.id}`}>
+        <button onClick={onClick}>{message.subject}</button>
+        <button onClick={() => onToggleStar?.(message.id, false)}>unstar</button>
+      </div>
+    );
+  },
 }));
 
 vi.mock("../../../src/components/MessageDetail", () => ({
@@ -101,6 +105,7 @@ describe("StarredView", () => {
     mockMailState.activeAccountId = "account-1";
     mockMailState.selectedMessageId = null;
     mockMailState.setSelectedMessage = setSelectedMessage;
+    latestToggleStar = undefined;
   });
 
   it("shows Load More for a full first page and fetches the next page when clicked", () => {
@@ -145,6 +150,25 @@ describe("StarredView", () => {
 
     expect(screen.queryByTestId("message-m-1")).toBeNull();
     expect(screen.queryByTestId("message-detail")).toBeNull();
+  });
+
+  it("restores a locally removed row when an unstar operation rolls back", () => {
+    useStarredMessagesQuery.mockReturnValue({
+      data: [makeMessage("m-1")],
+      loading: false,
+      error: null,
+      hasNextPage: false,
+      isFetchingNextPage: false,
+      fetchNextPage,
+    });
+
+    render(<StarredView />);
+    fireEvent.click(screen.getByRole("button", { name: "unstar" }));
+    expect(screen.queryByTestId("message-m-1")).toBeNull();
+
+    act(() => latestToggleStar?.("m-1", true));
+
+    expect(screen.getByTestId("message-m-1")).toBeTruthy();
   });
 
   it("does not open a stale globally selected message when entering starred view", () => {

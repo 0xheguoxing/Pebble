@@ -7,9 +7,16 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build, for example v0.1.3
+        description: Release tag to build, for example v0.1.4
         required: true
-        default: v0.1.3
+        default: v0.1.4
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -53,7 +60,7 @@ jobs:
       - name: Validate release version
         run: |
           $ErrorActionPreference = "Stop"
-          $tag = "${{ inputs.tag || github.ref_name }}"
+          $tag = $env:RELEASE_TAG
           if ($tag -notmatch '^v(?<version>\d+\.\d+\.\d+)$') {
             throw "Release tags must use vMAJOR.MINOR.PATCH, got '$tag'."
           }
@@ -147,43 +154,8 @@ jobs:
           path: release-artifacts/*
           if-no-files-found: error
 
-      - name: Create or update GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          $ErrorActionPreference = "Stop"
-          function Invoke-Gh {
-            param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-            & gh @Arguments
-            if ($LASTEXITCODE -ne 0) {
-              throw "gh $($Arguments -join ' ') failed with exit code $LASTEXITCODE."
-            }
-          }
-
-          $tag = "${{ inputs.tag || github.ref_name }}"
-          $version = $tag.Substring(1)
-          $title = "Pebble $tag"
-          $changelog = Get-Content CHANGELOG.md -Raw
-          $escapedVersion = [regex]::Escape($version)
-          $match = [regex]::Match($changelog, "(?ms)^## \[$escapedVersion\][^\r\n]*\r?\n(?<body>.*?)(?=^## \[|\z)")
-          if (-not $match.Success) {
-            throw "Could not find changelog notes for $version."
-          }
-
-          $notesFile = Join-Path $env:RUNNER_TEMP "release-notes.md"
-          $match.Groups["body"].Value.Trim() | Set-Content -Path $notesFile -Encoding utf8
-
-          gh release view $tag *> $null
-          if ($LASTEXITCODE -eq 0) {
-            Invoke-Gh release edit $tag --title $title --notes-file $notesFile
-            Invoke-Gh release upload $tag release-artifacts/* --clobber
-          } else {
-            Invoke-Gh release create $tag release-artifacts/* --title $title --notes-file $notesFile
-          }
-
   linux:
     name: Linux Package Release
-    needs: windows
     runs-on: ubuntu-latest
     environment: action
 
@@ -237,7 +209,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             echo "Release tags must use vMAJOR.MINOR.PATCH, got '$tag'." >&2
             exit 1
@@ -337,17 +309,8 @@ jobs:
           path: release-artifacts/*
           if-no-files-found: error
 
-      - name: Upload Linux assets to GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
-          gh release upload "$tag" release-artifacts/* --clobber
-
   macos:
     name: macOS Release (${{ matrix.arch }})
-    needs: windows
     runs-on: ${{ matrix.os }}
     environment: action
 
@@ -393,7 +356,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          tag="${{ inputs.tag || github.ref_name }}"
+          tag="$RELEASE_TAG"
           if [[ ! "$tag" =~ ^v([0-9]+\.[0-9]+\.[0-9]+)$ ]]; then
             echo "Release tags must use vMAJOR.MINOR.PATCH, got '$tag'." >&2
             exit 1
@@ -491,10 +454,70 @@ jobs:
           path: release-artifacts/*
           if-no-files-found: error
 
-      - name: Upload macOS assets to GitHub Release
+  publish:
+    name: Publish Complete Release
+    needs: [windows, linux, macos]
+    runs-on: ubuntu-latest
+    environment: action
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Download all platform artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: pebble-*
+          path: release-artifacts
+          merge-multiple: true
+
+      - name: Verify release artifact set
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          windows=(release-artifacts/*.exe)
+          appimages=(release-artifacts/*.AppImage)
+          debs=(release-artifacts/*.deb)
+          rpms=(release-artifacts/*.rpm)
+          macos_arm=(release-artifacts/*-arm64.dmg)
+          macos_x64=(release-artifacts/*-x64.dmg)
+          checksums=(release-artifacts/*.sha256)
+          if (( ${#windows[@]} == 0 || ${#appimages[@]} == 0 || ${#debs[@]} == 0 || ${#rpms[@]} == 0 || ${#macos_arm[@]} == 0 || ${#macos_x64[@]} == 0 )); then
+            echo "Incomplete platform artifact set." >&2
+            find release-artifacts -maxdepth 1 -type f -printf '%f\n' | sort
+            exit 1
+          fi
+          expected_checksums=$((${#windows[@]} + ${#appimages[@]} + ${#debs[@]} + ${#rpms[@]} + ${#macos_arm[@]} + ${#macos_x64[@]}))
+          if (( ${#checksums[@]} != expected_checksums )); then
+            echo "Expected $expected_checksums checksums, found ${#checksums[@]}." >&2
+            exit 1
+          fi
+          (cd release-artifacts && sha256sum --check --strict *.sha256)
+
+      - name: Create draft, upload complete asset set, and publish
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          tag="${{ inputs.tag || github.ref_name }}"
-          gh release upload "$tag" release-artifacts/* --clobber
+          tag="$RELEASE_TAG"
+          version="${tag#v}"
+          title="Pebble $tag"
+          notes_file="$RUNNER_TEMP/release-notes.md"
+          escaped_version="$(printf '%s' "$version" | sed 's/[][\\.^$*+?{}|()]/\\&/g')"
+          awk -v version="$escaped_version" '
+            $0 ~ "^## \\[" version "\\]" { found=1; next }
+            found && /^## \[/ { exit }
+            found { print }
+            END { if (!found) exit 2 }
+          ' CHANGELOG.md > "$notes_file"
+
+          if gh release view "$tag" >/dev/null 2>&1; then
+            echo "Release '$tag' already exists; refusing to replace or unpublish it." >&2
+            exit 1
+          fi
+          gh release create "$tag" --draft --verify-tag --title "$title" --notes-file "$notes_file"
+          gh release upload "$tag" release-artifacts/*
+          gh release edit "$tag" --draft=false

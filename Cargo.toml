@@ -39,6 +39,7 @@ tokio-native-tls = "0.3"
 aes-gcm = "0.10"
 rand = "0.8"
 keyring = { version = "3", features = ["apple-native", "windows-native", "linux-native-sync-persistent", "crypto-rust"] }
+hex = "0.4"
 semver = "1"
 
 [profile.release]

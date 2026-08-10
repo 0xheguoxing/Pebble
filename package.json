@@ -1,7 +1,7 @@
 {
   "name": "pebble",
   "private": true,
-  "version": "0.1.3",
+  "version": "0.1.4",
   "type": "module",
   "scripts": {
     "dev:frontend": "vite",
@@ -11,7 +11,7 @@
     "build": "node scripts/build-tauri.mjs",
     "build:windows": "tauri build --bundles nsis",
     "build:macos": "tauri build --bundles app,dmg",
-    "build:linux": "tauri build --bundles appimage,deb,rpm",
+    "build:linux": "NO_STRIP=1 tauri build --bundles appimage,deb,rpm",
     "test": "vitest run",
     "test:watch": "vitest"
   },

@@ -1,3 +1,4 @@
+use crate::commands::encrypted_store::{load_secure_user_data, store_secure_user_data};
 use crate::state::AppState;
 use pebble_core::{HttpProxyConfig, PebbleError};
 use pebble_crypto::CryptoService;
@@ -32,10 +33,9 @@ fn decrypt_json<T: DeserializeOwned>(
     store: &Store,
     key: &str,
 ) -> Result<Option<T>, PebbleError> {
-    let Some(encrypted) = store.get_secure_user_data(key)? else {
+    let Some(decrypted) = load_secure_user_data(crypto, store, key)? else {
         return Ok(None);
     };
-    let decrypted = crypto.decrypt(&encrypted)?;
     serde_json::from_slice(&decrypted)
         .map(Some)
         .map_err(|e| PebbleError::Internal(format!("Invalid secure user data for {key}: {e}")))
@@ -49,8 +49,7 @@ fn encrypt_json<T: Serialize>(
 ) -> Result<(), PebbleError> {
     let plaintext = serde_json::to_vec(value)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize secure user data: {e}")))?;
-    let encrypted = crypto.encrypt(&plaintext)?;
-    store.set_secure_user_data(key, &encrypted)
+    store_secure_user_data(crypto, store, key, &plaintext)
 }
 
 pub(crate) fn proxy_config_from_parts(

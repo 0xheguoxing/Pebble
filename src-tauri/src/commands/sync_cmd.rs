@@ -414,6 +414,7 @@ fn build_sync_task(
                 tokens.access_token,
                 Arc::clone(&state.crypto),
                 Arc::clone(&state.store),
+                Arc::clone(&state.oauth_account_locks),
                 account_id_clone.clone(),
             );
 
@@ -483,6 +484,7 @@ fn build_sync_task(
                 tokens.access_token,
                 Arc::clone(&state.crypto),
                 Arc::clone(&state.store),
+                Arc::clone(&state.oauth_account_locks),
                 account_id_clone.clone(),
             );
 

@@ -350,6 +350,50 @@ fn maybe_send_new_mail_notification(
     }
 }
 
+/// Replay crash-recovery search operations. Only operations that were applied
+/// successfully are eligible for clearing, and their markers remain durable
+/// until the Tantivy commit itself succeeds.
+pub(crate) fn recover_pending_search_operations(
+    store: &Store,
+    search: &TantivySearch,
+) -> pebble_core::Result<usize> {
+    let pending = store.list_search_pending()?;
+    let mut applied_ids = Vec::with_capacity(pending.len());
+    for (message_id, operation) in pending {
+        let result = if operation == "remove" {
+            search.remove_message(&message_id)
+        } else {
+            match store.get_message(&message_id) {
+                Ok(Some(message)) if !message.is_deleted => {
+                    match store.get_message_folder_ids(&message_id) {
+                        Ok(folder_ids) if !folder_ids.is_empty() => {
+                            search.index_message(&message, &folder_ids)
+                        }
+                        Ok(_) => search.remove_message(&message_id),
+                        Err(error) => Err(error),
+                    }
+                }
+                Ok(_) => search.remove_message(&message_id),
+                Err(error) => Err(error),
+            }
+        };
+        match result {
+            Ok(()) => applied_ids.push(message_id),
+            Err(error) => warn!(
+                "Failed to recover search operation for message {}: {}",
+                message_id, error
+            ),
+        }
+    }
+
+    if applied_ids.is_empty() {
+        return Ok(0);
+    }
+    search.commit()?;
+    store.clear_search_pending(&applied_ids)?;
+    Ok(applied_ids.len())
+}
+
 pub async fn index_new_messages(
     search: &Arc<TantivySearch>,
     store: &Arc<Store>,
@@ -378,6 +422,7 @@ pub async fn index_new_messages(
     }
 
     let mut pending = 0u32;
+    let mut reconciliation_pending_ids = Vec::new();
     loop {
         let stored = match tokio::time::timeout(
             tokio::time::Duration::from_secs(COMMIT_IDLE_SECS),
@@ -389,10 +434,15 @@ pub async fn index_new_messages(
             Ok(None) => break,
             Err(_) => {
                 if pending > 0 {
-                    if let Err(e) = search.commit() {
+                    if let Err(e) = commit_search_batch_and_clear_recovery(
+                        search,
+                        store,
+                        &mut reconciliation_pending_ids,
+                    ) {
                         error!("Failed to commit search index after idle flush: {}", e);
+                    } else {
+                        pending = 0;
                     }
-                    pending = 0;
                 }
                 // Idle — take the opportunity to refresh rules.
                 engine = load_engine(store);
@@ -400,21 +450,23 @@ pub async fn index_new_messages(
             }
         };
 
-        if let Some(ref app) = app {
-            let _ = app.emit(events::MAIL_NEW, new_mail_event_payload(&stored));
-            maybe_send_new_mail_notification(app, store, &stored);
-        }
+        if !stored.reconciliation {
+            if let Some(ref app) = app {
+                let _ = app.emit(events::MAIL_NEW, new_mail_event_payload(&stored));
+                maybe_send_new_mail_notification(app, store, &stored);
+            }
 
-        if let Some(ref engine) = engine {
-            let actions = engine.evaluate(&stored.message);
-            for action in actions {
-                if let Err(e) = apply_rule_action(
-                    store,
-                    &stored.message.account_id,
-                    &stored.message.id,
-                    &action,
-                ) {
-                    warn!("Rule action failed for message {}: {e}", stored.message.id);
+            if let Some(ref engine) = engine {
+                let actions = engine.evaluate(&stored.message);
+                for action in actions {
+                    if let Err(e) = apply_rule_action(
+                        store,
+                        &stored.message.account_id,
+                        &stored.message.id,
+                        &action,
+                    ) {
+                        warn!("Rule action failed for message {}: {e}", stored.message.id);
+                    }
                 }
             }
         }
@@ -467,22 +519,57 @@ pub async fn index_new_messages(
                 }
             }
         }
+        if stored.reconciliation
+            && !reconciliation_pending_ids
+                .iter()
+                .any(|pending_id| pending_id == &message_id)
+        {
+            reconciliation_pending_ids.push(message_id);
+        }
         pending += 1;
 
         if pending >= COMMIT_BATCH_SIZE {
-            if let Err(e) = search.commit() {
+            if let Err(e) = commit_search_batch_and_clear_recovery(
+                search,
+                store,
+                &mut reconciliation_pending_ids,
+            ) {
                 error!("Failed to commit search index: {}", e);
+            } else {
+                pending = 0;
             }
-            pending = 0;
             engine = load_engine(store);
         }
     }
 
     if pending > 0 {
-        if let Err(e) = search.commit() {
+        if let Err(e) =
+            commit_search_batch_and_clear_recovery(search, store, &mut reconciliation_pending_ids)
+        {
             error!("Failed to commit search index on close: {}", e);
         }
     }
+}
+
+fn commit_search_batch_and_clear_recovery(
+    search: &TantivySearch,
+    store: &Store,
+    reconciliation_pending_ids: &mut Vec<String>,
+) -> pebble_core::Result<()> {
+    finalize_recovery_markers_after_commit(store, reconciliation_pending_ids, || search.commit())
+}
+
+fn finalize_recovery_markers_after_commit(
+    store: &Store,
+    reconciliation_pending_ids: &mut Vec<String>,
+    commit: impl FnOnce() -> pebble_core::Result<()>,
+) -> pebble_core::Result<()> {
+    commit()?;
+    if !reconciliation_pending_ids.is_empty() {
+        store.clear_search_pending(reconciliation_pending_ids)?;
+        reconciliation_pending_ids.clear();
+    }
+    Ok(())
 }
 
 /// Apply a single rule action to a message.
@@ -682,11 +769,13 @@ mod rule_writeback_tests {
     #[cfg(any(target_os = "linux", windows))]
     use super::is_notification_open_action;
     use super::{
-        apply_rule_action, new_mail_event_payload, notification_open_payload,
+        apply_rule_action, finalize_recovery_markers_after_commit, new_mail_event_payload,
+        notification_open_payload, recover_pending_search_operations,
         should_send_new_mail_notification,
     };
     use pebble_core::*;
     use pebble_rules::types::RuleAction;
+    use pebble_search::TantivySearch;
     use pebble_store::pending_ops::PendingMailOpStatus;
     use pebble_store::Store;
     use serde_json::Value;
@@ -738,6 +827,7 @@ mod rule_writeback_tests {
             message,
             folder_ids: vec!["folder-inbox".to_string()],
             notify: true,
+            reconciliation: false,
         };
 
         let payload = new_mail_event_payload(&stored);
@@ -814,6 +904,51 @@ mod rule_writeback_tests {
     }
 
     #[test]
+    fn reconciliation_marker_survives_failed_search_commit() {
+        let store = Store::open_in_memory().unwrap();
+        let message_id = "reconcile-message".to_string();
+        store
+            .add_search_pending(std::slice::from_ref(&message_id), "remove")
+            .unwrap();
+        let mut ids = vec![message_id.clone()];
+
+        let result = finalize_recovery_markers_after_commit(&store, &mut ids, || {
+            Err(PebbleError::Internal("injected commit failure".to_string()))
+        });
+
+        assert!(result.is_err());
+        assert_eq!(ids, vec![message_id.clone()]);
+        assert_eq!(
+            store.list_search_pending().unwrap(),
+            vec![(message_id, "remove".to_string())]
+        );
+    }
+
+    #[test]
+    fn startup_search_recovery_commits_before_clearing_markers() {
+        let store = Store::open_in_memory().unwrap();
+        let search = TantivySearch::open_in_memory().unwrap();
+        let account = test_account();
+        store.insert_account(&account).unwrap();
+        let folder = test_folder(&account.id);
+        store.insert_folder(&folder).unwrap();
+        let message = test_message(&account.id);
+        store
+            .insert_message(&message, std::slice::from_ref(&folder.id))
+            .unwrap();
+        store
+            .add_search_pending(std::slice::from_ref(&message.id), "index")
+            .unwrap();
+
+        assert_eq!(
+            recover_pending_search_operations(&store, &search).unwrap(),
+            1
+        );
+        assert!(store.list_search_pending().unwrap().is_empty());
+        assert_eq!(search.search("Test", 10).unwrap().len(), 1);
+    }
+
+    #[test]
     fn initial_sync_messages_do_not_trigger_new_mail_notifications() {
         let store = Store::open_in_memory().unwrap();
         let account = test_account();
@@ -825,6 +960,7 @@ mod rule_writeback_tests {
             message,
             folder_ids: vec![folder.id],
             notify: false,
+            reconciliation: false,
         };
 
         assert!(!should_send_new_mail_notification(&store, &stored).unwrap());
@@ -842,6 +978,7 @@ mod rule_writeback_tests {
             message,
             folder_ids: vec![folder.id],
             notify: true,
+            reconciliation: false,
         };
 
         assert!(should_send_new_mail_notification(&store, &stored).unwrap());

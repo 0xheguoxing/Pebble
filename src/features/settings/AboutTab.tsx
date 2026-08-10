@@ -39,7 +39,7 @@ export default function AboutTab() {
   const diagnosticClickTimer = useRef<number | null>(null);
 
   useEffect(() => {
-    getVersion().then(setAppVersion).catch(() => setAppVersion("0.1.3"));
+    getVersion().then(setAppVersion).catch(() => setAppVersion("0.1.4"));
   }, []);
 
   useEffect(() => () => {

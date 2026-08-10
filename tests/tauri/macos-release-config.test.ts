@@ -14,7 +14,7 @@ describe("macOS release configuration", () => {
     const releaseWorkflow = readFileSync(resolve(process.cwd(), ".github", "workflows", "release.yml"), "utf8");
     const cargoVersion = cargoToml.match(/^version\s*=\s*"([^"]+)"/m)?.[1];
 
-    expect(packageJson.version).toBe("0.1.3");
+    expect(packageJson.version).toBe("0.1.4");
     expect(tauriConfig.version).toBe(packageJson.version);
     expect(cargoVersion).toBe(packageJson.version);
     expect(changelog).toContain(`## [${packageJson.version}] - `);
@@ -44,6 +44,15 @@ describe("macOS release configuration", () => {
     expect(buildScript.bundleTargetsForPlatform("win32")).toBe("nsis");
     expect(buildScript.bundleTargetsForPlatform("darwin")).toBe("app,dmg");
     expect(buildScript.bundleTargetsForPlatform("linux")).toBe("appimage,deb,rpm");
+    expect(buildScript.tauriBuildEnvironmentForPlatform("linux", {})).toEqual({
+      NO_STRIP: "1",
+    });
+    expect(
+      buildScript.tauriBuildEnvironmentForPlatform("linux", {
+        NO_STRIP: "0",
+      }),
+    ).toEqual({ NO_STRIP: "0" });
+    expect(buildScript.tauriBuildEnvironmentForPlatform("win32", {})).toEqual({});
   });
 
   it("keeps desktop notification clicks routable to the target message", () => {
@@ -142,5 +151,62 @@ describe("macOS release configuration", () => {
     expect(releaseWorkflow).toContain("*.deb");
     expect(releaseWorkflow).toContain("*.rpm");
     expect(releaseWorkflow).toContain("pebble-linux-packages-${{ env.PEBBLE_VERSION }}");
+  });
+
+  it("publishes a release only after every platform artifact is available", () => {
+    const releaseWorkflow = readFileSync(
+      resolve(process.cwd(), ".github", "workflows", "release.yml"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    const publishIndex = releaseWorkflow.indexOf("\n  publish:");
+
+    expect(publishIndex).toBeGreaterThan(0);
+    expect(releaseWorkflow).toContain("needs: [windows, linux, macos]");
+    expect(releaseWorkflow).toContain("actions/download-artifact@v4");
+    expect(releaseWorkflow).toContain("merge-multiple: true");
+    expect(releaseWorkflow).toContain("appimages=(release-artifacts/*.AppImage)");
+    expect(releaseWorkflow).toContain("debs=(release-artifacts/*.deb)");
+    expect(releaseWorkflow).toContain("rpms=(release-artifacts/*.rpm)");
+    expect(releaseWorkflow).toContain("macos_arm=(release-artifacts/*-arm64.dmg)");
+    expect(releaseWorkflow).toContain("macos_x64=(release-artifacts/*-x64.dmg)");
+    expect(releaseWorkflow).toContain("sha256sum --check --strict *.sha256");
+    expect(releaseWorkflow).toContain("group: release-${{ inputs.tag || github.ref_name }}");
+    expect(releaseWorkflow).toContain("cancel-in-progress: false");
+    expect(releaseWorkflow).toContain('if gh release view "$tag"');
+    expect(releaseWorkflow).toContain('gh release create "$tag" --draft');
+    expect(releaseWorkflow).toContain('gh release upload "$tag" release-artifacts/*');
+    expect(releaseWorkflow).toContain('gh release edit "$tag" --draft=false');
+    expect(releaseWorkflow).not.toContain("gh release edit \"$tag\" --draft --title");
+    expect(releaseWorkflow).not.toContain("--clobber");
+    expect(releaseWorkflow.slice(0, publishIndex)).not.toContain("gh release create");
+    expect(releaseWorkflow.slice(0, publishIndex)).not.toContain("gh release upload");
+  });
+
+  it("does not interpolate an untrusted release tag directly into shell scripts", () => {
+    const releaseWorkflow = readFileSync(
+      resolve(process.cwd(), ".github", "workflows", "release.yml"),
+      "utf8",
+    ).replace(/\r\n/g, "\n");
+    const lines = releaseWorkflow.split("\n");
+    const runBlocks: string[] = [];
+
+    for (let index = 0; index < lines.length; index += 1) {
+      const match = lines[index]?.match(/^(\s*)run:\s*(.*)$/);
+      if (!match) continue;
+      const indent = match[1].length;
+      const block = [match[2]];
+      while (index + 1 < lines.length) {
+        const nextLine = lines[index + 1] ?? "";
+        const nextIndent = nextLine.match(/^\s*/)?.[0].length ?? 0;
+        if (nextLine.trim() && nextIndent <= indent) break;
+        block.push(nextLine);
+        index += 1;
+      }
+      runBlocks.push(block.join("\n"));
+    }
+
+    expect(releaseWorkflow).toContain("RELEASE_TAG: ${{ inputs.tag || github.ref_name }}");
+    expect(runBlocks.join("\n")).not.toContain("${{ inputs.tag || github.ref_name }}");
+    expect(runBlocks.join("\n")).not.toContain("${{ inputs.tag || github.ref }}");
   });
 });

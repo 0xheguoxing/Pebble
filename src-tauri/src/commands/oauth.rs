@@ -4,7 +4,8 @@ use super::network::{
     AccountProxyMode, AccountProxySetting,
 };
 use crate::account_colors::default_account_color;
-use crate::state::AppState;
+use crate::commands::encrypted_store::{load_account_auth_data, store_account_auth_data};
+use crate::state::{AppState, OAuthAccountLockRegistry};
 use pebble_core::{
     new_id, now_timestamp, Account, HttpProxyConfig, OAuthTokens, PebbleError, ProviderType,
 };
@@ -15,6 +16,18 @@ use pebble_store::Store;
 use std::sync::Arc;
 use tauri::State;
 use tracing::debug;
+
+async fn oauth_account_lock(
+    registry: &OAuthAccountLockRegistry,
+    account_id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    let mut locks = registry.lock().await;
+    Arc::clone(
+        locks
+            .entry(account_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+    )
+}
 
 fn constant_time_eq(left: &str, right: &str) -> bool {
     if left.len() != right.len() {
@@ -28,17 +41,85 @@ fn constant_time_eq(left: &str, right: &str) -> bool {
     diff == 0
 }
 
+fn userinfo_url(provider: &str) -> Result<&'static str, PebbleError> {
+    let url = match provider.to_lowercase().as_str() {
+        "gmail" => "https://www.googleapis.com/oauth2/v2/userinfo",
+        "outlook" => {
+            "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName,displayName"
+        }
+        _ => return Err(PebbleError::UnsupportedProvider(provider.to_string())),
+    };
+    Ok(url)
+}
+
+fn non_empty_json_string<'a>(value: &'a serde_json::Value, field: &str) -> Option<&'a str> {
+    value[field]
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+fn parse_userinfo(
+    provider: &str,
+    response: &serde_json::Value,
+) -> Result<(String, String), PebbleError> {
+    let provider = provider.to_lowercase();
+    let email = match provider.as_str() {
+        "gmail" => non_empty_json_string(response, "email"),
+        "outlook" => non_empty_json_string(response, "mail")
+            .or_else(|| non_empty_json_string(response, "userPrincipalName")),
+        _ => return Err(PebbleError::UnsupportedProvider(provider)),
+    }
+    .ok_or_else(|| {
+        PebbleError::OAuth(format!(
+            "{provider} user profile did not include a mailbox address"
+        ))
+    })?;
+
+    let name = match provider.as_str() {
+        "outlook" => non_empty_json_string(response, "displayName")
+            .or_else(|| non_empty_json_string(response, "name")),
+        _ => non_empty_json_string(response, "name")
+            .or_else(|| non_empty_json_string(response, "displayName")),
+    }
+    .unwrap_or_default();
+
+    Ok((email.to_string(), name.to_string()))
+}
+
+fn resolve_oauth_identity(
+    provider: &str,
+    fallback_email: &str,
+    fallback_name: &str,
+    fetched: Result<(String, String), PebbleError>,
+) -> Result<(String, String), PebbleError> {
+    let (email, name) = match fetched {
+        Ok(identity) => identity,
+        Err(error) if provider.eq_ignore_ascii_case("outlook") => return Err(error),
+        Err(_) => (fallback_email.to_string(), fallback_name.to_string()),
+    };
+
+    Ok((
+        if email.is_empty() {
+            fallback_email.to_string()
+        } else {
+            email
+        },
+        if name.is_empty() {
+            fallback_name.to_string()
+        } else {
+            name
+        },
+    ))
+}
+
 /// Fetch the user's email and display name from the OAuth provider's userinfo endpoint.
 async fn fetch_userinfo(
     provider: &str,
     access_token: &str,
     network: &OAuthNetworkConfig,
 ) -> Result<(String, String), PebbleError> {
-    let url = match provider.to_lowercase().as_str() {
-        "gmail" => "https://www.googleapis.com/oauth2/v2/userinfo",
-        "outlook" => "https://graph.microsoft.com/v1.0/me",
-        _ => return Err(PebbleError::UnsupportedProvider(provider.to_string())),
-    };
+    let url = userinfo_url(provider)?;
 
     let client = build_http_client(network)
         .map_err(|e| PebbleError::Network(format!("Userinfo HTTP client failed: {e}")))?;
@@ -48,25 +129,14 @@ async fn fetch_userinfo(
         .send()
         .await
         .map_err(|e| PebbleError::Network(format!("Userinfo request failed: {e}")))?
+        .error_for_status()
+        .map_err(|e| PebbleError::Network(format!("Userinfo request failed: {e}")))?
         .json()
         .await
         .map_err(|e| PebbleError::Network(format!("Userinfo parse failed: {e}")))?;
 
-    let email = resp["email"]
-        .as_str()
-        .or_else(|| resp["mail"].as_str())
-        .or_else(|| resp["userPrincipalName"].as_str())
-        .unwrap_or("")
-        .to_string();
-
-    let name = resp["name"]
-        .as_str()
-        .or_else(|| resp["displayName"].as_str())
-        .unwrap_or("")
-        .to_string();
-
     debug!("Fetched userinfo from OAuth provider");
-    Ok((email, name))
+    parse_userinfo(provider, &resp)
 }
 
 fn oauth_proxy_from_parts(
@@ -425,9 +495,7 @@ fn persist_stored_oauth_auth_data_raw(
 ) -> Result<(), PebbleError> {
     let config_bytes = serde_json::to_vec(stored)
         .map_err(|e| PebbleError::Internal(format!("Failed to serialize OAuth auth data: {e}")))?;
-    let encrypted = crypto.encrypt(&config_bytes)?;
-    store.set_auth_data(account_id, &encrypted)?;
-    Ok(())
+    store_account_auth_data(crypto, store, account_id, &config_bytes)
 }
 
 fn read_stored_oauth_auth_data_raw(
@@ -435,10 +503,9 @@ fn read_stored_oauth_auth_data_raw(
     store: &Store,
     account_id: &str,
 ) -> Result<Option<StoredOAuthAuthData>, PebbleError> {
-    let Some(encrypted) = store.get_auth_data(account_id)? else {
+    let Some(decrypted) = load_account_auth_data(crypto, store, account_id)? else {
         return Ok(None);
     };
-    let decrypted = crypto.decrypt(&encrypted)?;
     decode_stored_oauth_auth_data(&decrypted).map(Some)
 }
 
@@ -501,6 +568,7 @@ pub(crate) fn build_oauth_token_refresher(
     fallback_access_token: String,
     crypto: Arc<CryptoService>,
     store: Arc<Store>,
+    account_locks: OAuthAccountLockRegistry,
     account_id: String,
 ) -> TokenRefresher {
     match refresh_token {
@@ -509,15 +577,18 @@ pub(crate) fn build_oauth_token_refresher(
                 let config = oauth_config.clone();
                 let crypto = Arc::clone(&crypto);
                 let store = Arc::clone(&store);
+                let account_locks = Arc::clone(&account_locks);
                 let account_id = account_id.clone();
                 let initial_rt = initial_rt.clone();
                 Box::pin(async move {
+                    let account_lock = oauth_account_lock(&account_locks, &account_id).await;
+                    let _account_guard = account_lock.lock().await;
                     // Read the latest refresh token from the encrypted store.
                     // OAuth providers (especially Microsoft) may rotate refresh tokens
                     // on each use, so the initially captured token may be stale.
-                    let (rt, network) = match store.get_auth_data(&account_id)? {
-                        Some(encrypted) => {
-                            let decrypted = crypto.decrypt(&encrypted)?;
+                    let (rt, network) = match load_account_auth_data(&crypto, &store, &account_id)?
+                    {
+                        Some(decrypted) => {
                             let stored = decode_stored_oauth_auth_data(&decrypted)?;
                             let effective_proxy = effective_oauth_proxy(&crypto, &store, &stored)?;
                             (
@@ -566,6 +637,8 @@ pub(crate) async fn ensure_account_oauth_auth(
     account_id: &str,
     provider: &str,
 ) -> Result<ResolvedOAuthAuth, PebbleError> {
+    let account_lock = oauth_account_lock(&state.oauth_account_locks, account_id).await;
+    let _account_guard = account_lock.lock().await;
     let stored = read_stored_oauth_auth_data_raw(&state.crypto, &state.store, account_id)?
         .ok_or_else(|| {
             PebbleError::Internal(format!("No auth data found for account {account_id}"))
@@ -662,20 +735,12 @@ pub async fn complete_oauth_flow(
         .map_err(|e| PebbleError::OAuth(token_exchange_error_message(&provider, &e)))?;
 
     // Fetch user info from Google/Microsoft to get actual email and display name
-    let (real_email, real_name) = fetch_userinfo(&provider, &token_pair.access_token, &network)
-        .await
-        .unwrap_or_else(|_| (email.clone(), display_name.clone()));
-
-    let final_email = if real_email.is_empty() {
-        email
-    } else {
-        real_email
-    };
-    let final_name = if real_name.is_empty() {
-        display_name
-    } else {
-        real_name
-    };
+    let (final_email, final_name) = resolve_oauth_identity(
+        &provider,
+        &email,
+        &display_name,
+        fetch_userinfo(&provider, &token_pair.access_token, &network).await,
+    )?;
 
     // Create the account
     let now = now_timestamp();
@@ -786,6 +851,8 @@ pub async fn update_oauth_account_proxy_setting(
     proxy_host: Option<String>,
     proxy_port: Option<u16>,
 ) -> std::result::Result<(), PebbleError> {
+    let account_lock = oauth_account_lock(&state.oauth_account_locks, &account_id).await;
+    let _account_guard = account_lock.lock().await;
     ensure_oauth_account_provider(&state, &account_id)?;
     let setting = account_proxy_setting_from_parts(mode, proxy_host, proxy_port, "OAuth proxy")?;
     let stored = read_stored_oauth_auth_data_raw(&state.crypto, &state.store, &account_id)?
@@ -808,6 +875,31 @@ mod tests {
         ENV_LOCK.get_or_init(|| Mutex::new(()))
     }
 
+    #[tokio::test]
+    async fn oauth_rmw_lock_is_shared_per_account_but_not_across_accounts() {
+        let registry: OAuthAccountLockRegistry =
+            Arc::new(tokio::sync::Mutex::new(Default::default()));
+        let first = oauth_account_lock(&registry, "account-a").await;
+        let same_account = oauth_account_lock(&registry, "account-a").await;
+        let other_account = oauth_account_lock(&registry, "account-b").await;
+
+        assert!(Arc::ptr_eq(&first, &same_account));
+        assert!(!Arc::ptr_eq(&first, &other_account));
+
+        let guard = first.lock().await;
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(10), same_account.lock())
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(tokio::time::Duration::from_millis(10), other_account.lock())
+                .await
+                .is_ok()
+        );
+        drop(guard);
+    }
+
     struct EnvVarGuard {
         key: &'static str,
         previous: Option<OsString>,
@@ -828,6 +920,87 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    #[test]
+    fn outlook_userinfo_prefers_documented_mailbox_address() {
+        let response = serde_json::json!({
+            "email": "external-login@qq.com",
+            "mail": " mailbox@outlook.com ",
+            "userPrincipalName": "external-login@qq.com",
+            "displayName": "Mailbox Owner"
+        });
+
+        let (email, name) = parse_userinfo("outlook", &response).unwrap();
+
+        assert_eq!(email, "mailbox@outlook.com");
+        assert_eq!(name, "Mailbox Owner");
+    }
+
+    #[test]
+    fn outlook_userinfo_falls_back_to_user_principal_name() {
+        let response = serde_json::json!({
+            "mail": null,
+            "userPrincipalName": "mailbox@outlook.com",
+            "displayName": "Mailbox Owner"
+        });
+
+        let (email, _) = parse_userinfo("outlook", &response).unwrap();
+
+        assert_eq!(email, "mailbox@outlook.com");
+    }
+
+    #[test]
+    fn outlook_userinfo_rejects_a_profile_without_mailbox_identity() {
+        let response = serde_json::json!({ "displayName": "Mailbox Owner" });
+
+        let error = parse_userinfo("outlook", &response).unwrap_err();
+
+        assert!(error.to_string().contains("mailbox address"));
+    }
+
+    #[test]
+    fn outlook_profile_lookup_errors_are_not_replaced_by_form_input() {
+        let result = resolve_oauth_identity(
+            "outlook",
+            "external-login@qq.com",
+            "Fallback Name",
+            Err(PebbleError::Network(
+                "Graph profile request failed".to_string(),
+            )),
+        );
+
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("Graph profile request failed"));
+    }
+
+    #[test]
+    fn gmail_profile_lookup_errors_keep_the_existing_form_fallback() {
+        let identity = resolve_oauth_identity(
+            "gmail",
+            "fallback@gmail.com",
+            "Fallback Name",
+            Err(PebbleError::Network(
+                "Google profile request failed".to_string(),
+            )),
+        )
+        .unwrap();
+
+        assert_eq!(
+            identity,
+            (
+                "fallback@gmail.com".to_string(),
+                "Fallback Name".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn outlook_userinfo_endpoint_requests_only_documented_identity_fields() {
+        assert_eq!(
+            userinfo_url("outlook").unwrap(),
+            "https://graph.microsoft.com/v1.0/me?$select=mail,userPrincipalName,displayName"
+        );
     }
 
     #[test]

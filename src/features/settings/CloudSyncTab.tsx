@@ -72,6 +72,7 @@ export default function CloudSyncTab() {
   const [autoEnabled, setAutoEnabled] = useState(false);
   const [autoInterval, setAutoInterval] = useState(60);
   const [autoLoaded, setAutoLoaded] = useState(false);
+  const [savingAutoConfig, setSavingAutoConfig] = useState(false);
 
   useEffect(() => {
     loadAutoBackupConfig().then((config) => {
@@ -90,34 +91,62 @@ export default function CloudSyncTab() {
     }).catch(() => setAutoLoaded(true));
   }, []);
 
-  async function handleAutoBackupToggle(enabled: boolean) {
-    setAutoEnabled(enabled);
-    if (enabled) {
-      await saveAutoBackupConfig({
-        url, username, password,
-        secret_passphrase: includeSecrets ? secretPassphrase : null,
-        interval_minutes: autoInterval,
-        enabled: true,
-      });
-    } else {
-      await saveAutoBackupConfig({
-        url, username, password,
-        secret_passphrase: includeSecrets ? secretPassphrase : null,
-        interval_minutes: autoInterval,
-        enabled: false,
-      });
-    }
-  }
+  async function handleSaveAutoBackupConfig() {
+    setStatusMsg("");
+    setStatusType("");
 
-  async function handleAutoIntervalChange(minutes: number) {
-    setAutoInterval(minutes);
-    if (autoEnabled) {
+    if (
+      autoEnabled &&
+      (!url.trim() || !username.trim() || !password)
+    ) {
+      setStatusMsg(
+        t(
+          "cloudSync.autoBackupCredentialsRequired",
+          "Enter a WebDAV URL, username, and password before enabling automatic backup.",
+        ),
+      );
+      setStatusType("error");
+      return;
+    }
+
+    if (includeSecrets && !secretPassphrase.trim()) {
+      setStatusMsg(
+        t(
+          "cloudSync.autoBackupSecretPassphraseRequired",
+          "Enter an encryption password before including secrets.",
+        ),
+      );
+      setStatusType("error");
+      return;
+    }
+
+    setSavingAutoConfig(true);
+    try {
       await saveAutoBackupConfig({
-        url, username, password,
+        url,
+        username,
+        password,
         secret_passphrase: includeSecrets ? secretPassphrase : null,
-        interval_minutes: minutes,
-        enabled: true,
+        interval_minutes: autoInterval,
+        enabled: autoEnabled,
       });
+      setStatusMsg(
+        t(
+          "cloudSync.autoBackupConfigSaved",
+          "Automatic backup configuration saved",
+        ),
+      );
+      setStatusType("success");
+    } catch (err: unknown) {
+      setStatusMsg(
+        t(
+          "cloudSync.autoBackupConfigSaveFailed",
+          `Failed to save automatic backup configuration: ${errorMessage(err)}`,
+        ),
+      );
+      setStatusType("error");
+    } finally {
+      setSavingAutoConfig(false);
     }
   }
 
@@ -319,7 +348,7 @@ export default function CloudSyncTab() {
     }
   }
 
-  const anyLoading = testing || backing || restoring;
+  const anyLoading = testing || backing || restoring || savingAutoConfig;
 
   function restorePreviewMessage(preview: BackupPreview) {
     const lines = [
@@ -428,6 +457,7 @@ export default function CloudSyncTab() {
           style={inputStyle}
           value={url}
           onChange={(e) => setUrl(e.target.value)}
+          disabled={savingAutoConfig}
           placeholder="https://dav.example.com/remote.php/dav/files/user/"
           autoComplete="url"
         />
@@ -441,6 +471,7 @@ export default function CloudSyncTab() {
           style={inputStyle}
           value={username}
           onChange={(e) => setUsername(e.target.value)}
+          disabled={savingAutoConfig}
           placeholder={t("cloudSync.username")}
           autoComplete="username"
         />
@@ -455,6 +486,7 @@ export default function CloudSyncTab() {
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
+          disabled={savingAutoConfig}
           placeholder={t("cloudSync.password")}
           autoComplete="current-password"
         />
@@ -467,6 +499,7 @@ export default function CloudSyncTab() {
           type="checkbox"
           checked={includeSecrets}
           onChange={(e) => setIncludeSecrets(e.target.checked)}
+          disabled={savingAutoConfig}
           style={{ marginTop: "3px" }}
         />
         <label
@@ -494,6 +527,7 @@ export default function CloudSyncTab() {
           type="password"
           value={secretPassphrase}
           onChange={(e) => setSecretPassphrase(e.target.value)}
+          disabled={savingAutoConfig}
           placeholder={t("cloudSync.secretPassphrasePlaceholder", "Required for backing up or restoring secrets")}
           autoComplete="new-password"
         />
@@ -630,8 +664,12 @@ export default function CloudSyncTab() {
               <input
                 type="checkbox"
                 checked={autoEnabled}
-                onChange={(e) => handleAutoBackupToggle(e.target.checked)}
-                disabled={!url || !username || !password}
+                onChange={(e) => setAutoEnabled(e.target.checked)}
+                disabled={
+                  savingAutoConfig ||
+                  (!autoEnabled &&
+                    (!url.trim() || !username.trim() || !password))
+                }
               />
               {t("cloudSync.autoBackupEnable", "Enable automatic WebDAV backup")}
             </label>
@@ -643,7 +681,8 @@ export default function CloudSyncTab() {
               </label>
               <select
                 value={autoInterval}
-                onChange={(e) => handleAutoIntervalChange(Number(e.target.value))}
+                onChange={(e) => setAutoInterval(Number(e.target.value))}
+                disabled={savingAutoConfig}
                 style={{ ...inputStyle, width: "auto", padding: "4px 8px" }}
               >
                 <option value={30}>30 min</option>
@@ -656,6 +695,25 @@ export default function CloudSyncTab() {
             </div>
           )}
           {!url && <p style={{ fontSize: "12px", color: "var(--color-text-secondary)", margin: "8px 0 0" }}>{t("cloudSync.autoBackupFillFields", "Fill in WebDAV credentials above to enable auto-backup.")}</p>}
+          <button
+            type="button"
+            style={{
+              ...buttonStyle,
+              marginTop: "12px",
+              background: "var(--color-accent)",
+              color: "#fff",
+              opacity: anyLoading ? 0.6 : 1,
+            }}
+            onClick={handleSaveAutoBackupConfig}
+            disabled={anyLoading}
+          >
+            {savingAutoConfig
+              ? t("common.saving")
+              : t(
+                  "cloudSync.saveAutoBackupConfig",
+                  "Save Auto-Backup Configuration",
+                )}
+          </button>
         </div>
       )}
 

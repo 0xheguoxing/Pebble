@@ -158,28 +158,67 @@ pub(crate) fn sanitize_filename(name: &str) -> String {
 /// moment it has been flushed — we don't keep every attachment's bytes
 /// live in memory until the whole function returns. Writes use a buffered
 /// writer with 64 KiB chunks so the working set stays bounded.
+fn write_attachment_bytes<W: std::io::Write>(
+    writer: &mut W,
+    data: &[u8],
+    file_path: &Path,
+) -> Result<()> {
+    const CHUNK_SIZE: usize = 64 * 1024;
+
+    for chunk in data.chunks(CHUNK_SIZE) {
+        writer.write_all(chunk).map_err(|e| {
+            PebbleError::Storage(format!(
+                "Failed to write attachment file {}: {e}",
+                file_path.display()
+            ))
+        })?;
+    }
+    writer.flush().map_err(|e| {
+        PebbleError::Storage(format!(
+            "Failed to flush attachment file {}: {e}",
+            file_path.display()
+        ))
+    })
+}
+
+#[cfg(test)]
 pub(crate) fn persist_message_attachments(
     store: &Store,
     attachments_root: &Path,
     message_id: &str,
     attachments: Vec<AttachmentData>,
-) {
-    use std::io::Write;
+) -> Result<()> {
+    let staged = stage_message_attachments(attachments_root, message_id, attachments)?;
+    for attachment in &staged {
+        if let Err(e) = store.insert_attachment(attachment) {
+            cleanup_staged_attachment_files(&staged);
+            return Err(e);
+        }
+    }
+
+    Ok(())
+}
+
+pub(crate) fn stage_message_attachments(
+    attachments_root: &Path,
+    message_id: &str,
+    attachments: Vec<AttachmentData>,
+) -> Result<Vec<pebble_core::Attachment>> {
     const CHUNK_SIZE: usize = 64 * 1024;
 
+    let mut written_paths = Vec::new();
+    let mut staged = Vec::new();
     for att_data in attachments.into_iter() {
         let att_dir = attachments_root.join(message_id);
-        if std::fs::create_dir_all(&att_dir).is_err() {
-            warn!("Failed to create attachment dir for message {}", message_id);
-            continue;
+        if let Err(e) = std::fs::create_dir_all(&att_dir) {
+            cleanup_attachment_files(&written_paths);
+            return Err(PebbleError::Storage(format!(
+                "Failed to create attachment directory {}: {e}",
+                att_dir.display()
+            )));
         }
 
         let safe_filename = sanitize_filename(&att_data.meta.filename);
-        if safe_filename.is_empty() {
-            warn!("Attachment has empty filename after sanitization, skipping");
-            continue;
-        }
-
         let mut file_path = att_dir.join(&safe_filename);
         let mut counter = 1u32;
         while file_path.exists() {
@@ -195,49 +234,31 @@ pub(crate) fn persist_message_attachments(
             counter += 1;
         }
         let file = match std::fs::File::create(&file_path) {
-            Ok(f) => f,
+            Ok(file) => file,
             Err(e) => {
-                warn!(
-                    "Failed to create attachment file {}: {}",
-                    file_path.display(),
-                    e
-                );
-                continue;
+                cleanup_attachment_files(&written_paths);
+                return Err(PebbleError::Storage(format!(
+                    "Failed to create attachment file {}: {e}",
+                    file_path.display()
+                )));
             }
         };
         let mut writer = std::io::BufWriter::with_capacity(CHUNK_SIZE, file);
 
         let AttachmentData { meta, data } = att_data;
-        let mut write_ok = true;
-        for chunk in data.chunks(CHUNK_SIZE) {
-            if let Err(e) = writer.write_all(chunk) {
-                warn!(
-                    "Failed to write attachment file {}: {}",
-                    file_path.display(),
-                    e
-                );
-                write_ok = false;
-                break;
-            }
-        }
+        let write_result = write_attachment_bytes(&mut writer, &data, &file_path);
         // Release the attachment buffer as soon as bytes are flushed to the
         // buffered writer, before we touch the store — callers often invoke us
         // in a tight loop where peak memory matters.
         drop(data);
 
-        if !write_ok {
+        if let Err(e) = write_result {
+            drop(writer);
             let _ = std::fs::remove_file(&file_path);
-            continue;
+            cleanup_attachment_files(&written_paths);
+            return Err(e);
         }
-        if let Err(e) = writer.flush() {
-            warn!(
-                "Failed to flush attachment file {}: {}",
-                file_path.display(),
-                e
-            );
-            let _ = std::fs::remove_file(&file_path);
-            continue;
-        }
+        drop(writer);
 
         let attachment = pebble_core::Attachment {
             id: new_id(),
@@ -249,26 +270,64 @@ pub(crate) fn persist_message_attachments(
             content_id: meta.content_id,
             is_inline: meta.is_inline,
         };
-        if let Err(e) = store.insert_attachment(&attachment) {
-            warn!("Failed to store attachment record: {}", e);
+        written_paths.push(file_path);
+        staged.push(attachment);
+    }
+
+    Ok(staged)
+}
+
+fn cleanup_attachment_files(paths: &[PathBuf]) {
+    for path in paths {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+pub(crate) fn cleanup_staged_attachment_files(attachments: &[pebble_core::Attachment]) {
+    for attachment in attachments {
+        if let Some(path) = attachment.local_path.as_deref() {
+            let _ = std::fs::remove_file(path);
         }
     }
 }
 
+#[cfg(test)]
+async fn finish_attachment_task(task: tokio::task::JoinHandle<Result<()>>) -> Result<()> {
+    task.await
+        .map_err(|e| PebbleError::Internal(format!("Attachment persistence task failed: {e}")))?
+}
+
 /// Async wrapper that offloads attachment I/O to a blocking thread.
-pub(crate) async fn persist_message_attachments_async(
-    store: Arc<Store>,
+pub(crate) async fn stage_message_attachments_async(
     attachments_root: PathBuf,
     message_id: String,
     attachments: Vec<AttachmentData>,
-) {
+) -> Result<Vec<pebble_core::Attachment>> {
     if attachments.is_empty() {
-        return;
+        return Ok(Vec::new());
     }
-    let _ = tokio::task::spawn_blocking(move || {
-        persist_message_attachments(&store, &attachments_root, &message_id, attachments);
-    })
-    .await;
+    let task = tokio::task::spawn_blocking(move || {
+        stage_message_attachments(&attachments_root, &message_id, attachments)
+    });
+    task.await
+        .map_err(|e| PebbleError::Internal(format!("Attachment staging task failed: {e}")))?
+}
+
+pub(crate) async fn store_new_message_with_attachments_atomically(
+    store: Arc<Store>,
+    attachments_root: PathBuf,
+    message: Message,
+    folder_ids: Vec<String>,
+    attachment_data: Vec<AttachmentData>,
+) -> Result<()> {
+    let staged =
+        stage_message_attachments_async(attachments_root, message.id.clone(), attachment_data)
+            .await?;
+    if let Err(error) = store.replace_message_with_attachments(&message, &folder_ids, &staged) {
+        cleanup_staged_attachment_files(&staged);
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
@@ -285,20 +344,53 @@ fn parse_imap_folder_cursor(state: Option<&str>) -> ImapFolderCursor {
     }
 }
 
+fn imap_uidvalidity_changed(stored: Option<u64>, current: Option<u64>) -> bool {
+    matches!((stored, current), (Some(stored), Some(current)) if stored != current)
+}
+
+pub(crate) fn remote_message_requires_fetch(
+    already_exists: bool,
+    has_incomplete_attachments: bool,
+) -> bool {
+    !already_exists || has_incomplete_attachments
+}
+
+pub(crate) fn preserve_local_state_for_attachment_repair(
+    store: &Store,
+    message: &mut Message,
+    folder_ids: &mut Vec<String>,
+) -> Result<()> {
+    let existing = store.get_message(&message.id)?.ok_or_else(|| {
+        PebbleError::Internal(format!(
+            "Incomplete attachment message disappeared before repair: {}",
+            message.id
+        ))
+    })?;
+    message.is_read = existing.is_read;
+    message.is_starred = existing.is_starred;
+    message.created_at = existing.created_at;
+    for folder_id in store.get_message_folder_ids(&message.id)? {
+        if !folder_ids.contains(&folder_id) {
+            folder_ids.push(folder_id);
+        }
+    }
+    Ok(())
+}
+
 fn prepare_imap_folder_cursor_for_status(
     mut cursor: ImapFolderCursor,
     uidvalidity: Option<u64>,
     highest_modseq: Option<u64>,
 ) -> ImapFolderCursor {
-    if let (Some(stored), Some(current)) = (cursor.uidvalidity, uidvalidity) {
-        if stored != current {
-            cursor.last_uid = None;
-        }
+    let uidvalidity_changed = imap_uidvalidity_changed(cursor.uidvalidity, uidvalidity);
+    if uidvalidity_changed {
+        cursor.last_uid = None;
+        cursor.highest_modseq = None;
     }
     if uidvalidity.is_some() {
         cursor.uidvalidity = uidvalidity;
     }
-    if highest_modseq.is_some() {
+    if !uidvalidity_changed && highest_modseq.is_some() {
         cursor.highest_modseq = highest_modseq;
     }
     cursor
@@ -514,6 +606,9 @@ pub struct StoredMessage {
     pub message: Message,
     pub folder_ids: Vec<String>,
     pub notify: bool,
+    /// Reconciliation updates refresh search only. They must not be surfaced
+    /// as new mail or run user rules again.
+    pub reconciliation: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -770,20 +865,25 @@ impl SyncWorker {
     async fn try_imap_folder_cursor_for_sync(
         &self,
         folder: &pebble_core::Folder,
-    ) -> Result<ImapFolderCursor> {
+    ) -> Result<(ImapFolderCursor, bool)> {
         let cursor = self.stored_imap_folder_cursor(folder);
         if !should_attempt_imap_remote_folder(folder) {
-            return Ok(cursor);
+            return Ok((cursor, false));
         }
         let status = self
             .provider
             .inner()
             .get_mailbox_status(&folder.remote_id)
             .await?;
-        Ok(prepare_imap_folder_cursor_for_status(
-            cursor,
-            status.uid_validity.map(u64::from),
-            status.highest_modseq,
+        let current_uidvalidity = status.uid_validity.map(u64::from);
+        let changed = imap_uidvalidity_changed(cursor.uidvalidity, current_uidvalidity);
+        Ok((
+            prepare_imap_folder_cursor_for_status(
+                cursor,
+                current_uidvalidity,
+                status.highest_modseq,
+            ),
+            changed,
         ))
     }
 
@@ -955,10 +1055,13 @@ impl SyncWorker {
             return Ok(());
         }
 
-        let cursor = self.try_imap_folder_cursor_for_sync(folder).await?;
+        let (cursor, uidvalidity_changed) = self.try_imap_folder_cursor_for_sync(folder).await?;
         let since_uid = cursor.last_uid;
         let notify_new = should_notify_imap_startup_fetch(since_uid);
-        let count = if let Some(uid) = since_uid {
+        let count = if uidvalidity_changed {
+            self.reconcile_folder_after_uidvalidity_change(folder)
+                .await?
+        } else if let Some(uid) = since_uid {
             self.sync_folder(folder, Some(uid), 50, notify_new).await?
         } else {
             // No cursor yet (fresh account or folder whose local data was
@@ -1054,6 +1157,179 @@ impl SyncWorker {
         Ok(total)
     }
 
+    /// UIDVALIDITY changes invalidate every numeric UID in one mailbox. Fetch
+    /// and stage the complete replacement first, then swap generations in one
+    /// SQLite transaction so a network, parse, file, or DB failure leaves the
+    /// old mailbox and its user-owned relations untouched.
+    async fn reconcile_folder_after_uidvalidity_change(
+        &self,
+        folder: &pebble_core::Folder,
+    ) -> Result<u32> {
+        let status = self
+            .provider
+            .inner()
+            .get_mailbox_status(&folder.remote_id)
+            .await?;
+        let ranges = history_page_ranges(status.exists, HISTORY_PAGE_SIZE);
+        let mut snapshot: Vec<pebble_store::messages::ImapFolderSnapshotMessage> = Vec::new();
+        let mut thread_mappings = std::collections::HashMap::new();
+        for (start_seq, end_seq) in ranges {
+            let raw_page = match self
+                .provider
+                .inner()
+                .fetch_messages_page(&folder.remote_id, start_seq, end_seq)
+                .await
+            {
+                Ok(page) => page,
+                Err(error) => {
+                    for entry in &snapshot {
+                        cleanup_staged_attachment_files(&entry.attachments);
+                    }
+                    return Err(error);
+                }
+            };
+            for (uid, raw) in raw_page {
+                let parsed = match parse_raw_email(&raw) {
+                    Ok(parsed) => parsed,
+                    Err(error) => {
+                        for entry in &snapshot {
+                            cleanup_staged_attachment_files(&entry.attachments);
+                        }
+                        return Err(PebbleError::Internal(format!(
+                            "Failed to parse replacement IMAP message UID {uid}: {error}"
+                        )));
+                    }
+                };
+                drop(raw);
+
+                let mut ref_ids = HashSet::new();
+                for header in [&parsed.in_reply_to, &parsed.references_header]
+                    .into_iter()
+                    .flatten()
+                {
+                    for id in header.split_whitespace() {
+                        ref_ids.insert(id.trim().to_string());
+                    }
+                }
+                let ref_ids: Vec<_> = ref_ids.into_iter().collect();
+                match self
+                    .base
+                    .store
+                    .get_thread_mappings_for_refs(&self.base.account_id, &ref_ids)
+                {
+                    Ok(existing) => thread_mappings.extend(existing),
+                    Err(error) => {
+                        for entry in &snapshot {
+                            cleanup_staged_attachment_files(&entry.attachments);
+                        }
+                        return Err(error);
+                    }
+                }
+
+                let now = now_timestamp();
+                let mut message = Message {
+                    id: new_id(),
+                    account_id: self.base.account_id.clone(),
+                    remote_id: uid.to_string(),
+                    message_id_header: parsed.message_id_header.clone(),
+                    in_reply_to: parsed.in_reply_to.clone(),
+                    references_header: parsed.references_header.clone(),
+                    thread_id: None,
+                    subject: parsed.subject.clone(),
+                    snippet: parsed.snippet.clone(),
+                    from_address: parsed.from_address.clone(),
+                    from_name: parsed.from_name.clone(),
+                    to_list: parsed.to_list.clone(),
+                    cc_list: parsed.cc_list.clone(),
+                    bcc_list: parsed.bcc_list.clone(),
+                    body_text: parsed.body_text.clone(),
+                    body_html_raw: parsed.body_html.clone(),
+                    has_attachments: parsed.has_attachments,
+                    is_read: false,
+                    is_starred: false,
+                    is_draft: false,
+                    date: parsed.date,
+                    remote_version: None,
+                    is_deleted: false,
+                    deleted_at: None,
+                    created_at: now,
+                    updated_at: now,
+                };
+                message.thread_id = Some(compute_thread_id(&message, &thread_mappings));
+                if let (Some(message_id), Some(thread_id)) =
+                    (&message.message_id_header, &message.thread_id)
+                {
+                    thread_mappings.insert(message_id.clone(), thread_id.clone());
+                }
+
+                let attachments = match stage_message_attachments_async(
+                    self.base.attachments_dir.clone(),
+                    message.id.clone(),
+                    parsed.attachments,
+                )
+                .await
+                {
+                    Ok(attachments) => attachments,
+                    Err(error) => {
+                        for entry in &snapshot {
+                            cleanup_staged_attachment_files(&entry.attachments);
+                        }
+                        return Err(error);
+                    }
+                };
+                snapshot.push(pebble_store::messages::ImapFolderSnapshotMessage {
+                    message,
+                    attachments,
+                });
+            }
+        }
+
+        let fresh_count = snapshot.len() as u32;
+        let staged_attachments: Vec<_> = snapshot
+            .iter()
+            .flat_map(|entry| entry.attachments.iter().cloned())
+            .collect();
+        let reconcile = match self.base.store.reconcile_imap_folder_uidvalidity(
+            &self.base.account_id,
+            &folder.id,
+            snapshot,
+        ) {
+            Ok(result) => result,
+            Err(error) => {
+                cleanup_staged_attachment_files(&staged_attachments);
+                return Err(error);
+            }
+        };
+
+        for path in &reconcile.unreferenced_attachment_paths {
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    warn!("Failed to remove superseded IMAP attachment {path}: {error}");
+                }
+            }
+        }
+        for message_id in &reconcile.indexed_message_ids {
+            if let Some(message) = self.base.store.get_message(message_id)? {
+                self.base.emit_message(StoredMessage {
+                    folder_ids: self.base.store.get_message_folder_ids(message_id)?,
+                    message,
+                    notify: false,
+                    reconciliation: true,
+                });
+            }
+        }
+        for message in reconcile.removed_messages {
+            self.base.emit_message(StoredMessage {
+                message,
+                folder_ids: Vec::new(),
+                notify: false,
+                reconciliation: true,
+            });
+        }
+
+        Ok(fresh_count)
+    }
+
     /// Store a batch of raw fetched messages, resolving threads and
     /// attachments. Returns the number of newly stored messages.
     async fn store_fetched_messages(
@@ -1076,6 +1352,15 @@ impl SyncWorker {
             .store
             .get_existing_remote_ids_in_folder(&self.base.account_id, &folder.id, &all_remote_ids)
             .unwrap_or_default();
+        let incomplete_attachments = self
+            .base
+            .store
+            .get_incomplete_attachment_message_map_by_remote_ids(
+                &self.base.account_id,
+                Some(&folder.id),
+                &all_remote_ids,
+            )
+            .unwrap_or_default();
 
         // Parse all raw messages upfront so we can collect In-Reply-To / References
         // before querying thread mappings (avoids loading the full account mapping).
@@ -1083,7 +1368,10 @@ impl SyncWorker {
             .into_iter()
             .filter(|(uid, _)| {
                 let remote_id = uid.to_string();
-                if existing_ids.contains(&remote_id) {
+                if !remote_message_requires_fetch(
+                    existing_ids.contains(&remote_id),
+                    incomplete_attachments.contains_key(&remote_id),
+                ) {
                     let _ = self.base.store.clear_sync_failure(
                         &self.base.account_id,
                         &folder.id,
@@ -1120,6 +1408,7 @@ impl SyncWorker {
 
         for (uid, parse_result) in parsed_messages {
             let remote_id = uid.to_string();
+            let repairing_incomplete = incomplete_attachments.contains_key(&remote_id);
 
             let parsed = match parse_result {
                 Ok(p) => p,
@@ -1141,7 +1430,10 @@ impl SyncWorker {
 
             // Build a temporary message to compute thread_id
             let mut msg = Message {
-                id: new_id(),
+                id: incomplete_attachments
+                    .get(&remote_id)
+                    .cloned()
+                    .unwrap_or_else(new_id),
                 account_id: self.base.account_id.clone(),
                 remote_id: remote_id.clone(),
                 message_id_header: parsed.message_id_header.clone(),
@@ -1171,11 +1463,34 @@ impl SyncWorker {
 
             let thread_id = compute_thread_id(&msg, &thread_mappings);
             msg.thread_id = Some(thread_id);
+            let mut folder_ids = vec![folder.id.clone()];
+            if repairing_incomplete {
+                if let Err(error) = preserve_local_state_for_attachment_repair(
+                    &self.base.store,
+                    &mut msg,
+                    &mut folder_ids,
+                ) {
+                    let reason = error.to_string();
+                    let _ = self.base.store.upsert_sync_failure(
+                        &self.base.account_id,
+                        &folder.id,
+                        &remote_id,
+                        "imap",
+                        &reason,
+                    );
+                    error!("Failed to prepare incomplete IMAP message repair: {error}");
+                    continue;
+                }
+            }
 
-            match self
-                .base
-                .store
-                .insert_message(&msg, std::slice::from_ref(&folder.id))
+            match store_new_message_with_attachments_atomically(
+                Arc::clone(&self.base.store),
+                self.base.attachments_dir.clone(),
+                msg.clone(),
+                folder_ids.clone(),
+                parsed.attachments,
+            )
+            .await
             {
                 Ok(()) => {
                     stored_count += 1;
@@ -1190,19 +1505,12 @@ impl SyncWorker {
                         thread_mappings.insert(mid.clone(), tid.clone());
                     }
 
-                    persist_message_attachments_async(
-                        Arc::clone(&self.base.store),
-                        self.base.attachments_dir.clone(),
-                        msg.id.clone(),
-                        parsed.attachments,
-                    )
-                    .await;
-
                     // Notify listeners (e.g. search indexer) about the new message
                     self.base.emit_message(StoredMessage {
                         message: msg.clone(),
-                        folder_ids: vec![folder.id.clone()],
-                        notify: notify_new,
+                        folder_ids,
+                        notify: notify_new && !repairing_incomplete,
+                        reconciliation: repairing_incomplete,
                     });
                 }
                 Err(e) => {
@@ -1339,10 +1647,13 @@ impl SyncWorker {
             return Ok(());
         }
 
-        let cursor = self.try_imap_folder_cursor_for_sync(folder).await?;
+        let (cursor, uidvalidity_changed) = self.try_imap_folder_cursor_for_sync(folder).await?;
         let since_uid = cursor.last_uid;
 
-        let count = if let Some(uid) = since_uid {
+        let count = if uidvalidity_changed {
+            self.reconcile_folder_after_uidvalidity_change(folder)
+                .await?
+        } else if let Some(uid) = since_uid {
             self.sync_folder(folder, Some(uid), 50, true).await?
         } else {
             // Folder was just added to the selection (or its cursor was
@@ -2013,6 +2324,199 @@ impl SyncWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pebble_core::{Folder, FolderRole};
+    use std::io::{self, Write};
+
+    struct FailingAttachmentWriter {
+        fail_write: bool,
+        fail_flush: bool,
+    }
+
+    impl Write for FailingAttachmentWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            if self.fail_write {
+                Err(io::Error::other("injected write failure"))
+            } else {
+                Ok(buf.len())
+            }
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            if self.fail_flush {
+                Err(io::Error::other("injected flush failure"))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn test_attachment(filename: &str, data: &[u8]) -> AttachmentData {
+        AttachmentData {
+            meta: crate::parser::AttachmentMeta {
+                filename: filename.to_string(),
+                mime_type: "application/octet-stream".to_string(),
+                size: data.len(),
+                content_id: None,
+                is_inline: false,
+            },
+            data: data.to_vec(),
+        }
+    }
+
+    fn test_store_with_message(message_id: &str) -> Arc<Store> {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let now = now_timestamp();
+        let account = pebble_core::Account {
+            id: "account-1".to_string(),
+            email: "user@example.com".to_string(),
+            display_name: "User".to_string(),
+            color: None,
+            provider: pebble_core::ProviderType::Imap,
+            created_at: now,
+            updated_at: now,
+        };
+        let folder = Folder {
+            id: "folder-1".to_string(),
+            account_id: account.id.clone(),
+            remote_id: "INBOX".to_string(),
+            name: "Inbox".to_string(),
+            folder_type: pebble_core::FolderType::Folder,
+            role: Some(FolderRole::Inbox),
+            parent_id: None,
+            color: None,
+            is_system: true,
+            sort_order: 0,
+        };
+        let message = Message {
+            id: message_id.to_string(),
+            account_id: account.id.clone(),
+            remote_id: "remote-1".to_string(),
+            message_id_header: None,
+            in_reply_to: None,
+            references_header: None,
+            thread_id: None,
+            subject: "Subject".to_string(),
+            snippet: String::new(),
+            from_address: String::new(),
+            from_name: String::new(),
+            to_list: Vec::new(),
+            cc_list: Vec::new(),
+            bcc_list: Vec::new(),
+            body_text: String::new(),
+            body_html_raw: String::new(),
+            has_attachments: true,
+            is_read: false,
+            is_starred: false,
+            is_draft: false,
+            date: now,
+            remote_version: None,
+            is_deleted: false,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&message, std::slice::from_ref(&folder.id))
+            .unwrap();
+        store
+    }
+
+    #[test]
+    fn attachment_db_failure_is_returned_and_removes_written_file() {
+        let store = Store::open_in_memory().unwrap();
+        let root = std::env::temp_dir().join(format!("pebble-attachment-test-{}", new_id()));
+        let message_id = "missing-message";
+
+        let result = persist_message_attachments(
+            &store,
+            &root,
+            message_id,
+            vec![test_attachment("report.bin", b"attachment")],
+        );
+
+        assert!(result.is_err());
+        assert!(!root.join(message_id).join("report.bin").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn attachment_directory_creation_failure_is_returned() {
+        let store = Store::open_in_memory().unwrap();
+        let root = std::env::temp_dir().join(format!("pebble-attachment-test-{}", new_id()));
+        std::fs::write(&root, b"not a directory").unwrap();
+
+        let result = persist_message_attachments(
+            &store,
+            &root,
+            "message-1",
+            vec![test_attachment("report.bin", b"attachment")],
+        );
+
+        assert!(result.is_err());
+        let _ = std::fs::remove_file(root);
+    }
+
+    #[test]
+    fn attachment_write_failure_is_returned() {
+        let mut writer = FailingAttachmentWriter {
+            fail_write: true,
+            fail_flush: false,
+        };
+
+        let result = write_attachment_bytes(&mut writer, b"attachment", Path::new("report.bin"));
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn attachment_flush_failure_is_returned() {
+        let mut writer = FailingAttachmentWriter {
+            fail_write: false,
+            fail_flush: true,
+        };
+
+        let result = write_attachment_bytes(&mut writer, b"attachment", Path::new("report.bin"));
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn attachment_task_join_failure_is_returned() {
+        let task = tokio::task::spawn_blocking(|| -> Result<()> {
+            panic!("injected attachment worker panic");
+        });
+
+        let result = finish_attachment_task(task).await;
+
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn atomic_new_message_db_failure_keeps_no_half_state_and_cleans_staged_files() {
+        let message_id = "message-1";
+        let store = test_store_with_message(message_id);
+        let message = store.get_message(message_id).unwrap().unwrap();
+        store
+            .hard_delete_messages(&[message_id.to_string()])
+            .unwrap();
+        let root = std::env::temp_dir().join(format!("pebble-attachment-test-{}", new_id()));
+
+        let result = store_new_message_with_attachments_atomically(
+            Arc::clone(&store),
+            root.clone(),
+            message,
+            vec!["missing-folder".to_string()],
+            vec![test_attachment("report.bin", b"attachment")],
+        )
+        .await;
+
+        assert!(result.is_err());
+        assert!(store.get_message(message_id).unwrap().is_none());
+        assert!(!root.join(message_id).join("report.bin").exists());
+        let _ = std::fs::remove_dir_all(root);
+    }
 
     #[test]
     fn test_sanitize_filename_rejects_windows_reserved_names() {
@@ -2061,6 +2565,55 @@ mod tests {
     }
 
     #[test]
+    fn legacy_half_written_attachment_rows_are_forced_to_refetch() {
+        assert!(remote_message_requires_fetch(false, false));
+        assert!(!remote_message_requires_fetch(true, false));
+        assert!(remote_message_requires_fetch(true, true));
+    }
+
+    #[test]
+    fn attachment_repair_preserves_local_flags_created_at_and_folder_relations() {
+        let store = test_store_with_message("repair-message");
+        store
+            .update_message_flags("repair-message", Some(true), Some(true))
+            .unwrap();
+        let archive = Folder {
+            id: "folder-archive".to_string(),
+            account_id: "account-1".to_string(),
+            remote_id: "Archive".to_string(),
+            name: "Archive".to_string(),
+            folder_type: pebble_core::FolderType::Folder,
+            role: Some(FolderRole::Archive),
+            parent_id: None,
+            color: None,
+            is_system: true,
+            sort_order: 1,
+        };
+        store.insert_folder(&archive).unwrap();
+        store
+            .add_message_to_folder("repair-message", &archive.id)
+            .unwrap();
+        let existing = store.get_message("repair-message").unwrap().unwrap();
+        let mut replacement = existing.clone();
+        replacement.is_read = false;
+        replacement.is_starred = false;
+        replacement.created_at += 999;
+        let mut folder_ids = vec!["folder-1".to_string()];
+
+        preserve_local_state_for_attachment_repair(&store, &mut replacement, &mut folder_ids)
+            .unwrap();
+
+        assert!(replacement.is_read);
+        assert!(replacement.is_starred);
+        assert_eq!(replacement.created_at, existing.created_at);
+        folder_ids.sort();
+        assert_eq!(
+            folder_ids,
+            vec!["folder-1".to_string(), "folder-archive".to_string()]
+        );
+    }
+
+    #[test]
     fn imap_folder_cursor_resets_last_uid_when_uidvalidity_changes() {
         let stored = ImapFolderCursor {
             uidvalidity: Some(1234),
@@ -2072,7 +2625,7 @@ mod tests {
 
         assert_eq!(prepared.uidvalidity, Some(9999));
         assert_eq!(prepared.last_uid, None);
-        assert_eq!(prepared.highest_modseq, Some(7000));
+        assert_eq!(prepared.highest_modseq, None);
     }
 
     #[test]
@@ -2088,6 +2641,157 @@ mod tests {
         assert_eq!(prepared.uidvalidity, Some(1234));
         assert_eq!(prepared.last_uid, Some(987));
         assert_eq!(prepared.highest_modseq, Some(7000));
+    }
+
+    #[test]
+    fn imap_uidvalidity_change_keeps_old_generation_until_snapshot_commits() {
+        let store = Store::open_in_memory().unwrap();
+        let now = now_timestamp();
+        let account = pebble_core::Account {
+            id: "uidvalidity-account".to_string(),
+            email: "uidvalidity@example.com".to_string(),
+            display_name: "UIDVALIDITY".to_string(),
+            color: None,
+            provider: pebble_core::ProviderType::Imap,
+            created_at: now,
+            updated_at: now,
+        };
+        let folder = Folder {
+            id: "uidvalidity-folder".to_string(),
+            account_id: account.id.clone(),
+            remote_id: "INBOX".to_string(),
+            name: "Inbox".to_string(),
+            folder_type: pebble_core::FolderType::Folder,
+            role: Some(FolderRole::Inbox),
+            parent_id: None,
+            color: None,
+            is_system: true,
+            sort_order: 0,
+        };
+        let message = Message {
+            id: "old-generation-message".to_string(),
+            account_id: account.id.clone(),
+            remote_id: "42".to_string(),
+            message_id_header: None,
+            in_reply_to: None,
+            references_header: None,
+            thread_id: None,
+            subject: "old generation".to_string(),
+            snippet: String::new(),
+            from_address: String::new(),
+            from_name: String::new(),
+            to_list: Vec::new(),
+            cc_list: Vec::new(),
+            bcc_list: Vec::new(),
+            body_text: String::new(),
+            body_html_raw: String::new(),
+            has_attachments: false,
+            is_read: false,
+            is_starred: false,
+            is_draft: false,
+            date: now,
+            remote_version: None,
+            is_deleted: false,
+            deleted_at: None,
+            created_at: now,
+            updated_at: now,
+        };
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&message, std::slice::from_ref(&folder.id))
+            .unwrap();
+        store
+            .upsert_sync_failure(
+                &account.id,
+                &folder.id,
+                &message.remote_id,
+                "imap",
+                "old generation failure",
+            )
+            .unwrap();
+
+        let prepared = prepare_imap_folder_cursor_for_status(
+            ImapFolderCursor {
+                uidvalidity: Some(100),
+                last_uid: Some(42),
+                highest_modseq: Some(900),
+            },
+            Some(200),
+            Some(1000),
+        );
+
+        assert_eq!(prepared.last_uid, None);
+        assert_eq!(prepared.highest_modseq, None);
+        assert!(store.get_message(&message.id).unwrap().is_some());
+        assert!(store
+            .has_sync_failures_for_folder(&account.id, &folder.id)
+            .unwrap());
+    }
+
+    #[test]
+    fn imap_uidvalidity_backfill_failure_keeps_the_previous_cursor() {
+        let store = test_store_with_message("cursor-message");
+        let folder = store
+            .list_folders("account-1")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let previous = ImapFolderCursor {
+            uidvalidity: Some(100),
+            last_uid: Some(42),
+            highest_modseq: Some(900),
+        };
+        let previous_state = serialize_imap_folder_cursor(&previous).unwrap();
+        store
+            .set_folder_sync_state("account-1", &folder.id, &previous_state)
+            .unwrap();
+        store
+            .upsert_sync_failure(
+                "account-1",
+                &folder.id,
+                "42",
+                "imap",
+                "new generation parse failure",
+            )
+            .unwrap();
+        let provider = Arc::new(crate::provider::imap_provider::ImapMailProvider::new(
+            crate::imap::ImapConfig {
+                host: "localhost".to_string(),
+                port: 993,
+                username: "user".to_string(),
+                password: "password".to_string(),
+                security: crate::imap::ConnectionSecurity::Tls,
+                accept_invalid_certs: false,
+                proxy: None,
+            },
+        ));
+        let (_stop_tx, stop_rx) = watch::channel(false);
+        let worker = SyncWorker::new(
+            "account-1",
+            provider,
+            Arc::clone(&store),
+            stop_rx,
+            std::env::temp_dir(),
+        );
+        let current_generation = ImapFolderCursor {
+            uidvalidity: Some(200),
+            last_uid: None,
+            highest_modseq: None,
+        };
+
+        worker
+            .persist_imap_folder_cursor_after_sync(&folder, current_generation)
+            .unwrap();
+
+        assert_eq!(
+            store
+                .get_folder_sync_state("account-1", &folder.id)
+                .unwrap()
+                .as_deref(),
+            Some(previous_state.as_str())
+        );
     }
 
     #[test]

@@ -90,6 +90,26 @@ describe("buildComposeEditorContent", () => {
     expect(quote).not.toContain("&lt;strong&gt;");
   });
 
+  it("removes document CSS and remote-loading resources from quoted messages", () => {
+    const quote = buildReplyQuoteHtml({
+      composeReplyTo: makeMessage({
+        body_html_raw:
+          '<style>#root { display: none }</style>' +
+          '<link rel="stylesheet" href="https://tracker.example/mail.css">' +
+          '<p style="color: red">Hello</p>' +
+          '<img src="https://tracker.example/pixel" srcset="https://tracker.example/2x 2x">',
+      }),
+      t,
+    });
+
+    expect(quote).toContain("Hello");
+    expect(quote).toContain("color: red");
+    expect(quote).not.toContain("<style");
+    expect(quote).not.toContain("<link");
+    expect(quote).not.toContain("tracker.example");
+    expect(quote).not.toContain("srcset");
+  });
+
   it("appends the quoted reply only when sending", () => {
     expect(appendReplyQuoteHtml("<p>Reply</p>", "<blockquote><p>Original</p></blockquote>"))
       .toBe("<p>Reply</p><br/><br/><blockquote><p>Original</p></blockquote>");

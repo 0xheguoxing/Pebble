@@ -12,18 +12,29 @@ use tracing::{info, warn};
 
 use crate::backoff::SyncBackoff;
 use crate::gmail_sync::TokenRefresher;
-use crate::provider::outlook::{should_hide_outlook_folder, OutlookDeltaPage, OutlookProvider};
+use crate::provider::outlook::{
+    should_hide_outlook_folder, validate_graph_continuation_url, OutlookDeltaPage, OutlookProvider,
+    MAX_GRAPH_CONTINUATION_PAGES,
+};
 use crate::realtime_policy::{RealtimePollPolicy, RealtimeRuntimeState, SyncTrigger};
 use crate::sync::{
-    persist_message_attachments_async, recv_sync_trigger, StoredMessage, SyncConfig, SyncError,
+    cleanup_staged_attachment_files, recv_sync_trigger, stage_message_attachments_async,
+    store_new_message_with_attachments_atomically, StoredMessage, SyncConfig, SyncError,
     SyncWorkerBase,
 };
 use crate::thread::compute_thread_id;
 
+#[derive(Debug)]
 struct OutlookDeltaBatch {
     messages: Vec<Message>,
     deleted_remote_ids: Vec<String>,
     delta_link: Option<String>,
+}
+
+#[derive(Debug)]
+struct OutlookDeltaRecoveryBatch {
+    batch: OutlookDeltaBatch,
+    recovered_from_expired_cursor: bool,
 }
 
 enum SyncWaitOutcome {
@@ -100,13 +111,30 @@ where
     let mut messages = Vec::new();
     let mut deleted_remote_ids = Vec::new();
     let mut cursor = stored_cursor.map(ToOwned::to_owned);
+    let mut visited = std::collections::HashSet::new();
+    let mut page_count = 0usize;
 
     loop {
+        if page_count == MAX_GRAPH_CONTINUATION_PAGES {
+            return Err(PebbleError::Network(
+                "Outlook delta pagination exceeded page limit".to_string(),
+            ));
+        }
+        if let Some(continuation) = cursor.as_deref() {
+            validate_graph_continuation_url(continuation)?;
+            if !visited.insert(continuation.to_string()) {
+                return Err(PebbleError::Network(
+                    "Outlook delta pagination returned a repeated continuation URL".to_string(),
+                ));
+            }
+        }
+        page_count += 1;
         let page = fetch_page(folder_id.to_string(), cursor.take()).await?;
         messages.extend(page.messages);
         deleted_remote_ids.extend(page.deleted_remote_ids);
 
         if let Some(delta_link) = page.delta_link {
+            validate_graph_continuation_url(&delta_link)?;
             return Ok(OutlookDeltaBatch {
                 messages,
                 deleted_remote_ids,
@@ -124,6 +152,31 @@ where
                 });
             }
         }
+    }
+}
+
+async fn collect_outlook_delta_pages_with_expiry_recovery<F, Fut>(
+    folder_id: &str,
+    stored_cursor: Option<&str>,
+    mut fetch_page: F,
+) -> Result<OutlookDeltaRecoveryBatch>
+where
+    F: FnMut(String, Option<String>) -> Fut,
+    Fut: Future<Output = Result<OutlookDeltaPage>>,
+{
+    match collect_outlook_delta_pages(folder_id, stored_cursor, &mut fetch_page).await {
+        Ok(batch) => Ok(OutlookDeltaRecoveryBatch {
+            batch,
+            recovered_from_expired_cursor: false,
+        }),
+        Err(PebbleError::SyncCursorExpired(_)) if stored_cursor.is_some() => {
+            let batch = collect_outlook_delta_pages(folder_id, None, &mut fetch_page).await?;
+            Ok(OutlookDeltaRecoveryBatch {
+                batch,
+                recovered_from_expired_cursor: true,
+            })
+        }
+        Err(error) => Err(error),
     }
 }
 
@@ -205,6 +258,46 @@ fn apply_outlook_deleted_remote_ids(
         deleted_remote_ids,
         |message_id| store.soft_delete_message(message_id),
     ))
+}
+
+fn load_outlook_folder_snapshot(store: &Store, folder_id: &str) -> Result<Vec<Message>> {
+    const PAGE_SIZE: u32 = 500;
+    let mut snapshot = Vec::new();
+    let mut offset = 0u32;
+    loop {
+        let mut page = store.list_full_messages_by_folder(folder_id, PAGE_SIZE, offset)?;
+        let page_len = u32::try_from(page.len()).unwrap_or(PAGE_SIZE);
+        snapshot.append(&mut page);
+        if page_len < PAGE_SIZE {
+            return Ok(snapshot);
+        }
+        offset = offset.saturating_add(page_len);
+    }
+}
+
+fn reconcile_outlook_fresh_snapshot(
+    store: &Store,
+    folder_id: &str,
+    previous_snapshot: &[Message],
+    fresh_remote_ids: &std::collections::HashSet<String>,
+) -> OutlookDeletionOutcome {
+    let mut outcome = OutlookDeletionOutcome::default();
+    for message in previous_snapshot {
+        if fresh_remote_ids.contains(&message.remote_id) {
+            continue;
+        }
+        match store.remove_message_from_folder(&message.id, folder_id) {
+            Ok(()) => outcome.deleted_count += 1,
+            Err(error) => {
+                warn!(
+                    "Failed to reconcile stale Outlook folder message {}: {error}",
+                    message.remote_id
+                );
+                outcome.failure_count += 1;
+            }
+        }
+    }
+    outcome
 }
 
 fn update_outlook_backoff_after_sync(backoff: &mut SyncBackoff, failure_count: u32) {
@@ -337,12 +430,42 @@ impl OutlookSyncWorker {
         messages: Vec<Message>,
         notify_new: bool,
     ) -> u32 {
+        let provider = Arc::clone(&self.provider);
+        self.persist_folder_messages_with_attachment_fetch(
+            folder,
+            messages,
+            notify_new,
+            move |remote_id| {
+                let provider = Arc::clone(&provider);
+                async move { provider.list_message_attachments(&remote_id).await }
+            },
+        )
+        .await
+    }
+
+    async fn persist_folder_messages_with_attachment_fetch<F, Fut>(
+        &self,
+        folder: &Folder,
+        messages: Vec<Message>,
+        notify_new: bool,
+        mut fetch_attachments: F,
+    ) -> u32
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Result<Vec<crate::parser::AttachmentData>>>,
+    {
         let remote_ids: Vec<String> = messages.iter().map(|m| m.remote_id.clone()).collect();
-        let existing = self
+        let existing = match self
             .base
             .store
-            .get_existing_remote_ids(&self.base.account_id, &remote_ids)
-            .unwrap_or_default();
+            .get_existing_message_map_by_remote_ids(&self.base.account_id, &remote_ids)
+        {
+            Ok(existing) => existing,
+            Err(e) => {
+                warn!("Failed to look up existing Outlook messages: {e}");
+                return u32::try_from(messages.len()).unwrap_or(u32::MAX);
+            }
+        };
 
         let ref_ids: Vec<String> = {
             let mut refs = std::collections::HashSet::new();
@@ -369,7 +492,115 @@ impl OutlookSyncWorker {
         let mut failure_count = 0;
 
         for msg in &messages {
-            if existing.contains(&msg.remote_id) {
+            if let Some(local_id) = existing.get(&msg.remote_id) {
+                let current = match self.base.store.get_message(local_id) {
+                    Ok(Some(current)) => current,
+                    Ok(None) => {
+                        failure_count += 1;
+                        warn!(
+                            "Existing Outlook message {} disappeared before update",
+                            msg.remote_id
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        failure_count += 1;
+                        warn!("Failed to load Outlook message {}: {e}", msg.remote_id);
+                        continue;
+                    }
+                };
+                let attachments = match self.base.store.list_attachments_by_message(local_id) {
+                    Ok(attachments) => attachments,
+                    Err(e) => {
+                        failure_count += 1;
+                        warn!(
+                            "Failed to load attachments before updating Outlook message {}: {e}",
+                            msg.remote_id
+                        );
+                        continue;
+                    }
+                };
+
+                let mut updated = msg.clone();
+                updated.id = local_id.clone();
+                updated.created_at = current.created_at;
+                if updated.thread_id.is_none() {
+                    updated.thread_id = current.thread_id;
+                }
+                let folder_ids = vec![folder.id.clone()];
+                let remote_attachments = if updated.has_attachments {
+                    match fetch_attachments(msg.remote_id.clone()).await {
+                        Ok(attachments) => attachments,
+                        Err(e) => {
+                            failure_count += 1;
+                            warn!(
+                                "Failed to fetch Outlook attachments for existing message {}: {e}",
+                                msg.remote_id
+                            );
+                            continue;
+                        }
+                    }
+                } else {
+                    Vec::new()
+                };
+                let replacement_attachments = match stage_message_attachments_async(
+                    self.base.attachments_dir.clone(),
+                    local_id.clone(),
+                    remote_attachments,
+                )
+                .await
+                {
+                    Ok(attachments) => attachments,
+                    Err(e) => {
+                        failure_count += 1;
+                        warn!(
+                            "Failed to stage Outlook attachments for existing message {}: {e}",
+                            msg.remote_id
+                        );
+                        continue;
+                    }
+                };
+                if let Err(e) = self.base.store.replace_message_with_attachments(
+                    &updated,
+                    &folder_ids,
+                    &replacement_attachments,
+                ) {
+                    cleanup_staged_attachment_files(&replacement_attachments);
+                    failure_count += 1;
+                    warn!("Failed to update Outlook message {}: {e}", msg.remote_id);
+                    continue;
+                }
+
+                for attachment in &attachments {
+                    let Some(path) = attachment.local_path.as_deref() else {
+                        continue;
+                    };
+                    match self.base.store.is_attachment_local_path_referenced(path) {
+                        Ok(false) => {
+                            if let Err(e) = std::fs::remove_file(path) {
+                                if e.kind() != std::io::ErrorKind::NotFound {
+                                    warn!(
+                                        "Failed to remove obsolete Outlook attachment {path}: {e}"
+                                    );
+                                }
+                            }
+                        }
+                        Ok(true) => {}
+                        Err(e) => {
+                            warn!("Failed to check Outlook attachment path reference {path}: {e}")
+                        }
+                    }
+                }
+
+                if let (Some(mid), Some(tid)) = (&updated.message_id_header, &updated.thread_id) {
+                    thread_mappings.insert(mid.clone(), tid.clone());
+                }
+                self.base.emit_message(StoredMessage {
+                    message: updated,
+                    folder_ids,
+                    notify: false,
+                    reconciliation: false,
+                });
                 continue;
             }
 
@@ -378,8 +609,31 @@ impl OutlookSyncWorker {
             msg.thread_id = Some(thread_id);
 
             let folder_ids = vec![folder.id.clone()];
-            if let Err(e) = self.base.store.insert_message(&msg, &folder_ids) {
-                warn!("Failed to store Outlook message: {e}");
+            let attachments = if msg.has_attachments {
+                match fetch_attachments(msg.remote_id.clone()).await {
+                    Ok(attachments) => attachments,
+                    Err(e) => {
+                        failure_count += 1;
+                        warn!(
+                            "Failed to fetch Outlook attachments for {}: {e}",
+                            msg.remote_id
+                        );
+                        continue;
+                    }
+                }
+            } else {
+                Vec::new()
+            };
+            if let Err(e) = store_new_message_with_attachments_atomically(
+                Arc::clone(&self.base.store),
+                self.base.attachments_dir.clone(),
+                msg.clone(),
+                folder_ids.clone(),
+                attachments,
+            )
+            .await
+            {
+                warn!("Failed to store Outlook message atomically: {e}");
                 failure_count += 1;
                 continue;
             }
@@ -388,31 +642,11 @@ impl OutlookSyncWorker {
                 thread_mappings.insert(mid.clone(), tid.clone());
             }
 
-            if msg.has_attachments {
-                match self.provider.list_message_attachments(&msg.remote_id).await {
-                    Ok(attachments) if !attachments.is_empty() => {
-                        persist_message_attachments_async(
-                            Arc::clone(&self.base.store),
-                            self.base.attachments_dir.clone(),
-                            msg.id.clone(),
-                            attachments,
-                        )
-                        .await;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        warn!(
-                            "Failed to fetch Outlook attachments for {}: {e}",
-                            msg.remote_id
-                        );
-                    }
-                }
-            }
-
             self.base.emit_message(StoredMessage {
                 message: msg.clone(),
                 folder_ids,
                 notify: notify_new,
+                reconciliation: false,
             });
         }
 
@@ -556,9 +790,8 @@ impl OutlookSyncWorker {
                     .ok()
                     .flatten();
                 let cursor = parse_outlook_delta_cursor(&folder.remote_id, state.as_deref());
-                let notify_new = cursor.is_some();
 
-                match collect_outlook_delta_pages(
+                match collect_outlook_delta_pages_with_expiry_recovery(
                     &folder.remote_id,
                     cursor.as_deref(),
                     |folder_id, cursor| {
@@ -572,15 +805,43 @@ impl OutlookSyncWorker {
                 )
                 .await
                 {
-                    Ok(batch) => {
+                    Ok(recovered) => {
+                        let previous_snapshot = if recovered.recovered_from_expired_cursor {
+                            match load_outlook_folder_snapshot(&self.base.store, &folder.id) {
+                                Ok(snapshot) => Some(snapshot),
+                                Err(error) => {
+                                    warn!(
+                                        "Failed to snapshot Outlook folder {} before expired-cursor recovery: {error}",
+                                        folder.name
+                                    );
+                                    sync_failure_count += 1;
+                                    continue;
+                                }
+                            }
+                        } else {
+                            None
+                        };
+                        let OutlookDeltaBatch {
+                            messages,
+                            deleted_remote_ids,
+                            delta_link,
+                        } = recovered.batch;
+                        let fresh_remote_ids = recovered.recovered_from_expired_cursor.then(|| {
+                            messages
+                                .iter()
+                                .map(|message| message.remote_id.clone())
+                                .collect::<std::collections::HashSet<_>>()
+                        });
+                        let notify_new =
+                            cursor.is_some() && !recovered.recovered_from_expired_cursor;
                         let mut failure_count = self
-                            .persist_folder_messages(folder, batch.messages, notify_new)
+                            .persist_folder_messages(folder, messages, notify_new)
                             .await;
 
                         match apply_outlook_deleted_remote_ids(
                             &self.base.store,
                             &self.base.account_id,
-                            &batch.deleted_remote_ids,
+                            &deleted_remote_ids,
                         ) {
                             Ok(outcome) => {
                                 failure_count += outcome.failure_count;
@@ -593,9 +854,22 @@ impl OutlookSyncWorker {
                                 failure_count += 1;
                             }
                         }
+                        if failure_count == 0 {
+                            if let (Some(previous_snapshot), Some(fresh_remote_ids)) =
+                                (previous_snapshot.as_deref(), fresh_remote_ids.as_ref())
+                            {
+                                failure_count += reconcile_outlook_fresh_snapshot(
+                                    &self.base.store,
+                                    &folder.id,
+                                    previous_snapshot,
+                                    fresh_remote_ids,
+                                )
+                                .failure_count;
+                            }
+                        }
                         sync_failure_count += failure_count;
 
-                        if let Some(delta_link) = batch.delta_link {
+                        if let Some(delta_link) = delta_link {
                             if can_advance_outlook_delta_cursor(failure_count) {
                                 let state =
                                     serialize_outlook_delta_cursor(&folder.remote_id, &delta_link);
@@ -673,7 +947,8 @@ impl OutlookSyncWorker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pebble_core::{Account, Folder, FolderRole, FolderType, ProviderType};
+    use crate::parser::{AttachmentData, AttachmentMeta};
+    use pebble_core::{new_id, Account, Attachment, Folder, FolderRole, FolderType, ProviderType};
     use std::collections::VecDeque;
 
     #[test]
@@ -749,6 +1024,19 @@ mod tests {
         }
     }
 
+    fn make_attachment_data(filename: &str, data: &[u8]) -> AttachmentData {
+        AttachmentData {
+            meta: AttachmentMeta {
+                filename: filename.to_string(),
+                mime_type: "text/plain".to_string(),
+                size: data.len(),
+                content_id: None,
+                is_inline: false,
+            },
+            data: data.to_vec(),
+        }
+    }
+
     #[test]
     fn outlook_sync_skips_hidden_service_folders_from_existing_store_rows() {
         let mut conversation_history = make_folder("conversation-history-id");
@@ -775,24 +1063,34 @@ mod tests {
             OutlookDeltaPage {
                 messages: vec![make_message("outlook-1")],
                 deleted_remote_ids: vec!["deleted-1".to_string()],
-                next_link: Some("https://graph.example/next".to_string()),
+                next_link: Some(
+                    "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$skiptoken=next"
+                        .to_string(),
+                ),
                 delta_link: None,
             },
             OutlookDeltaPage {
                 messages: vec![make_message("outlook-2")],
                 deleted_remote_ids: vec!["deleted-2".to_string()],
                 next_link: None,
-                delta_link: Some("https://graph.example/delta".to_string()),
+                delta_link: Some(
+                    "https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=done"
+                        .to_string(),
+                ),
             },
         ]);
         let mut requested = Vec::new();
 
         let batch =
-            collect_outlook_delta_pages("folder-1", Some("cursor-0"), |folder_id, cursor| {
+            collect_outlook_delta_pages(
+                "folder-1",
+                Some("https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=cursor-0"),
+                |folder_id, cursor| {
                 requested.push((folder_id, cursor));
                 let page = pages.pop_front().expect("expected a delta page request");
                 async move { Ok(page) }
-            })
+            },
+            )
             .await
             .unwrap();
 
@@ -807,18 +1105,221 @@ mod tests {
         );
         assert_eq!(
             batch.delta_link.as_deref(),
-            Some("https://graph.example/delta")
+            Some("https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=done")
         );
         assert_eq!(
             requested,
             vec![
-                ("folder-1".to_string(), Some("cursor-0".to_string())),
                 (
                     "folder-1".to_string(),
-                    Some("https://graph.example/next".to_string())
+                    Some("https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$deltatoken=cursor-0".to_string())
+                ),
+                (
+                    "folder-1".to_string(),
+                    Some("https://graph.microsoft.com/v1.0/me/mailFolders/folder-1/messages/delta?$skiptoken=next".to_string())
                 ),
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn collect_outlook_delta_pages_rejects_untrusted_stored_cursor_before_fetch() {
+        let mut fetch_count = 0;
+
+        let error = collect_outlook_delta_pages(
+            "folder-1",
+            Some("https://evil.example/v1.0/me/messages/delta?$deltatoken=secret"),
+            |_, _| {
+                fetch_count += 1;
+                async {
+                    unreachable!("untrusted cursor must be rejected before a credentialed GET")
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("untrusted Graph continuation"));
+        assert_eq!(fetch_count, 0);
+    }
+
+    #[tokio::test]
+    async fn collect_outlook_delta_pages_rejects_malicious_second_page_before_fetch() {
+        let mut fetch_count = 0;
+
+        let error = collect_outlook_delta_pages("folder-1", None, |_, _| {
+            fetch_count += 1;
+            async {
+                Ok(OutlookDeltaPage {
+                    messages: Vec::new(),
+                    deleted_remote_ids: Vec::new(),
+                    next_link: Some(
+                        "https://graph.microsoft.com.evil.example/v1.0/me/messages/delta"
+                            .to_string(),
+                    ),
+                    delta_link: None,
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("untrusted Graph continuation"));
+        assert_eq!(fetch_count, 1);
+    }
+
+    #[tokio::test]
+    async fn collect_outlook_delta_pages_rejects_repeated_next_link() {
+        let repeated =
+            "https://graph.microsoft.com/v1.0/me/messages/delta?$skiptoken=repeated".to_string();
+        let mut fetch_count = 0;
+
+        let error = collect_outlook_delta_pages("folder-1", None, |_, _| {
+            fetch_count += 1;
+            let repeated = repeated.clone();
+            async move {
+                Ok(OutlookDeltaPage {
+                    messages: Vec::new(),
+                    deleted_remote_ids: Vec::new(),
+                    next_link: Some(repeated),
+                    delta_link: None,
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("repeated"));
+        assert_eq!(fetch_count, 2);
+    }
+
+    #[tokio::test]
+    async fn collect_outlook_delta_pages_caps_infinite_unique_continuations() {
+        let mut fetch_count = 0usize;
+
+        let error = collect_outlook_delta_pages("folder-1", None, |_, _| {
+            fetch_count += 1;
+            let next = format!(
+                "https://graph.microsoft.com/v1.0/me/messages/delta?$skiptoken={fetch_count}"
+            );
+            async move {
+                Ok(OutlookDeltaPage {
+                    messages: Vec::new(),
+                    deleted_remote_ids: Vec::new(),
+                    next_link: Some(next),
+                    delta_link: None,
+                })
+            }
+        })
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("page limit"));
+        assert_eq!(fetch_count, MAX_GRAPH_CONTINUATION_PAGES);
+    }
+
+    #[tokio::test]
+    async fn expired_outlook_cursor_restarts_fresh_pagination_and_reconciles_ghosts() {
+        let stored_cursor =
+            "https://graph.microsoft.com/v1.0/me/messages/delta?$deltatoken=expired";
+        let next_link = "https://graph.microsoft.com/v1.0/me/messages/delta?$skiptoken=fresh-2";
+        let delta_link =
+            "https://graph.microsoft.com/v1.0/me/messages/delta?$deltatoken=fresh-done";
+        let mut calls = 0;
+        let recovered = collect_outlook_delta_pages_with_expiry_recovery(
+            "inbox",
+            Some(stored_cursor),
+            |_, cursor| {
+                calls += 1;
+                async move {
+                    match calls {
+                        1 => Err(PebbleError::SyncCursorExpired("expired".to_string())),
+                        2 => {
+                            assert!(cursor.is_none());
+                            Ok(OutlookDeltaPage {
+                                messages: vec![make_message("current-1")],
+                                deleted_remote_ids: Vec::new(),
+                                next_link: Some(next_link.to_string()),
+                                delta_link: None,
+                            })
+                        }
+                        3 => Ok(OutlookDeltaPage {
+                            messages: vec![make_message("current-2")],
+                            deleted_remote_ids: Vec::new(),
+                            next_link: None,
+                            delta_link: Some(delta_link.to_string()),
+                        }),
+                        _ => unreachable!(),
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap();
+        assert!(recovered.recovered_from_expired_cursor);
+        assert_eq!(recovered.batch.messages.len(), 2);
+
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let current = make_message("current-1");
+        let ghost = make_message("ghost");
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&current, std::slice::from_ref(&folder.id))
+            .unwrap();
+        store
+            .insert_message(&ghost, std::slice::from_ref(&folder.id))
+            .unwrap();
+        let snapshot = load_outlook_folder_snapshot(&store, &folder.id).unwrap();
+        let fresh_remote_ids = recovered
+            .batch
+            .messages
+            .iter()
+            .map(|message| message.remote_id.clone())
+            .collect::<std::collections::HashSet<_>>();
+
+        let outcome =
+            reconcile_outlook_fresh_snapshot(&store, &folder.id, &snapshot, &fresh_remote_ids);
+        assert_eq!(outcome.failure_count, 0);
+        assert!(store.get_message(&ghost.id).unwrap().unwrap().is_deleted);
+        assert!(!store.get_message(&current.id).unwrap().unwrap().is_deleted);
+        assert_eq!(recovered.batch.delta_link.as_deref(), Some(delta_link));
+        assert!(can_advance_outlook_delta_cursor(outcome.failure_count));
+    }
+
+    #[tokio::test]
+    async fn failed_fresh_page_after_cursor_expiry_keeps_snapshot_retryable() {
+        let stored_cursor =
+            "https://graph.microsoft.com/v1.0/me/messages/delta?$deltatoken=expired";
+        let next_link = "https://graph.microsoft.com/v1.0/me/messages/delta?$skiptoken=fresh-2";
+        let mut calls = 0;
+
+        let error = collect_outlook_delta_pages_with_expiry_recovery(
+            "inbox",
+            Some(stored_cursor),
+            |_, _| {
+                calls += 1;
+                async move {
+                    match calls {
+                        1 => Err(PebbleError::SyncCursorExpired("expired".to_string())),
+                        2 => Ok(OutlookDeltaPage {
+                            messages: vec![make_message("partial")],
+                            deleted_remote_ids: Vec::new(),
+                            next_link: Some(next_link.to_string()),
+                            delta_link: None,
+                        }),
+                        3 => Err(PebbleError::Network("fresh page failed".to_string())),
+                        _ => unreachable!(),
+                    }
+                }
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert!(error.to_string().contains("fresh page failed"));
     }
 
     #[test]
@@ -886,5 +1387,468 @@ mod tests {
 
         update_outlook_backoff_after_sync(&mut backoff, 0);
         assert_eq!(backoff.failure_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn outlook_delta_updates_flags_for_existing_messages() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let mut existing = make_message("outlook-1");
+        existing.is_read = false;
+        existing.is_starred = false;
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&folder.id))
+            .unwrap();
+
+        let mut changed = make_message("outlook-1");
+        changed.id = "newly-generated-delta-id".to_string();
+        changed.is_read = true;
+        changed.is_starred = true;
+        changed.subject = "Updated subject".to_string();
+        changed.body_text = "Updated body".to_string();
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            std::env::temp_dir(),
+        );
+
+        let failures = worker
+            .persist_folder_messages(&folder, vec![changed], false)
+            .await;
+
+        let stored = store.get_message(&existing.id).unwrap().unwrap();
+        assert_eq!(failures, 0);
+        assert!(stored.is_read);
+        assert!(stored.is_starred);
+        assert_eq!(stored.subject, "Updated subject");
+        assert_eq!(stored.body_text, "Updated body");
+    }
+
+    #[tokio::test]
+    async fn outlook_delta_removes_attachments_deleted_from_an_existing_message() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let mut existing = make_message("outlook-attachment-delete");
+        existing.has_attachments = true;
+        let attachments_dir = std::env::temp_dir().join(format!(
+            "pebble-outlook-existing-attachment-delete-{}",
+            new_id()
+        ));
+        let old_path = attachments_dir.join("old.txt");
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+        std::fs::write(&old_path, b"old attachment").unwrap();
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&folder.id))
+            .unwrap();
+        store
+            .insert_attachment(&Attachment {
+                id: new_id(),
+                message_id: existing.id.clone(),
+                filename: "old.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                size: 14,
+                local_path: Some(old_path.to_string_lossy().into_owned()),
+                content_id: None,
+                is_inline: false,
+            })
+            .unwrap();
+
+        let mut changed = make_message("outlook-attachment-delete");
+        changed.has_attachments = false;
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            attachments_dir.clone(),
+        );
+
+        let failures = worker
+            .persist_folder_messages(&folder, vec![changed], false)
+            .await;
+
+        assert_eq!(failures, 0);
+        assert!(store
+            .list_attachments_by_message(&existing.id)
+            .unwrap()
+            .is_empty());
+        assert!(!old_path.exists());
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[tokio::test]
+    async fn outlook_delta_adds_attachments_to_an_existing_message() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let existing = make_message("outlook-attachment-add");
+        let attachments_dir = std::env::temp_dir().join(format!(
+            "pebble-outlook-existing-attachment-add-{}",
+            new_id()
+        ));
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&folder.id))
+            .unwrap();
+
+        let mut changed = make_message("outlook-attachment-add");
+        changed.has_attachments = true;
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            attachments_dir.clone(),
+        );
+
+        let failures = worker
+            .persist_folder_messages_with_attachment_fetch(
+                &folder,
+                vec![changed],
+                false,
+                |remote_id| async move {
+                    assert_eq!(remote_id, "outlook-attachment-add");
+                    Ok(vec![make_attachment_data("new.txt", b"new attachment")])
+                },
+            )
+            .await;
+
+        let attachments = store.list_attachments_by_message(&existing.id).unwrap();
+        assert_eq!(failures, 0);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "new.txt");
+        let path = attachments[0].local_path.as_ref().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"new attachment");
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[tokio::test]
+    async fn outlook_delta_replaces_attachments_on_an_existing_message() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let mut existing = make_message("outlook-attachment-replace");
+        existing.has_attachments = true;
+        let attachments_dir = std::env::temp_dir().join(format!(
+            "pebble-outlook-existing-attachment-replace-{}",
+            new_id()
+        ));
+        let old_path = attachments_dir.join("old.txt");
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+        std::fs::write(&old_path, b"old attachment").unwrap();
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&folder.id))
+            .unwrap();
+        store
+            .insert_attachment(&Attachment {
+                id: new_id(),
+                message_id: existing.id.clone(),
+                filename: "old.txt".to_string(),
+                mime_type: "text/plain".to_string(),
+                size: 14,
+                local_path: Some(old_path.to_string_lossy().into_owned()),
+                content_id: None,
+                is_inline: false,
+            })
+            .unwrap();
+
+        let mut changed = make_message("outlook-attachment-replace");
+        changed.has_attachments = true;
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            attachments_dir.clone(),
+        );
+
+        let failures = worker
+            .persist_folder_messages_with_attachment_fetch(
+                &folder,
+                vec![changed],
+                false,
+                |_| async { Ok(vec![make_attachment_data("new.txt", b"replacement")]) },
+            )
+            .await;
+
+        let attachments = store.list_attachments_by_message(&existing.id).unwrap();
+        assert_eq!(failures, 0);
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].filename, "new.txt");
+        assert_eq!(
+            std::fs::read(attachments[0].local_path.as_ref().unwrap()).unwrap(),
+            b"replacement"
+        );
+        assert!(!old_path.exists());
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[tokio::test]
+    async fn outlook_invalid_attachment_base64_preserves_existing_state_and_blocks_cursor() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let mut existing = make_message("outlook-attachment-fetch-failure");
+        existing.has_attachments = true;
+        let attachments_dir = std::env::temp_dir().join(format!(
+            "pebble-outlook-attachment-fetch-failure-{}",
+            new_id()
+        ));
+        let old_path = attachments_dir.join("old.txt");
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+        std::fs::write(&old_path, b"old attachment").unwrap();
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&folder.id))
+            .unwrap();
+        let old_attachment = Attachment {
+            id: new_id(),
+            message_id: existing.id.clone(),
+            filename: "old.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            size: 14,
+            local_path: Some(old_path.to_string_lossy().into_owned()),
+            content_id: None,
+            is_inline: false,
+        };
+        store.insert_attachment(&old_attachment).unwrap();
+
+        let mut changed = make_message("outlook-attachment-fetch-failure");
+        changed.has_attachments = true;
+        changed.subject = "must not commit".to_string();
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            attachments_dir.clone(),
+        );
+
+        let failures = worker
+            .persist_folder_messages_with_attachment_fetch(
+                &folder,
+                vec![changed],
+                false,
+                |_| async {
+                    crate::provider::outlook::base64_standard_decode_outlook("TQ$=")
+                        .map(|_| Vec::new())
+                },
+            )
+            .await;
+
+        assert_eq!(failures, 1);
+        assert!(!can_advance_outlook_delta_cursor(failures));
+        assert_eq!(
+            store.get_message(&existing.id).unwrap().unwrap().subject,
+            existing.subject
+        );
+        let stored_attachments = store.list_attachments_by_message(&existing.id).unwrap();
+        assert_eq!(stored_attachments.len(), 1);
+        assert_eq!(stored_attachments[0].id, old_attachment.id);
+        assert_eq!(stored_attachments[0].local_path, old_attachment.local_path);
+        assert!(old_path.exists());
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[tokio::test]
+    async fn outlook_attachment_write_failure_preserves_existing_state_and_blocks_cursor() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let mut existing = make_message("outlook-attachment-write-failure");
+        existing.has_attachments = true;
+        let test_dir = std::env::temp_dir().join(format!(
+            "pebble-outlook-attachment-write-failure-{}",
+            new_id()
+        ));
+        std::fs::create_dir_all(&test_dir).unwrap();
+        let attachments_root_file = test_dir.join("not-a-directory");
+        std::fs::write(&attachments_root_file, b"block directory creation").unwrap();
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&folder.id))
+            .unwrap();
+
+        let mut changed = make_message("outlook-attachment-write-failure");
+        changed.has_attachments = true;
+        changed.subject = "must not commit".to_string();
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            attachments_root_file,
+        );
+
+        let failures = worker
+            .persist_folder_messages_with_attachment_fetch(
+                &folder,
+                vec![changed],
+                false,
+                |_| async { Ok(vec![make_attachment_data("new.txt", b"new")]) },
+            )
+            .await;
+
+        assert_eq!(failures, 1);
+        assert!(!can_advance_outlook_delta_cursor(failures));
+        assert_eq!(
+            store.get_message(&existing.id).unwrap().unwrap().subject,
+            existing.subject
+        );
+        assert!(store
+            .list_attachments_by_message(&existing.id)
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(test_dir);
+    }
+
+    #[tokio::test]
+    async fn outlook_attachment_db_failure_rolls_back_staged_files_and_blocks_cursor() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let stored_folder = make_folder("inbox");
+        let missing_folder = make_folder("missing");
+        let existing = make_message("outlook-attachment-db-failure");
+        let attachments_dir =
+            std::env::temp_dir().join(format!("pebble-outlook-attachment-db-failure-{}", new_id()));
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&stored_folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&stored_folder.id))
+            .unwrap();
+
+        let mut changed = make_message("outlook-attachment-db-failure");
+        changed.has_attachments = true;
+        changed.subject = "must not commit".to_string();
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            attachments_dir.clone(),
+        );
+
+        let failures = worker
+            .persist_folder_messages_with_attachment_fetch(
+                &missing_folder,
+                vec![changed],
+                false,
+                |_| async { Ok(vec![make_attachment_data("new.txt", b"new")]) },
+            )
+            .await;
+
+        assert_eq!(failures, 1);
+        assert!(!can_advance_outlook_delta_cursor(failures));
+        assert_eq!(
+            store.get_message(&existing.id).unwrap().unwrap().subject,
+            existing.subject
+        );
+        assert!(store
+            .list_attachments_by_message(&existing.id)
+            .unwrap()
+            .is_empty());
+        assert!(!attachments_dir.join(&existing.id).join("new.txt").exists());
+        let _ = std::fs::remove_dir_all(attachments_dir);
+    }
+
+    #[tokio::test]
+    async fn outlook_delta_does_not_delete_an_attachment_file_still_referenced_elsewhere() {
+        let store = Arc::new(Store::open_in_memory().unwrap());
+        let account = make_account();
+        let folder = make_folder("inbox");
+        let mut existing = make_message("outlook-shared-attachment-first");
+        existing.has_attachments = true;
+        let mut other = make_message("outlook-shared-attachment-second");
+        other.id = "local-shared-attachment-second".to_string();
+        other.has_attachments = true;
+        let attachments_dir =
+            std::env::temp_dir().join(format!("pebble-outlook-shared-attachment-{}", new_id()));
+        let shared_path = attachments_dir.join("shared.txt");
+        std::fs::create_dir_all(&attachments_dir).unwrap();
+        std::fs::write(&shared_path, b"shared attachment").unwrap();
+
+        store.insert_account(&account).unwrap();
+        store.insert_folder(&folder).unwrap();
+        store
+            .insert_message(&existing, std::slice::from_ref(&folder.id))
+            .unwrap();
+        store
+            .insert_message(&other, std::slice::from_ref(&folder.id))
+            .unwrap();
+        for message_id in [&existing.id, &other.id] {
+            store
+                .insert_attachment(&Attachment {
+                    id: new_id(),
+                    message_id: message_id.clone(),
+                    filename: "shared.txt".to_string(),
+                    mime_type: "text/plain".to_string(),
+                    size: 17,
+                    local_path: Some(shared_path.to_string_lossy().into_owned()),
+                    content_id: None,
+                    is_inline: false,
+                })
+                .unwrap();
+        }
+
+        let changed = make_message("outlook-shared-attachment-first");
+        let worker = OutlookSyncWorker::new(
+            "account-1",
+            Arc::new(OutlookProvider::new(
+                "token".to_string(),
+                "account-1".to_string(),
+            )),
+            Arc::clone(&store),
+            attachments_dir.clone(),
+        );
+
+        let failures = worker
+            .persist_folder_messages(&folder, vec![changed], false)
+            .await;
+
+        assert_eq!(failures, 0);
+        assert!(store
+            .list_attachments_by_message(&existing.id)
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            store.list_attachments_by_message(&other.id).unwrap().len(),
+            1
+        );
+        assert!(shared_path.exists());
+        let _ = std::fs::remove_dir_all(attachments_dir);
     }
 }

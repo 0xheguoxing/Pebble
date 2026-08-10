@@ -47,6 +47,13 @@ export default function ContactAutocomplete({
   const inputRef = useRef<HTMLInputElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const searchGenerationRef = useRef(0);
+  const activeAccountIdRef = useRef(accountId);
+  const inputValueRef = useRef(inputValue);
+  const selectedAddressesRef = useRef(value);
+  activeAccountIdRef.current = accountId;
+  inputValueRef.current = inputValue;
+  selectedAddressesRef.current = value;
 
   const setInputValue = useCallback(
     (nextValue: string) => {
@@ -60,15 +67,23 @@ export default function ContactAutocomplete({
 
   const fetchSuggestions = useCallback(
     async (query: string) => {
+      const generation = ++searchGenerationRef.current;
+      const requestIsCurrent = () => searchGenerationRef.current === generation
+        && activeAccountIdRef.current === accountId
+        && inputValueRef.current === query;
       if (!query.trim() || !accountId) {
         setSuggestions([]);
         setShowDropdown(false);
+        setLoading(false);
         return;
       }
       setLoading(true);
       try {
         const results = await searchContactSuggestions(accountId, query, 10);
-        const selectedAddresses = new Set(value.map((address) => address.trim().toLowerCase()));
+        if (!requestIsCurrent()) return;
+        const selectedAddresses = new Set(
+          selectedAddressesRef.current.map((address) => address.trim().toLowerCase()),
+        );
         const filtered = results.filter(
           (contact) => !selectedAddresses.has(contact.address.trim().toLowerCase()),
         );
@@ -76,17 +91,21 @@ export default function ContactAutocomplete({
         setShowDropdown(filtered.length > 0);
         setActiveIndex(-1);
       } catch {
+        if (!requestIsCurrent()) return;
         setSuggestions([]);
         setShowDropdown(false);
       } finally {
-        setLoading(false);
+        if (requestIsCurrent()) {
+          setLoading(false);
+        }
       }
     },
-    [accountId, value],
+    [accountId],
   );
 
   const handleInputChange = (text: string) => {
     setInputValue(text);
+    searchGenerationRef.current += 1;
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => {
       fetchSuggestions(text);
@@ -99,6 +118,7 @@ export default function ContactAutocomplete({
       onChange([...value, contact.address]);
     }
     setInputValue("");
+    searchGenerationRef.current += 1;
     setSuggestions([]);
     setShowDropdown(false);
     setActiveIndex(-1);
@@ -119,6 +139,7 @@ export default function ContactAutocomplete({
       });
     }
     setInputValue("");
+    searchGenerationRef.current += 1;
     setSuggestions([]);
     setShowDropdown(false);
   };
@@ -214,9 +235,22 @@ export default function ContactAutocomplete({
     return () => document.removeEventListener("mousedown", handleClickOutside);
   }, []);
 
+  useEffect(() => {
+    searchGenerationRef.current += 1;
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current);
+      debounceRef.current = null;
+    }
+    setSuggestions([]);
+    setShowDropdown(false);
+    setActiveIndex(-1);
+    setLoading(false);
+  }, [accountId]);
+
   // Cleanup debounce on unmount
   useEffect(() => {
     return () => {
+      searchGenerationRef.current += 1;
       if (debounceRef.current) clearTimeout(debounceRef.current);
     };
   }, []);

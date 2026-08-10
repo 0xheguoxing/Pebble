@@ -75,6 +75,17 @@ impl Store {
             Ok(result)
         })
     }
+
+    pub fn is_attachment_local_path_referenced(&self, local_path: &str) -> Result<bool> {
+        self.with_read(|conn| {
+            let referenced = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attachments WHERE local_path = ?1)",
+                params![local_path],
+                |row| row.get(0),
+            )?;
+            Ok(referenced)
+        })
+    }
 }
 
 #[cfg(test)]

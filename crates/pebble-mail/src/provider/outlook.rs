@@ -13,6 +13,7 @@ use pebble_core::{
 };
 
 const GRAPH_API_BASE: &str = "https://graph.microsoft.com/v1.0/me";
+pub(crate) const MAX_GRAPH_CONTINUATION_PAGES: usize = 1_000;
 
 // ---------------------------------------------------------------------------
 // Microsoft Graph API response types (internal)
@@ -234,7 +235,7 @@ struct GraphDraftResponse {
     id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct GraphAttachmentItem {
     #[allow(dead_code)]
@@ -254,6 +255,158 @@ struct GraphAttachmentItem {
 #[derive(Deserialize)]
 struct GraphAttachmentList {
     value: Vec<GraphAttachmentItem>,
+    #[serde(rename = "@odata.nextLink")]
+    next_link: Option<String>,
+}
+
+#[async_trait]
+trait GraphAttachmentPageOperations {
+    async fn fetch_attachment_page(&mut self, url: &str) -> Result<GraphAttachmentList>;
+}
+
+pub(crate) fn validate_graph_continuation_url(url: &str) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(url).map_err(|error| {
+        PebbleError::Network(format!(
+            "Refusing untrusted Graph continuation URL: invalid URL ({error})"
+        ))
+    })?;
+    let is_trusted = parsed.scheme() == "https"
+        && parsed
+            .host_str()
+            .is_some_and(|host| host.eq_ignore_ascii_case("graph.microsoft.com"))
+        && parsed.port_or_known_default() == Some(443)
+        && parsed.username().is_empty()
+        && parsed.password().is_none()
+        && parsed.path().starts_with("/v1.0/me/");
+    if !is_trusted {
+        return Err(PebbleError::Network(
+            "Refusing untrusted Graph continuation URL".to_string(),
+        ));
+    }
+    Ok(parsed)
+}
+
+fn outlook_delta_response_error(status: reqwest::StatusCode, body: &str) -> PebbleError {
+    if status == reqwest::StatusCode::GONE
+        || (status.is_client_error() && body.to_ascii_lowercase().contains("syncstatenotfound"))
+    {
+        PebbleError::SyncCursorExpired(format!(
+            "Outlook delta cursor was rejected (status {status})"
+        ))
+    } else {
+        PebbleError::Network(format!(
+            "Failed to fetch Outlook delta (status {status}): {body}"
+        ))
+    }
+}
+
+fn outlook_delete_draft_status_result(status: reqwest::StatusCode, body: &str) -> Result<()> {
+    if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+        Ok(())
+    } else {
+        Err(PebbleError::Network(format!(
+            "Failed to delete draft (status {status}): {body}"
+        )))
+    }
+}
+
+fn validate_graph_attachment_next_link(next_link: &str) -> Result<()> {
+    validate_graph_continuation_url(next_link)
+        .map(|_| ())
+        .map_err(|_| {
+            PebbleError::Network("Refusing untrusted Graph attachment nextLink".to_string())
+        })
+}
+
+async fn collect_graph_attachment_pages<O: GraphAttachmentPageOperations>(
+    operations: &mut O,
+    initial_url: &str,
+) -> Result<Vec<GraphAttachmentItem>> {
+    let mut url = initial_url.to_string();
+    let mut items = Vec::new();
+    let mut visited = std::collections::HashSet::new();
+    let mut page_count = 0usize;
+
+    loop {
+        if page_count == MAX_GRAPH_CONTINUATION_PAGES {
+            return Err(PebbleError::Network(
+                "Graph attachment pagination exceeded page limit".to_string(),
+            ));
+        }
+        page_count += 1;
+        if !visited.insert(url.clone()) {
+            return Err(PebbleError::Network(
+                "Graph attachment pagination returned a repeated nextLink".to_string(),
+            ));
+        }
+        let page = operations.fetch_attachment_page(&url).await?;
+        items.extend(page.value);
+        let Some(next_link) = page.next_link else {
+            return Ok(items);
+        };
+        validate_graph_attachment_next_link(&next_link)?;
+        url = next_link;
+    }
+}
+
+#[async_trait]
+trait DraftAttachmentOperations {
+    async fn upload(&mut self, attachment: &GraphFileAttachment) -> Result<String>;
+    async fn delete(&mut self, attachment_id: &str) -> Result<()>;
+}
+
+#[async_trait]
+trait CreatedDraftCleanupOperations {
+    async fn delete_created_draft(&mut self, draft_id: &str) -> Result<()>;
+}
+
+async fn finish_created_draft_attachments<O: CreatedDraftCleanupOperations>(
+    cleanup: &mut O,
+    draft_id: &str,
+    attachment_result: Result<()>,
+) -> Result<()> {
+    let Err(attachment_error) = attachment_result else {
+        return Ok(());
+    };
+    match cleanup.delete_created_draft(draft_id).await {
+        Ok(()) => Err(attachment_error),
+        Err(cleanup_error) => Err(PebbleError::Network(format!(
+            "{attachment_error}; additionally failed to delete newly created draft {draft_id}: {cleanup_error}"
+        ))),
+    }
+}
+
+async fn replace_draft_attachment_set<O: DraftAttachmentOperations>(
+    operations: &mut O,
+    new_attachments: &[GraphFileAttachment],
+    old_attachment_ids: &[String],
+) -> Result<()> {
+    let mut uploaded_ids = Vec::with_capacity(new_attachments.len());
+    for attachment in new_attachments {
+        match operations.upload(attachment).await {
+            Ok(id) => uploaded_ids.push(id),
+            Err(upload_error) => {
+                let mut rollback_failures = Vec::new();
+                for id in uploaded_ids.iter().rev() {
+                    if let Err(error) = operations.delete(id).await {
+                        rollback_failures.push(format!("{id}: {error}"));
+                    }
+                }
+                if rollback_failures.is_empty() {
+                    return Err(upload_error);
+                }
+                return Err(PebbleError::Network(format!(
+                    "{upload_error}; additionally failed to roll back uploaded draft attachments: {}",
+                    rollback_failures.join(", ")
+                )));
+            }
+        }
+    }
+
+    for id in old_attachment_ids {
+        operations.delete(id).await?;
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -266,10 +419,96 @@ pub struct OutlookProvider {
     account_id: String,
 }
 
+struct OutlookGraphAttachmentPageOperations<'a> {
+    provider: &'a OutlookProvider,
+}
+
+#[async_trait]
+impl GraphAttachmentPageOperations for OutlookGraphAttachmentPageOperations<'_> {
+    async fn fetch_attachment_page(&mut self, url: &str) -> Result<GraphAttachmentList> {
+        let resp = self.provider.get(url).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(PebbleError::Network(format!(
+                "Failed to list attachments (status {status}): {text}"
+            )));
+        }
+        resp.json().await.map_err(|error| {
+            PebbleError::Network(format!("Failed to parse attachment list: {error}"))
+        })
+    }
+}
+
+struct OutlookDraftAttachmentOperations<'a> {
+    provider: &'a OutlookProvider,
+    draft_id: &'a str,
+}
+
+struct OutlookCreatedDraftCleanupOperations<'a> {
+    provider: &'a OutlookProvider,
+}
+
+#[async_trait]
+impl CreatedDraftCleanupOperations for OutlookCreatedDraftCleanupOperations<'_> {
+    async fn delete_created_draft(&mut self, draft_id: &str) -> Result<()> {
+        let url = format!("{GRAPH_API_BASE}/messages/{draft_id}");
+        let resp = self.provider.delete(&url).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(PebbleError::Network(format!(
+                "Failed to delete newly created draft (status {status}): {text}"
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl DraftAttachmentOperations for OutlookDraftAttachmentOperations<'_> {
+    async fn upload(&mut self, attachment: &GraphFileAttachment) -> Result<String> {
+        let url = format!("{GRAPH_API_BASE}/messages/{}/attachments", self.draft_id);
+        let resp = self.provider.post_json(&url, attachment).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(PebbleError::Network(format!(
+                "Failed to add draft attachment (status {status}): {text}"
+            )));
+        }
+        let uploaded: GraphDraftResponse = resp.json().await.map_err(|e| {
+            PebbleError::Network(format!("Failed to parse uploaded draft attachment: {e}"))
+        })?;
+        if uploaded.id.trim().is_empty() {
+            return Err(PebbleError::Network(
+                "Uploaded draft attachment response did not include an ID".to_string(),
+            ));
+        }
+        Ok(uploaded.id)
+    }
+
+    async fn delete(&mut self, attachment_id: &str) -> Result<()> {
+        let url = format!(
+            "{GRAPH_API_BASE}/messages/{}/attachments/{attachment_id}",
+            self.draft_id
+        );
+        let resp = self.provider.delete(&url).await?;
+        if !resp.status().is_success() {
+            let status = resp.status();
+            let text = resp.text().await.unwrap_or_default();
+            return Err(PebbleError::Network(format!(
+                "Failed to delete draft attachment (status {status}): {text}"
+            )));
+        }
+        Ok(())
+    }
+}
+
 impl OutlookProvider {
     pub fn new(access_token: String, account_id: String) -> Self {
         Self {
-            client: Client::new(),
+            client: http_client_with_proxy(None).expect("failed to build Outlook HTTP client"),
             access_token: RwLock::new(access_token),
             account_id,
         }
@@ -315,7 +554,9 @@ impl OutlookProvider {
     ) -> Result<FetchResult> {
         let select = "id,subject,bodyPreview,body,from,toRecipients,ccRecipients,isRead,flag,isDraft,receivedDateTime,internetMessageId,conversationId,hasAttachments,categories";
         let url = match cursor {
-            Some(cursor) if !cursor.is_empty() => cursor.to_string(),
+            Some(cursor) if !cursor.is_empty() => {
+                validate_graph_continuation_url(cursor)?.to_string()
+            }
             _ => format!(
                 "{GRAPH_API_BASE}/mailFolders/{folder_id}/messages?$top={limit}&$select={select}"
             ),
@@ -332,6 +573,9 @@ impl OutlookProvider {
             .json()
             .await
             .map_err(|e| PebbleError::Network(format!("Failed to parse message list: {e}")))?;
+        if let Some(next_link) = list.next_link.as_deref() {
+            validate_graph_continuation_url(next_link)?;
+        }
 
         debug!(count = list.value.len(), "Fetched Outlook messages");
 
@@ -357,8 +601,9 @@ impl OutlookProvider {
     ) -> Result<OutlookDeltaPage> {
         let select = "id,subject,bodyPreview,body,from,toRecipients,ccRecipients,isRead,flag,isDraft,receivedDateTime,internetMessageId,conversationId,hasAttachments,categories";
         let url = match cursor {
-            Some(cursor) if cursor.starts_with("https://") => cursor.to_string(),
-            Some(cursor) if !cursor.is_empty() => cursor.to_string(),
+            Some(cursor) if !cursor.is_empty() => {
+                validate_graph_continuation_url(cursor)?.to_string()
+            }
             _ => format!(
                 "{GRAPH_API_BASE}/mailFolders/{folder_id}/messages/delta?$top=50&$select={select}"
             ),
@@ -368,15 +613,19 @@ impl OutlookProvider {
         if !resp.status().is_success() {
             let status = resp.status();
             let text = resp.text().await.unwrap_or_default();
-            return Err(PebbleError::Network(format!(
-                "Failed to fetch Outlook delta (status {status}): {text}"
-            )));
+            return Err(outlook_delta_response_error(status, &text));
         }
 
         let list: GraphMessageList = resp
             .json()
             .await
             .map_err(|e| PebbleError::Network(format!("Failed to parse delta response: {e}")))?;
+        for continuation in [list.next_link.as_deref(), list.delta_link.as_deref()]
+            .into_iter()
+            .flatten()
+        {
+            validate_graph_continuation_url(continuation)?;
+        }
 
         let mut messages = Vec::new();
         let mut deleted_remote_ids = Vec::new();
@@ -522,6 +771,14 @@ impl OutlookProvider {
 mod proxy_tests {
     use super::*;
     use pebble_core::HttpProxyConfig;
+
+    #[tokio::test]
+    async fn outlook_provider_new_ignores_all_proxy() {
+        crate::provider::proxy_test_support::assert_client_builder_ignores_all_proxy(|| {
+            OutlookProvider::new("access-token".to_string(), "account-id".to_string()).client
+        })
+        .await;
+    }
 
     #[test]
     fn outlook_provider_accepts_socks5_proxy() {
@@ -795,95 +1052,74 @@ impl OutlookProvider {
         remote_id: &str,
     ) -> Result<Vec<GraphAttachmentItem>> {
         let url = format!("{GRAPH_API_BASE}/messages/{remote_id}/attachments");
-        let resp = self.get(&url).await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(PebbleError::Network(format!(
-                "Failed to list attachments (status {status}): {text}"
-            )));
-        }
-        let list: GraphAttachmentList = resp
-            .json()
-            .await
-            .map_err(|e| PebbleError::Network(format!("Failed to parse attachment list: {e}")))?;
-        Ok(list.value)
+        let mut operations = OutlookGraphAttachmentPageOperations { provider: self };
+        collect_graph_attachment_pages(&mut operations, &url).await
     }
 
     async fn replace_draft_attachments(
         &self,
         draft_id: &str,
-        attachment_paths: &[String],
+        new_attachments: &[GraphFileAttachment],
         remove_existing: bool,
     ) -> Result<()> {
-        if remove_existing {
-            for item in self.list_graph_attachment_items(draft_id).await? {
-                if !is_graph_file_attachment(&item) {
-                    continue;
-                }
-                let url = format!(
-                    "{GRAPH_API_BASE}/messages/{draft_id}/attachments/{}",
-                    item.id
-                );
-                let resp = self.delete(&url).await?;
-                if !resp.status().is_success() {
-                    let status = resp.status();
-                    let text = resp.text().await.unwrap_or_default();
-                    return Err(PebbleError::Network(format!(
-                        "Failed to delete draft attachment (status {status}): {text}"
-                    )));
-                }
-            }
-        }
-
-        for path in attachment_paths {
-            let attachment = graph_file_attachment_from_path(path)?;
-            let url = format!("{GRAPH_API_BASE}/messages/{draft_id}/attachments");
-            let resp = self.post_json(&url, &attachment).await?;
-            if !resp.status().is_success() {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                return Err(PebbleError::Network(format!(
-                    "Failed to add draft attachment (status {status}): {text}"
-                )));
-            }
-        }
-
-        Ok(())
+        let old_attachment_ids = if remove_existing {
+            self.list_graph_attachment_items(draft_id)
+                .await?
+                .into_iter()
+                .filter(is_graph_file_attachment)
+                .map(|item| item.id)
+                .collect()
+        } else {
+            Vec::new()
+        };
+        let mut operations = OutlookDraftAttachmentOperations {
+            provider: self,
+            draft_id,
+        };
+        replace_draft_attachment_set(&mut operations, new_attachments, &old_attachment_ids).await
     }
 
     pub async fn list_message_attachments(
         &self,
         remote_id: &str,
     ) -> Result<Vec<crate::parser::AttachmentData>> {
-        let mut out = Vec::new();
-        for item in self.list_graph_attachment_items(remote_id).await? {
-            // Only fileAttachment carries inline content bytes; skip others for now.
-            if !is_graph_file_attachment(&item) {
-                continue;
-            }
-            let Some(b64) = item.content_bytes else {
-                continue;
-            };
-            let data = base64_standard_decode_outlook(&b64);
-            let filename = item.name.unwrap_or_else(|| "attachment".to_string());
-            let mime_type = item
-                .content_type
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let size = item.size.unwrap_or(data.len() as i64).max(0) as usize;
-            out.push(crate::parser::AttachmentData {
-                meta: crate::parser::AttachmentMeta {
-                    filename,
-                    mime_type,
-                    size,
-                    content_id: item.content_id,
-                    is_inline: item.is_inline,
-                },
-                data,
-            });
-        }
-        Ok(out)
+        graph_attachment_items_to_data(self.list_graph_attachment_items(remote_id).await?)
     }
+}
+
+fn graph_attachment_items_to_data(
+    items: Vec<GraphAttachmentItem>,
+) -> Result<Vec<crate::parser::AttachmentData>> {
+    let mut out = Vec::new();
+    for item in items {
+        // Only fileAttachment carries inline content bytes; skip others for now.
+        if !is_graph_file_attachment(&item) {
+            continue;
+        }
+        let b64 = item.content_bytes.ok_or_else(|| {
+            PebbleError::Network(format!(
+                "Outlook file attachment {} did not include contentBytes",
+                item.id
+            ))
+        })?;
+        let data = base64_standard_decode_outlook(&b64)?;
+        let filename = item.name.unwrap_or_else(|| "attachment".to_string());
+        let mime_type = item
+            .content_type
+            .unwrap_or_else(|| "application/octet-stream".to_string());
+        let size = item.size.unwrap_or(data.len() as i64).max(0) as usize;
+        out.push(crate::parser::AttachmentData {
+            meta: crate::parser::AttachmentMeta {
+                filename,
+                mime_type,
+                size,
+                content_id: item.content_id,
+                is_inline: item.is_inline,
+            },
+            data,
+        });
+    }
+    Ok(out)
 }
 
 #[async_trait]
@@ -930,6 +1166,7 @@ impl CategoryProvider for OutlookProvider {
 #[async_trait]
 impl DraftProvider for OutlookProvider {
     async fn save_draft(&self, draft: &DraftMessage) -> Result<String> {
+        let attachments = graph_file_attachments_from_paths(&draft.attachment_paths)?;
         let (content_type, content) = if let Some(ref html) = draft.body_html {
             ("HTML".to_string(), html.clone())
         } else {
@@ -961,14 +1198,19 @@ impl DraftProvider for OutlookProvider {
             .json()
             .await
             .map_err(|e| PebbleError::Network(format!("Failed to parse draft response: {e}")))?;
-        if !draft.attachment_paths.is_empty() {
-            self.replace_draft_attachments(&draft_resp.id, &draft.attachment_paths, false)
-                .await?;
-        }
+        let attachment_result = if attachments.is_empty() {
+            Ok(())
+        } else {
+            self.replace_draft_attachments(&draft_resp.id, &attachments, false)
+                .await
+        };
+        let mut cleanup = OutlookCreatedDraftCleanupOperations { provider: self };
+        finish_created_draft_attachments(&mut cleanup, &draft_resp.id, attachment_result).await?;
         Ok(draft_resp.id)
     }
 
     async fn update_draft(&self, draft_id: &str, draft: &DraftMessage) -> Result<()> {
+        let attachments = graph_file_attachments_from_paths(&draft.attachment_paths)?;
         let (content_type, content) = if let Some(ref html) = draft.body_html {
             ("HTML".to_string(), html.clone())
         } else {
@@ -996,7 +1238,7 @@ impl DraftProvider for OutlookProvider {
                 "Failed to update draft (status {status}): {text}"
             )));
         }
-        self.replace_draft_attachments(draft_id, &draft.attachment_paths, true)
+        self.replace_draft_attachments(draft_id, &attachments, true)
             .await?;
         Ok(())
     }
@@ -1004,14 +1246,12 @@ impl DraftProvider for OutlookProvider {
     async fn delete_draft(&self, draft_id: &str) -> Result<()> {
         let url = format!("{GRAPH_API_BASE}/messages/{draft_id}");
         let resp = self.delete(&url).await?;
-        if !resp.status().is_success() {
-            let status = resp.status();
-            let text = resp.text().await.unwrap_or_default();
-            return Err(PebbleError::Network(format!(
-                "Failed to delete draft (status {status}): {text}"
-            )));
+        let status = resp.status();
+        if status.is_success() || status == reqwest::StatusCode::NOT_FOUND {
+            return Ok(());
         }
-        Ok(())
+        let text = resp.text().await.unwrap_or_default();
+        outlook_delete_draft_status_result(status, &text)
     }
 
     async fn list_drafts(&self) -> Result<Vec<DraftMessage>> {
@@ -1096,6 +1336,13 @@ fn graph_file_attachment_from_path(path_str: &str) -> Result<GraphFileAttachment
     })
 }
 
+fn graph_file_attachments_from_paths(paths: &[String]) -> Result<Vec<GraphFileAttachment>> {
+    paths
+        .iter()
+        .map(|path| graph_file_attachment_from_path(path))
+        .collect()
+}
+
 fn base64_standard_encode_outlook(data: &[u8]) -> String {
     const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
@@ -1120,39 +1367,73 @@ fn base64_standard_encode_outlook(data: &[u8]) -> String {
     out
 }
 
-fn base64_standard_decode_outlook(input: &str) -> Vec<u8> {
-    // Standard base64 alphabet decoder. Skips whitespace and padding.
-    let bytes: Vec<u8> = input
-        .bytes()
-        .filter(|b| !b.is_ascii_whitespace() && *b != b'=')
-        .map(|b| match b {
-            b'A'..=b'Z' => b - b'A',
-            b'a'..=b'z' => b - b'a' + 26,
-            b'0'..=b'9' => b - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => 0,
-        })
-        .collect();
-
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        if chunk.len() < 2 {
-            break;
+pub(crate) fn base64_standard_decode_outlook(input: &str) -> Result<Vec<u8>> {
+    fn sextet(byte: u8) -> Option<u8> {
+        match byte {
+            b'A'..=b'Z' => Some(byte - b'A'),
+            b'a'..=b'z' => Some(byte - b'a' + 26),
+            b'0'..=b'9' => Some(byte - b'0' + 52),
+            b'+' => Some(62),
+            b'/' => Some(63),
+            _ => None,
         }
-        let n = ((chunk[0] as u32) << 18)
-            | ((chunk[1] as u32) << 12)
-            | ((chunk.get(2).copied().unwrap_or(0) as u32) << 6)
-            | (chunk.get(3).copied().unwrap_or(0) as u32);
+    }
+
+    if input.is_empty() {
+        return Ok(Vec::new());
+    }
+    let bytes = input.as_bytes();
+    if !bytes.len().is_multiple_of(4) {
+        return Err(PebbleError::Network(
+            "Invalid Outlook attachment base64 content: length is not a multiple of four"
+                .to_string(),
+        ));
+    }
+    let padding = bytes.iter().rev().take_while(|byte| **byte == b'=').count();
+    if padding > 2 || bytes[..bytes.len() - padding].contains(&b'=') {
+        return Err(PebbleError::Network(
+            "Invalid Outlook attachment base64 content: invalid padding".to_string(),
+        ));
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() / 4 * 3 - padding);
+    for (chunk_index, chunk) in bytes.chunks_exact(4).enumerate() {
+        let is_last = chunk_index + 1 == bytes.len() / 4;
+        let chunk_padding = if is_last { padding } else { 0 };
+        let a = sextet(chunk[0]);
+        let b = sextet(chunk[1]);
+        let c = if chunk_padding == 2 {
+            Some(0)
+        } else {
+            sextet(chunk[2])
+        };
+        let d = if chunk_padding >= 1 {
+            Some(0)
+        } else {
+            sextet(chunk[3])
+        };
+        let (Some(a), Some(b), Some(c), Some(d)) = (a, b, c, d) else {
+            return Err(PebbleError::Network(
+                "Invalid Outlook attachment base64 content: non-standard alphabet character"
+                    .to_string(),
+            ));
+        };
+        if (chunk_padding == 2 && b & 0x0f != 0) || (chunk_padding == 1 && c & 0x03 != 0) {
+            return Err(PebbleError::Network(
+                "Invalid Outlook attachment base64 content: non-canonical trailing bits"
+                    .to_string(),
+            ));
+        }
+        let n = ((a as u32) << 18) | ((b as u32) << 12) | ((c as u32) << 6) | d as u32;
         out.push((n >> 16) as u8);
-        if chunk.len() >= 3 {
+        if chunk_padding < 2 {
             out.push((n >> 8) as u8);
         }
-        if chunk.len() >= 4 {
+        if chunk_padding == 0 {
             out.push(n as u8);
         }
     }
-    out
+    Ok(out)
 }
 
 fn guess_outlook_mime(filename: &str) -> &'static str {
@@ -1314,6 +1595,218 @@ fn parse_graph_datetime(s: &str) -> Option<i64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::VecDeque;
+
+    #[test]
+    fn outlook_attachment_base64_rejects_invalid_standard_alphabet_character() {
+        assert!(base64_standard_decode_outlook("TQ$=").is_err());
+        assert_eq!(
+            base64_standard_decode_outlook("TQ==").unwrap(),
+            b"M".to_vec()
+        );
+    }
+
+    #[test]
+    fn outlook_attachment_base64_rejects_invalid_padding() {
+        assert!(base64_standard_decode_outlook("TQ=").is_err());
+        assert!(base64_standard_decode_outlook("TR==").is_err());
+    }
+
+    #[test]
+    fn outlook_attachment_base64_rejects_truncated_quartet() {
+        assert!(base64_standard_decode_outlook("TQ").is_err());
+    }
+
+    #[test]
+    fn outlook_file_attachment_without_content_bytes_is_an_error() {
+        let page = graph_attachment_page(serde_json::json!({
+            "value": [{
+                "id": "file-1",
+                "name": "missing.txt",
+                "@odata.type": "#microsoft.graph.fileAttachment"
+            }]
+        }));
+
+        let error = graph_attachment_items_to_data(page.value).unwrap_err();
+        assert!(error.to_string().contains("contentBytes"));
+    }
+
+    #[test]
+    fn outlook_non_file_attachment_without_content_bytes_is_skipped() {
+        let page = graph_attachment_page(serde_json::json!({
+            "value": [{
+                "id": "reference-1",
+                "name": "link",
+                "@odata.type": "#microsoft.graph.referenceAttachment"
+            }]
+        }));
+
+        assert!(graph_attachment_items_to_data(page.value)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn outlook_delta_gone_and_sync_state_not_found_are_dedicated_cursor_expiry_errors() {
+        assert!(matches!(
+            outlook_delta_response_error(reqwest::StatusCode::GONE, "gone"),
+            PebbleError::SyncCursorExpired(_)
+        ));
+        assert!(matches!(
+            outlook_delta_response_error(
+                reqwest::StatusCode::BAD_REQUEST,
+                r#"{"error":{"code":"syncStateNotFound"}}"#,
+            ),
+            PebbleError::SyncCursorExpired(_)
+        ));
+        assert!(matches!(
+            outlook_delta_response_error(reqwest::StatusCode::BAD_REQUEST, "other"),
+            PebbleError::Network(_)
+        ));
+    }
+
+    #[test]
+    fn outlook_delete_draft_treats_not_found_as_idempotent_success() {
+        assert!(outlook_delete_draft_status_result(reqwest::StatusCode::NO_CONTENT, "").is_ok());
+        assert!(outlook_delete_draft_status_result(reqwest::StatusCode::NOT_FOUND, "gone").is_ok());
+        assert!(outlook_delete_draft_status_result(
+            reqwest::StatusCode::INTERNAL_SERVER_ERROR,
+            "failed"
+        )
+        .is_err());
+    }
+
+    #[derive(Default)]
+    struct FakeGraphAttachmentPageOperations {
+        pages: VecDeque<GraphAttachmentList>,
+        requested_urls: Vec<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl GraphAttachmentPageOperations for FakeGraphAttachmentPageOperations {
+        async fn fetch_attachment_page(&mut self, url: &str) -> Result<GraphAttachmentList> {
+            self.requested_urls.push(url.to_string());
+            self.pages.pop_front().ok_or_else(|| {
+                PebbleError::Network("unexpected attachment page request".to_string())
+            })
+        }
+    }
+
+    fn graph_attachment_page(value: serde_json::Value) -> GraphAttachmentList {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[tokio::test]
+    async fn graph_attachment_listing_follows_safe_next_link_across_two_pages() {
+        let next_link =
+            "https://graph.microsoft.com/v1.0/me/messages/draft-1/attachments?$skiptoken=next";
+        let mut operations = FakeGraphAttachmentPageOperations {
+            pages: VecDeque::from([
+                graph_attachment_page(serde_json::json!({
+                    "value": [{
+                        "id": "old-1",
+                        "name": "one.txt",
+                        "@odata.type": "#microsoft.graph.fileAttachment"
+                    }],
+                    "@odata.nextLink": next_link
+                })),
+                graph_attachment_page(serde_json::json!({
+                    "value": [{
+                        "id": "old-2",
+                        "name": "two.txt",
+                        "@odata.type": "#microsoft.graph.fileAttachment"
+                    }]
+                })),
+            ]),
+            requested_urls: Vec::new(),
+        };
+
+        let items = collect_graph_attachment_pages(
+            &mut operations,
+            "https://graph.microsoft.com/v1.0/me/messages/draft-1/attachments",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            items.into_iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec!["old-1", "old-2"]
+        );
+        assert_eq!(operations.requested_urls.len(), 2);
+        assert_eq!(operations.requested_urls[1], next_link);
+    }
+
+    #[tokio::test]
+    async fn two_page_attachment_listing_deletes_every_old_file_during_replacement() {
+        let mut page_operations = FakeGraphAttachmentPageOperations {
+            pages: VecDeque::from([
+                graph_attachment_page(serde_json::json!({
+                    "value": [{
+                        "id": "old-1",
+                        "@odata.type": "#microsoft.graph.fileAttachment"
+                    }],
+                    "@odata.nextLink": "https://graph.microsoft.com/v1.0/me/messages/draft-1/attachments?$skiptoken=next"
+                })),
+                graph_attachment_page(serde_json::json!({
+                    "value": [{
+                        "id": "old-2",
+                        "@odata.type": "#microsoft.graph.fileAttachment"
+                    }]
+                })),
+            ]),
+            requested_urls: Vec::new(),
+        };
+        let old_ids = collect_graph_attachment_pages(
+            &mut page_operations,
+            "https://graph.microsoft.com/v1.0/me/messages/draft-1/attachments",
+        )
+        .await
+        .unwrap()
+        .into_iter()
+        .filter(is_graph_file_attachment)
+        .map(|item| item.id)
+        .collect::<Vec<_>>();
+        let mut replacement_operations = FakeDraftAttachmentOperations::default();
+
+        replace_draft_attachment_set(&mut replacement_operations, &[], &old_ids)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            replacement_operations.events,
+            vec!["delete:old-1", "delete:old-2"]
+        );
+    }
+
+    #[tokio::test]
+    async fn graph_attachment_listing_rejects_untrusted_next_link_before_sending_token() {
+        for next_link in [
+            "http://graph.microsoft.com/v1.0/me/messages/1/attachments?$skiptoken=secret",
+            "https://graph.microsoft.com.evil.example/v1.0/me/messages/1/attachments?$skiptoken=secret",
+            "https://evil.example/v1.0/me/messages/1/attachments?$skiptoken=secret",
+            "https://graph.microsoft.com:444/v1.0/me/messages/1/attachments?$skiptoken=secret",
+            "https://attacker@graph.microsoft.com/v1.0/me/messages/1/attachments?$skiptoken=secret",
+            "https://graph.microsoft.com/v1.0/users/other/messages/1/attachments?$skiptoken=secret",
+        ] {
+            let mut operations = FakeGraphAttachmentPageOperations {
+                pages: VecDeque::from([graph_attachment_page(serde_json::json!({
+                    "value": [],
+                    "@odata.nextLink": next_link
+                }))]),
+                requested_urls: Vec::new(),
+            };
+
+            let error = collect_graph_attachment_pages(
+                &mut operations,
+                "https://graph.microsoft.com/v1.0/me/messages/1/attachments",
+            )
+            .await
+            .unwrap_err();
+
+            assert!(error.to_string().contains("untrusted Graph attachment nextLink"));
+            assert_eq!(operations.requested_urls.len(), 1);
+        }
+    }
 
     #[test]
     fn test_well_known_name_to_role_inbox() {
@@ -1424,6 +1917,178 @@ mod tests {
         assert!(attachment.name.starts_with("pebble-outlook-"));
         assert_eq!(attachment.content_type, "text/plain");
         assert_eq!(attachment.content_bytes, "aGVsbG8=");
+    }
+
+    #[derive(Default)]
+    struct FakeDraftAttachmentOperations {
+        events: Vec<String>,
+        upload_attempt: usize,
+        fail_upload_at: Option<usize>,
+        fail_delete_id: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl DraftAttachmentOperations for FakeDraftAttachmentOperations {
+        async fn upload(&mut self, attachment: &GraphFileAttachment) -> Result<String> {
+            let attempt = self.upload_attempt;
+            self.upload_attempt += 1;
+            self.events.push(format!("upload:{}", attachment.name));
+            if self.fail_upload_at == Some(attempt) {
+                return Err(PebbleError::Network(format!(
+                    "upload failed at attempt {attempt}"
+                )));
+            }
+            Ok(format!("new-{attempt}"))
+        }
+
+        async fn delete(&mut self, attachment_id: &str) -> Result<()> {
+            self.events.push(format!("delete:{attachment_id}"));
+            if self.fail_delete_id.as_deref() == Some(attachment_id) {
+                return Err(PebbleError::Network(format!(
+                    "delete failed for {attachment_id}"
+                )));
+            }
+            Ok(())
+        }
+    }
+
+    fn fake_graph_attachment(name: &str) -> GraphFileAttachment {
+        GraphFileAttachment {
+            odata_type: "#microsoft.graph.fileAttachment".to_string(),
+            name: name.to_string(),
+            content_type: "text/plain".to_string(),
+            content_bytes: "YQ==".to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn draft_attachment_replacement_uploads_every_new_item_before_deleting_old_items() {
+        let mut operations = FakeDraftAttachmentOperations::default();
+        let new_attachments = vec![
+            fake_graph_attachment("a.txt"),
+            fake_graph_attachment("b.txt"),
+        ];
+        let old_ids = vec!["old-1".to_string(), "old-2".to_string()];
+
+        replace_draft_attachment_set(&mut operations, &new_attachments, &old_ids)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            operations.events,
+            [
+                "upload:a.txt",
+                "upload:b.txt",
+                "delete:old-1",
+                "delete:old-2"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_attachment_upload_failure_rolls_back_new_items_without_deleting_old_items() {
+        let mut operations = FakeDraftAttachmentOperations {
+            fail_upload_at: Some(1),
+            ..Default::default()
+        };
+        let new_attachments = vec![
+            fake_graph_attachment("a.txt"),
+            fake_graph_attachment("b.txt"),
+        ];
+        let old_ids = vec!["old-1".to_string()];
+
+        let error = replace_draft_attachment_set(&mut operations, &new_attachments, &old_ids)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("upload failed at attempt 1"));
+        assert_eq!(
+            operations.events,
+            ["upload:a.txt", "upload:b.txt", "delete:new-0"]
+        );
+    }
+
+    #[tokio::test]
+    async fn draft_attachment_old_delete_failure_is_returned() {
+        let mut operations = FakeDraftAttachmentOperations {
+            fail_delete_id: Some("old-2".to_string()),
+            ..Default::default()
+        };
+        let new_attachments = vec![fake_graph_attachment("a.txt")];
+        let old_ids = vec!["old-1".to_string(), "old-2".to_string()];
+
+        let error = replace_draft_attachment_set(&mut operations, &new_attachments, &old_ids)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("delete failed for old-2"));
+        assert_eq!(
+            operations.events,
+            ["upload:a.txt", "delete:old-1", "delete:old-2"]
+        );
+    }
+
+    #[test]
+    fn draft_attachment_preparation_rejects_a_missing_file() {
+        let path = std::env::temp_dir().join(format!("pebble-outlook-missing-{}", new_id()));
+
+        let error = graph_file_attachments_from_paths(&[path.to_string_lossy().into_owned()])
+            .err()
+            .expect("missing attachment must be rejected")
+            .to_string();
+
+        assert!(error.contains("Failed to read attachment"));
+    }
+
+    #[derive(Default)]
+    struct FakeCreatedDraftCleanupOperations {
+        deleted_draft_ids: Vec<String>,
+        fail_delete: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CreatedDraftCleanupOperations for FakeCreatedDraftCleanupOperations {
+        async fn delete_created_draft(&mut self, draft_id: &str) -> Result<()> {
+            self.deleted_draft_ids.push(draft_id.to_string());
+            if self.fail_delete {
+                return Err(PebbleError::Network("draft cleanup failed".to_string()));
+            }
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn created_draft_attachment_failure_deletes_the_new_draft_and_returns_original_error() {
+        let mut cleanup = FakeCreatedDraftCleanupOperations::default();
+        let attachment_result = Err(PebbleError::Network("attachment upload failed".to_string()));
+
+        let error = finish_created_draft_attachments(&mut cleanup, "draft-1", attachment_result)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("attachment upload failed"));
+        assert_eq!(cleanup.deleted_draft_ids, ["draft-1"]);
+    }
+
+    #[tokio::test]
+    async fn created_draft_cleanup_failure_preserves_both_errors() {
+        let mut cleanup = FakeCreatedDraftCleanupOperations {
+            fail_delete: true,
+            ..Default::default()
+        };
+        let attachment_result = Err(PebbleError::Network("attachment upload failed".to_string()));
+
+        let error = finish_created_draft_attachments(&mut cleanup, "draft-1", attachment_result)
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(error.contains("attachment upload failed"));
+        assert!(error.contains("draft cleanup failed"));
+        assert_eq!(cleanup.deleted_draft_ids, ["draft-1"]);
     }
 
     #[test]

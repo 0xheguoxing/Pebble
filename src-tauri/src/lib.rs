@@ -227,8 +227,42 @@ fn take_pending_mailto_urls(state: tauri::State<PendingMailtoUrls>) -> Vec<Strin
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn should_prefer_wayland(
+    wayland_display: Option<&std::ffi::OsStr>,
+    gdk_backend: Option<&std::ffi::OsStr>,
+    is_appimage: bool,
+) -> bool {
+    wayland_display.is_some_and(|value| !value.is_empty())
+        && (gdk_backend.is_none()
+            || (is_appimage && gdk_backend == Some(std::ffi::OsStr::new("x11"))))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Prefer native Wayland when a Wayland compositor is available.
+    //
+    // Two cases:
+    // 1. No GDK_BACKEND set at all — safe to default to wayland.
+    // 2. AppImage: the bundled GTK plugin hardcodes GDK_BACKEND=x11 in
+    //    its AppRun hook (see tauri#8541).  Detect this via the APPDIR
+    //    env var and override the AppImage default so the app actually
+    //    runs on Wayland when a compositor is present.
+    // We do NOT override any other explicit GDK_BACKEND value (e.g. a
+    // user who intentionally set GDK_BACKEND=x11 outside of AppImage).
+    #[cfg(target_os = "linux")]
+    {
+        let wayland_display = std::env::var_os("WAYLAND_DISPLAY");
+        let gdk_backend = std::env::var_os("GDK_BACKEND");
+        if should_prefer_wayland(
+            wayland_display.as_deref(),
+            gdk_backend.as_deref(),
+            std::env::var_os("APPDIR").is_some(),
+        ) {
+            std::env::set_var("GDK_BACKEND", "wayland,x11");
+        }
+    }
+
     let mut builder = tauri::Builder::default();
 
     #[cfg(desktop)]
@@ -380,33 +414,17 @@ pub fn run() {
             let app_for_reindex = app_handle.clone();
             let reindex_handle = tauri::async_runtime::spawn_blocking(move || {
                 // 1. Process any pending search ops left over from a previous crash.
-                let pending = store_for_reindex.list_search_pending().unwrap_or_default();
-                if !pending.is_empty() {
-                    tracing::info!("Recovering {} pending search operations from previous session", pending.len());
-                    let mut ids_to_clear = Vec::with_capacity(pending.len());
-                    for (msg_id, op) in &pending {
-                        match op.as_str() {
-                            "remove" => {
-                                let _ = search_for_reindex.remove_message(msg_id);
-                            }
-                            _ => {
-                                match store_for_reindex.get_message(msg_id) {
-                                    Ok(Some(msg)) if !msg.is_deleted => {
-                                        let folder_ids = store_for_reindex.get_message_folder_ids(msg_id).unwrap_or_default();
-                                        if folder_ids.is_empty() {
-                                            let _ = search_for_reindex.remove_message(msg_id);
-                                        } else {
-                                            let _ = search_for_reindex.index_message(&msg, &folder_ids);
-                                        }
-                                    }
-                                    _ => { let _ = search_for_reindex.remove_message(msg_id); }
-                                }
-                            }
-                        }
-                        ids_to_clear.push(msg_id.clone());
-                    }
-                    let _ = search_for_reindex.commit();
-                    let _ = store_for_reindex.clear_search_pending(&ids_to_clear);
+                match commands::indexing::recover_pending_search_operations(
+                    &store_for_reindex,
+                    &search_for_reindex,
+                ) {
+                    Ok(recovered) if recovered > 0 => tracing::info!(
+                        "Recovered {recovered} pending search operations from previous session"
+                    ),
+                    Ok(_) => {}
+                    Err(error) => tracing::warn!(
+                        "Search recovery did not commit; pending operations were retained: {error}"
+                    ),
                 }
 
                 // 2. Full rebuild if schema changed or counts diverge.
@@ -434,11 +452,15 @@ pub fn run() {
                     match commands::indexing::do_reindex(&store_for_reindex, &search_for_reindex) {
                         Ok(n) => {
                             tracing::info!("Background reindex complete: {n} messages indexed");
+                            if let Err(error) = store_for_reindex.clear_all_search_pending() {
+                                tracing::warn!(
+                                    "Search rebuild committed but recovery markers could not be cleared: {error}"
+                                );
+                            }
                             let _ = app_for_reindex.emit("search:reindex-complete", n);
                         }
                         Err(e) => tracing::error!("Background reindex failed: {e}"),
                     }
-                    let _ = store_for_reindex.clear_all_search_pending();
                 }
             });
 
@@ -544,6 +566,7 @@ pub fn run() {
             commands::rules::delete_rule,
             commands::compose::send_email,
             commands::compose::stage_compose_attachment,
+            commands::compose::cleanup_staged_compose_attachment,
             commands::trusted_senders::trust_sender,
             commands::trusted_senders::list_trusted_senders,
             commands::trusted_senders::remove_trusted_sender,
@@ -602,6 +625,7 @@ pub fn run() {
             commands::user_data::delete_email_template,
             commands::user_data::get_email_signature,
             commands::user_data::set_email_signature,
+            commands::user_data::migrate_email_signature_if_absent,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
@@ -609,7 +633,8 @@ pub fn run() {
 
 #[cfg(test)]
 mod startup_timing_tests {
-    use super::startup_phase_timing;
+    use super::{should_prefer_wayland, startup_phase_timing};
+    use std::ffi::OsStr;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -623,5 +648,20 @@ mod startup_timing_tests {
         assert_eq!(timing.label, "search index opened");
         assert_eq!(timing.phase_ms, 175);
         assert_eq!(timing.total_ms, 250);
+    }
+
+    #[test]
+    fn wayland_preference_respects_display_backend_and_appimage_context() {
+        let display = Some(OsStr::new("wayland-0"));
+        let empty_display = Some(OsStr::new(""));
+        let x11 = Some(OsStr::new("x11"));
+        let wayland = Some(OsStr::new("wayland"));
+
+        assert!(!should_prefer_wayland(None, None, false));
+        assert!(!should_prefer_wayland(empty_display, None, false));
+        assert!(should_prefer_wayland(display, None, false));
+        assert!(!should_prefer_wayland(display, x11, false));
+        assert!(should_prefer_wayland(display, x11, true));
+        assert!(!should_prefer_wayland(display, wayland, true));
     }
 }

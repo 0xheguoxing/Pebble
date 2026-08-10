@@ -67,12 +67,20 @@ fn resolve_privacy_mode(
     match privacy_mode {
         PrivacyMode::Strict | PrivacyMode::LoadOnce => {
             match store.is_trusted_sender(&message.account_id, &message.from_address)? {
-                Some(TrustType::All) => Ok(PrivacyMode::TrustSender(message.from_address.clone())),
-                Some(TrustType::Images) => Ok(PrivacyMode::LoadOnce),
+                Some(TrustType::All | TrustType::Images) => Ok(PrivacyMode::LoadOnce),
                 None => Ok(privacy_mode),
             }
         }
-        PrivacyMode::TrustSender(_) | PrivacyMode::Off => Ok(privacy_mode),
+        PrivacyMode::TrustSender(sender)
+            if sender.eq_ignore_ascii_case(message.from_address.trim()) =>
+        {
+            match store.is_trusted_sender(&message.account_id, &message.from_address)? {
+                Some(TrustType::All | TrustType::Images) => Ok(PrivacyMode::LoadOnce),
+                None => Ok(PrivacyMode::Strict),
+            }
+        }
+        PrivacyMode::TrustSender(_) => Ok(PrivacyMode::Strict),
+        PrivacyMode::Off => Ok(PrivacyMode::Off),
     }
 }
 
@@ -167,13 +175,71 @@ mod tests {
     }
 
     #[test]
-    fn all_trusted_sender_overrides_relaxed_mode() {
+    fn persistent_all_trust_resolves_to_tracker_safe_image_loading() {
         let (store, message) = store_with_trusted_sender(TrustType::All);
 
         let mode = resolve_privacy_mode(&store, &message, PrivacyMode::LoadOnce).unwrap();
 
-        assert!(
-            matches!(mode, PrivacyMode::TrustSender(sender) if sender == "trusted@example.com")
-        );
+        assert!(matches!(mode, PrivacyMode::LoadOnce));
+    }
+
+    #[test]
+    fn sender_override_with_persistent_all_trust_stays_tracker_safe() {
+        let (store, message) = store_with_trusted_sender(TrustType::All);
+
+        let mode = resolve_privacy_mode(
+            &store,
+            &message,
+            PrivacyMode::TrustSender("trusted@example.com".to_string()),
+        )
+        .unwrap();
+
+        assert!(matches!(mode, PrivacyMode::LoadOnce));
+    }
+
+    #[test]
+    fn sender_override_cannot_be_reused_for_a_different_message_sender() {
+        let (store, mut message) = store_with_trusted_sender(TrustType::All);
+        message.from_address = "other@example.com".to_string();
+
+        let mode = resolve_privacy_mode(
+            &store,
+            &message,
+            PrivacyMode::TrustSender("trusted@example.com".to_string()),
+        )
+        .unwrap();
+
+        assert!(matches!(mode, PrivacyMode::Strict));
+    }
+
+    #[test]
+    fn matching_sender_override_is_rejected_without_persisted_trust() {
+        let store = Store::open_in_memory().unwrap();
+        let account = make_account("account-1");
+        store.insert_account(&account).unwrap();
+        let message = make_message(&account.id, "sender@example.com");
+
+        let mode = resolve_privacy_mode(
+            &store,
+            &message,
+            PrivacyMode::TrustSender("sender@example.com".to_string()),
+        )
+        .unwrap();
+
+        assert!(matches!(mode, PrivacyMode::Strict));
+    }
+
+    #[test]
+    fn images_only_trust_cannot_be_escalated_by_sender_override() {
+        let (store, message) = store_with_trusted_sender(TrustType::Images);
+
+        let mode = resolve_privacy_mode(
+            &store,
+            &message,
+            PrivacyMode::TrustSender("trusted@example.com".to_string()),
+        )
+        .unwrap();
+
+        assert!(matches!(mode, PrivacyMode::LoadOnce));
     }
 }

@@ -1,7 +1,11 @@
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import ComposeView from "../../../src/features/compose/ComposeView";
-import { deleteDraft } from "../../../src/lib/api";
+import {
+  cleanupStagedComposeAttachment,
+  deleteDraft,
+  stageComposeAttachment,
+} from "../../../src/lib/api";
 
 const mocks = vi.hoisted(() => ({
   mutate: vi.fn(),
@@ -9,7 +13,17 @@ const mocks = vi.hoisted(() => ({
   setComposeDirty: vi.fn(),
   addToast: vi.fn(),
   loadDraftFromStorage: vi.fn(),
+  cancelPendingDraftSaves: vi.fn(),
+  confirmCloseCompose: vi.fn(),
+  cancelCloseCompose: vi.fn(),
+  showComposeLeaveConfirm: false,
   quotedReplyHtml: "",
+  accountsQuery: {
+    data: [{ id: "account-1", email: "me@example.com", display_name: "Me" }],
+    isLoading: false,
+    isSuccess: true,
+    isError: false,
+  },
   recipients: {
     to: ["to@example.com"] as string[],
     cc: [] as string[],
@@ -40,9 +54,9 @@ vi.mock("../../../src/stores/compose.store", () => ({
         composeMode: "new",
         composeReplyTo: null,
         closeCompose: mocks.closeCompose,
-        showComposeLeaveConfirm: false,
-        confirmCloseCompose: vi.fn(),
-        cancelCloseCompose: vi.fn(),
+        showComposeLeaveConfirm: mocks.showComposeLeaveConfirm,
+        confirmCloseCompose: mocks.confirmCloseCompose,
+        cancelCloseCompose: mocks.cancelCloseCompose,
       }),
     {
       getState: () => ({ setComposeDirty: mocks.setComposeDirty }),
@@ -51,9 +65,7 @@ vi.mock("../../../src/stores/compose.store", () => ({
 }));
 
 vi.mock("../../../src/hooks/queries", () => ({
-  useAccountsQuery: () => ({
-    data: [{ id: "account-1", email: "me@example.com", display_name: "Me" }],
-  }),
+  useAccountsQuery: () => mocks.accountsQuery,
 }));
 
 vi.mock("../../../src/hooks/mutations", () => ({
@@ -84,6 +96,7 @@ vi.mock("../../../src/hooks/useComposeDraft", () => ({
   useComposeDraft: () => ({
     draftIdRef: { current: "draft-1" },
     draftIdsByAccountRef: { current: { "account-1": "draft-1" } },
+    cancelPendingDraftSaves: mocks.cancelPendingDraftSaves,
   }),
   loadDraftFromStorage: mocks.loadDraftFromStorage,
   clearDraftStorage: vi.fn(),
@@ -171,8 +184,26 @@ vi.mock("../../../src/stores/toast.store", () => ({
 }));
 
 vi.mock("../../../src/lib/api", () => ({
+  cleanupStagedComposeAttachment: vi.fn(),
   deleteDraft: vi.fn(),
+  stageComposeAttachment: vi.fn(),
 }));
+
+function attachmentFile(name: string, contents = name): File {
+  const file = new File([contents], name);
+  Object.defineProperty(file, "arrayBuffer", {
+    value: vi.fn().mockResolvedValue(new TextEncoder().encode(contents).buffer),
+  });
+  return file;
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((res) => {
+    resolve = res;
+  });
+  return { promise, resolve };
+}
 
 describe("ComposeView", () => {
   let warnSpy: ReturnType<typeof vi.spyOn>;
@@ -184,12 +215,26 @@ describe("ComposeView", () => {
     mocks.setComposeDirty.mockReset();
     mocks.addToast.mockReset();
     mocks.loadDraftFromStorage.mockReset();
+    mocks.cancelPendingDraftSaves.mockReset();
+    mocks.cancelPendingDraftSaves.mockResolvedValue({ "account-1": "draft-1" });
+    mocks.confirmCloseCompose.mockReset();
+    mocks.cancelCloseCompose.mockReset();
+    mocks.showComposeLeaveConfirm = false;
     mocks.quotedReplyHtml = "";
+    mocks.accountsQuery.data = [{ id: "account-1", email: "me@example.com", display_name: "Me" }];
+    mocks.accountsQuery.isLoading = false;
+    mocks.accountsQuery.isSuccess = true;
+    mocks.accountsQuery.isError = false;
     mocks.recipients.to = ["to@example.com"];
     mocks.recipients.cc = [];
     mocks.recipients.bcc = [];
     mocks.loadDraftFromStorage.mockReturnValue(null);
     vi.mocked(deleteDraft).mockReset();
+    vi.mocked(deleteDraft).mockResolvedValue(undefined);
+    vi.mocked(cleanupStagedComposeAttachment).mockReset();
+    vi.mocked(cleanupStagedComposeAttachment).mockResolvedValue(undefined);
+    vi.mocked(stageComposeAttachment).mockReset();
+    vi.mocked(stageComposeAttachment).mockImplementation(async (filename) => `staged/${filename}`);
   });
 
   afterEach(() => {
@@ -209,10 +254,38 @@ describe("ComposeView", () => {
     })));
   });
 
+  it("prevents duplicate sends while successful-send cleanup is pending", async () => {
+    const pendingDeletion = deferred<void>();
+    vi.mocked(deleteDraft).mockReturnValue(pendingDeletion.promise);
+    mocks.mutate.mockImplementation((_params, options) => options.onSuccess());
+
+    render(<ComposeView />);
+    const sendButton = screen.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+    fireEvent.click(sendButton);
+    await waitFor(() => expect(mocks.mutate).toHaveBeenCalledOnce());
+    fireEvent.click(sendButton);
+
+    expect(mocks.mutate).toHaveBeenCalledOnce();
+    expect(sendButton.disabled).toBe(true);
+
+    await act(async () => pendingDeletion.resolve());
+    await waitFor(() => expect(mocks.closeCompose).toHaveBeenCalledOnce());
+  });
+
   it("validates a restored new-message draft against loaded account ids", () => {
     render(<ComposeView />);
 
     expect(mocks.loadDraftFromStorage).toHaveBeenCalledWith(["account-1"]);
+  });
+
+  it("preserves a legacy draft when the accounts query fails", () => {
+    mocks.accountsQuery.data = [];
+    mocks.accountsQuery.isSuccess = false;
+    mocks.accountsQuery.isError = true;
+
+    render(<ComposeView />);
+
+    expect(mocks.loadDraftFromStorage).toHaveBeenCalledWith(undefined);
   });
 
   it("sends a typed valid recipient without requiring Enter first", async () => {
@@ -247,5 +320,286 @@ describe("ComposeView", () => {
     fireEvent.click(screen.getByRole("button", { name: "Show quoted message" }));
 
     expect(screen.getByText("Original message body")).toBeTruthy();
+  });
+
+  it("uses the first attached filename as an empty subject", async () => {
+    render(<ComposeView />);
+
+    const first = attachmentFile("季度报告.pdf", "quarterly results");
+    const second = attachmentFile("supporting-data.xlsx", "supporting data");
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    fireEvent.change(fileInput!, { target: { files: [first, second] } });
+
+    await waitFor(() => expect(vi.mocked(stageComposeAttachment)).toHaveBeenCalledTimes(2));
+    await waitFor(() => expect((screen.getByLabelText("Subject") as HTMLInputElement).value)
+      .toBe("季度报告.pdf"));
+  });
+
+  it("does not let a later concurrent attachment refill a subject the user cleared", async () => {
+    let resolveFirst!: (path: string) => void;
+    let resolveSecond!: (path: string) => void;
+    vi.mocked(stageComposeAttachment).mockImplementation((filename) => new Promise((resolve) => {
+      if (filename === "first.pdf") resolveFirst = resolve;
+      if (filename === "second.pdf") resolveSecond = resolve;
+    }));
+
+    render(<ComposeView />);
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    const subjectInput = screen.getByLabelText("Subject") as HTMLInputElement;
+    expect(fileInput).not.toBeNull();
+
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("first.pdf")] } });
+    await waitFor(() => expect(stageComposeAttachment).toHaveBeenCalledWith("first.pdf", expect.any(Array)));
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("second.pdf")] } });
+    await waitFor(() => expect(stageComposeAttachment).toHaveBeenCalledWith("second.pdf", expect.any(Array)));
+
+    await act(async () => resolveFirst("staged/first.pdf"));
+    await waitFor(() => expect(subjectInput.value).toBe("first.pdf"));
+    fireEvent.change(subjectInput, { target: { value: "" } });
+
+    await act(async () => resolveSecond("staged/second.pdf"));
+    await waitFor(() => expect(screen.getByText("second.pdf")).toBeTruthy());
+    expect(subjectInput.value).toBe("");
+  });
+
+  it("keeps successfully staged files when a later file in the batch fails", async () => {
+    vi.mocked(stageComposeAttachment)
+      .mockResolvedValueOnce("staged/first.pdf")
+      .mockRejectedValueOnce(new Error("staging failed"));
+
+    render(<ComposeView />);
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    expect(fileInput).not.toBeNull();
+    fireEvent.change(fileInput!, {
+      target: { files: [attachmentFile("first.pdf"), attachmentFile("broken.pdf")] },
+    });
+
+    await waitFor(() => expect(screen.getByText("first.pdf")).toBeTruthy());
+    expect(screen.queryByText("broken.pdf")).toBeNull();
+    expect((screen.getByLabelText("Subject") as HTMLInputElement).value).toBe("first.pdf");
+    expect(screen.getByRole("alert").textContent).toContain("Failed to attach file");
+  });
+
+  it("disables send until attachment staging finishes and sends the staged path", async () => {
+    const pendingStage = deferred<string>();
+    vi.mocked(stageComposeAttachment).mockReturnValue(pendingStage.promise);
+    render(<ComposeView />);
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("slow.pdf")] } });
+    await waitFor(() => expect(stageComposeAttachment)
+      .toHaveBeenCalledWith("slow.pdf", expect.any(Array)));
+
+    const sendButton = screen.getByRole("button", { name: "Send" }) as HTMLButtonElement;
+    expect(sendButton.disabled).toBe(true);
+    expect(mocks.mutate).not.toHaveBeenCalled();
+
+    await act(async () => pendingStage.resolve("staged/slow.pdf"));
+    await waitFor(() => expect(sendButton.disabled).toBe(false));
+    fireEvent.click(sendButton);
+
+    await waitFor(() => expect(mocks.mutate).toHaveBeenCalledWith(
+      expect.objectContaining({ attachmentPaths: ["staged/slow.pdf"] }),
+      expect.any(Object),
+    ));
+  });
+
+  it("disables discard until attachment staging finishes, then cleans the staged path", async () => {
+    const pendingStage = deferred<string>();
+    vi.mocked(stageComposeAttachment).mockReturnValue(pendingStage.promise);
+    mocks.showComposeLeaveConfirm = true;
+    render(<ComposeView />);
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("slow-discard.pdf")] } });
+    await waitFor(() => expect(stageComposeAttachment)
+      .toHaveBeenCalledWith("slow-discard.pdf", expect.any(Array)));
+
+    const discardButton = screen.getByRole("button", { name: "Discard" }) as HTMLButtonElement;
+    expect(discardButton.disabled).toBe(true);
+    await act(async () => pendingStage.resolve("staged/slow-discard.pdf"));
+    await waitFor(() => expect(discardButton.disabled).toBe(false));
+    fireEvent.click(discardButton);
+
+    await waitFor(() => expect(cleanupStagedComposeAttachment)
+      .toHaveBeenCalledWith("staged/slow-discard.pdf"));
+    await waitFor(() => expect(mocks.confirmCloseCompose).toHaveBeenCalledOnce());
+  });
+
+  it("cleans an attachment that finishes staging after the compose view unmounts", async () => {
+    const pendingStage = deferred<string>();
+    vi.mocked(stageComposeAttachment).mockReturnValue(pendingStage.promise);
+    const { unmount } = render(<ComposeView />);
+
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("late.pdf")] } });
+    await waitFor(() => expect(stageComposeAttachment)
+      .toHaveBeenCalledWith("late.pdf", expect.any(Array)));
+    unmount();
+
+    await act(async () => pendingStage.resolve("staged/late.pdf"));
+    await waitFor(() => expect(cleanupStagedComposeAttachment)
+      .toHaveBeenCalledWith("staged/late.pdf"));
+  });
+
+  it("deletes a staged file when the attachment is removed", async () => {
+    render(<ComposeView />);
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("remove-me.pdf")] } });
+    await waitFor(() => expect(screen.getByText("remove-me.pdf")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: /Remove attachment/ }));
+
+    await waitFor(() => expect(cleanupStagedComposeAttachment)
+      .toHaveBeenCalledWith("staged/remove-me.pdf"));
+    expect(screen.queryByText("remove-me.pdf")).toBeNull();
+  });
+
+  it("deletes autosaved drafts and staged files before confirming discard", async () => {
+    const { rerender } = render(<ComposeView />);
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("discard-me.pdf")] } });
+    await waitFor(() => expect(screen.getByText("discard-me.pdf")).toBeTruthy());
+
+    mocks.showComposeLeaveConfirm = true;
+    rerender(<ComposeView />);
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+
+    await waitFor(() => expect(mocks.cancelPendingDraftSaves).toHaveBeenCalledOnce());
+    await waitFor(() => expect(deleteDraft).toHaveBeenCalledWith("account-1", "draft-1"));
+    await waitFor(() => expect(cleanupStagedComposeAttachment)
+      .toHaveBeenCalledWith("staged/discard-me.pdf"));
+    await waitFor(() => expect(mocks.confirmCloseCompose).toHaveBeenCalledOnce());
+  });
+
+  it("cleans restored compose-staging attachments when discarding a legacy draft", async () => {
+    mocks.loadDraftFromStorage.mockReturnValue({
+      accountId: "account-1",
+      to: ["to@example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Restored",
+      rawSource: "",
+      richTextHtml: "<p>Restored</p>",
+      editorMode: "rich",
+      attachments: [{ name: "restored.pdf", path: "staged/restored.pdf", size: 42 }],
+      savedAt: Date.now(),
+    });
+    mocks.showComposeLeaveConfirm = true;
+    render(<ComposeView />);
+
+    expect(screen.getByText("restored.pdf")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+
+    await waitFor(() => expect(cleanupStagedComposeAttachment)
+      .toHaveBeenCalledWith("staged/restored.pdf"));
+  });
+
+  it("does not delete a restored attachment source on ordinary unmount", async () => {
+    mocks.loadDraftFromStorage.mockReturnValue({
+      accountId: "account-1",
+      to: ["to@example.com"],
+      cc: [],
+      bcc: [],
+      subject: "Restored",
+      rawSource: "",
+      richTextHtml: "<p>Restored</p>",
+      editorMode: "rich",
+      attachments: [{ name: "restored.pdf", path: "staged/restored.pdf", size: 42 }],
+      savedAt: Date.now(),
+    });
+    const { unmount } = render(<ComposeView />);
+
+    unmount();
+    await act(async () => Promise.resolve());
+
+    expect(cleanupStagedComposeAttachment).not.toHaveBeenCalled();
+  });
+
+  it("waits for autosave and draft deletion before cleaning staged files", async () => {
+    const pendingCancellation = deferred<Record<string, string>>();
+    const pendingDeletion = deferred<void>();
+    mocks.cancelPendingDraftSaves.mockReturnValue(pendingCancellation.promise);
+    vi.mocked(deleteDraft).mockReturnValue(pendingDeletion.promise);
+
+    const { rerender } = render(<ComposeView />);
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("in-flight.pdf")] } });
+    await waitFor(() => expect(screen.getByText("in-flight.pdf")).toBeTruthy());
+
+    mocks.showComposeLeaveConfirm = true;
+    rerender(<ComposeView />);
+    fireEvent.click(screen.getByRole("button", { name: "Discard" }));
+
+    expect(cleanupStagedComposeAttachment).not.toHaveBeenCalled();
+    await act(async () => pendingCancellation.resolve({ "account-1": "draft-1" }));
+    await waitFor(() => expect(deleteDraft).toHaveBeenCalledWith("account-1", "draft-1"));
+    expect(cleanupStagedComposeAttachment).not.toHaveBeenCalled();
+
+    await act(async () => pendingDeletion.resolve());
+    await waitFor(() => expect(cleanupStagedComposeAttachment)
+      .toHaveBeenCalledWith("staged/in-flight.pdf"));
+  });
+
+  it("traps focus in the discard dialog and restores the opener after Escape", () => {
+    const { rerender } = render(<ComposeView />);
+    const backButton = screen.getByRole("button", { name: "Back" });
+    backButton.focus();
+
+    mocks.showComposeLeaveConfirm = true;
+    rerender(<ComposeView />);
+
+    const keepEditingButton = screen.getByRole("button", { name: "Keep editing" });
+    const discardButton = screen.getByRole("button", { name: "Discard" });
+    expect(document.activeElement).toBe(keepEditingButton);
+
+    fireEvent.keyDown(document, { key: "Tab", shiftKey: true });
+    expect(document.activeElement).toBe(discardButton);
+    fireEvent.keyDown(document, { key: "Tab" });
+    expect(document.activeElement).toBe(keepEditingButton);
+
+    fireEvent.keyDown(document, { key: "Escape" });
+    expect(mocks.cancelCloseCompose).toHaveBeenCalledOnce();
+    mocks.showComposeLeaveConfirm = false;
+    rerender(<ComposeView />);
+    expect(document.activeElement).toBe(backButton);
+  });
+
+  it("ignores repeated discard actions while cleanup is pending", async () => {
+    const pendingCancellation = deferred<Record<string, string>>();
+    mocks.cancelPendingDraftSaves.mockReturnValue(pendingCancellation.promise);
+    mocks.showComposeLeaveConfirm = true;
+    render(<ComposeView />);
+
+    const discardButton = screen.getByRole("button", { name: "Discard" });
+    fireEvent.click(discardButton);
+    fireEvent.click(discardButton);
+
+    expect(mocks.cancelPendingDraftSaves).toHaveBeenCalledOnce();
+    fireEvent.click(screen.getByRole("button", { name: "Keep editing" }));
+    expect(mocks.cancelCloseCompose).not.toHaveBeenCalled();
+
+    await act(async () => {
+      pendingCancellation.resolve({ "account-1": "draft-1" });
+      await pendingCancellation.promise;
+    });
+    await waitFor(() => expect(mocks.confirmCloseCompose).toHaveBeenCalledOnce());
+  });
+
+  it("cleans staged files after a successful send", async () => {
+    mocks.mutate.mockImplementation((_params, options) => options.onSuccess());
+    render(<ComposeView />);
+    const fileInput = document.querySelector<HTMLInputElement>('input[type="file"]');
+    fireEvent.change(fileInput!, { target: { files: [attachmentFile("sent.pdf")] } });
+    await waitFor(() => expect(screen.getByText("sent.pdf")).toBeTruthy());
+
+    fireEvent.click(screen.getByRole("button", { name: "Send" }));
+
+    await waitFor(() => expect(cleanupStagedComposeAttachment)
+      .toHaveBeenCalledWith("staged/sent.pdf"));
   });
 });
