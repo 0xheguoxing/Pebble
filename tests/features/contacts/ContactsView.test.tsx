@@ -22,7 +22,25 @@ vi.mock("react-i18next", () => ({
     init: vi.fn(),
   },
   useTranslation: () => ({
-    t: (_key: string, fallback?: string) => fallback ?? _key,
+    t: (key: string, fallbackOrOptions?: string | { count?: number; defaultValue?: string }) => {
+      if (key === "contacts.count" && typeof fallbackOrOptions === "object") {
+        return `translated count ${fallbackOrOptions.count}`;
+      }
+      if (typeof fallbackOrOptions === "string") return fallbackOrOptions;
+      return fallbackOrOptions?.defaultValue ?? key;
+    },
+  }),
+}));
+
+vi.mock("@tanstack/react-virtual", () => ({
+  useVirtualizer: ({ count }: { count: number }) => ({
+    getTotalSize: () => count * 60,
+    getVirtualItems: () => Array.from(
+      { length: Math.min(count, 10) },
+      (_, index) => ({ index, key: `contact-row-${index}`, start: index * 60 }),
+    ),
+    measureElement: vi.fn(),
+    scrollToIndex: vi.fn(),
   }),
 }));
 
@@ -59,6 +77,19 @@ const alice: Contact = {
   created_at: 1,
   updated_at: 1,
 };
+
+function contact(index: number): Contact {
+  return {
+    ...alice,
+    id: `contact-${index}`,
+    display_name: `Contact ${index}`,
+    emails: [{
+      ...alice.emails[0],
+      id: `email-${index}`,
+      address: `contact-${index}@example.com`,
+    }],
+  };
+}
 
 describe("ContactsView", () => {
   beforeEach(() => {
@@ -113,6 +144,15 @@ describe("ContactsView", () => {
       favoriteOnly: true,
       limit: Number.MAX_SAFE_INTEGER,
     }));
+  });
+
+  it("uses the translated count and only mounts virtualized contact rows", () => {
+    mocks.contacts = Array.from({ length: 100 }, (_, index) => contact(index));
+
+    render(<ContactsView />);
+
+    expect(screen.getByLabelText("translated count 100")).toBeTruthy();
+    expect(screen.getAllByRole("listitem")).toHaveLength(10);
   });
 
   it("opens contact details and composes to the primary email", () => {
@@ -171,6 +211,7 @@ describe("ContactsView", () => {
     expect(document.body.textContent).toContain("1 created");
     expect(document.body.textContent).toContain("2 merged");
     expect(document.body.textContent).toContain("4 invalid");
+    expect(document.body.textContent).toContain("Card 4: invalid email");
   });
 
   it("exports saved contacts as a vCard download", async () => {

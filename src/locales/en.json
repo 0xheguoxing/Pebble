@@ -568,6 +568,7 @@
     "emailRequired": "Add at least one email address",
     "primaryRequired": "Choose exactly one primary email",
     "duplicateEmail": "Each email address can only be added once",
+    "nameTooLong": "Name must be 512 characters or fewer",
     "notesTooLong": "Notes must be 2000 characters or fewer",
     "back": "Back to contacts",
     "count": "{{count}} contacts",

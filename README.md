@@ -63,7 +63,7 @@ Pebble currently supports Gmail, IMAP, POP3, and experimental Outlook accounts.
 
 - Local address book with search, favorites, notes, multiple labeled email addresses, and one-click contact actions from message participants.
 - Recipient autocomplete that prioritizes saved contacts and falls back to recent correspondents.
-- vCard (`.vcf`) import and export for moving contacts between Pebble and other address books.
+- vCard (`.vcf`) import and export for moving contacts between Pebble and other address books. Re-imports merge by normalized email; existing non-empty local names and notes take precedence over imported values.
 - Kanban board with Todo, Waiting, and Done columns.
 - Command palette and keyboard-first navigation.
 - Built-in translation providers with bilingual reading and customizable shortcuts (`T` to translate selection, `Ctrl+Shift+T` to toggle bilingual view).

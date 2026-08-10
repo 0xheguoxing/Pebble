@@ -1237,7 +1237,7 @@ textarea:focus-visible {
 }
 
 .contact-list {
-  padding: 7px;
+  padding: 0;
 }
 
 .contact-list-item {
@@ -1544,17 +1544,16 @@ textarea:focus-visible {
 }
 
 .contact-danger-button {
-  border: 1px solid color-mix(in srgb, #dc2626 30%, var(--color-border));
+  border: 1px solid color-mix(in srgb, var(--color-danger) 30%, var(--color-border));
   background: transparent;
-  color: #dc2626;
+  color: var(--color-danger);
 }
 
 .contact-danger-button:hover {
-  background: color-mix(in srgb, #dc2626 8%, transparent);
+  background: color-mix(in srgb, var(--color-danger) 8%, transparent);
 }
 
-.contact-text-button,
-.contact-inline-danger {
+.contact-text-button {
   padding: 4px 0;
   border: 0;
   background: transparent;
@@ -1562,7 +1561,10 @@ textarea:focus-visible {
 }
 
 .contact-inline-danger {
-  color: var(--color-text-secondary);
+  padding: 4px 0;
+  border: 0;
+  background: transparent;
+  color: var(--color-danger);
   font-size: 11px;
   font-weight: 500;
 }
@@ -1705,9 +1707,9 @@ textarea:focus-visible {
 .contact-form-error {
   margin: 14px 0 0;
   padding: 9px 10px;
-  border-left: 3px solid #dc2626;
-  background: color-mix(in srgb, #dc2626 7%, transparent);
-  color: #dc2626;
+  border-left: 3px solid var(--color-danger);
+  background: color-mix(in srgb, var(--color-danger) 7%, transparent);
+  color: var(--color-danger);
   font-size: 12px;
 }
 

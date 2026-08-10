@@ -188,6 +188,10 @@ export default function ContactAutocomplete({
           ? (activeSuggestion?.source === "recent" ? activeSuggestion : undefined)
           : suggestions.find((suggestion) => suggestion.source === "recent");
         if (e.key === "Tab" && showDropdown && removableSuggestion) {
+          // Keep the recent-only removal control from being converted into a chip,
+          // while deliberately leaving Tab uncancelled so focus advances normally.
+          setShowDropdown(false);
+          setActiveIndex(-1);
           return;
         }
         e.preventDefault();

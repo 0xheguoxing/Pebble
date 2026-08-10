@@ -22,7 +22,24 @@ interface DraftEmail extends ContactEmailInput {
   key: string;
 }
 
+type ErrorField = "name" | "emails" | "notes" | "form";
+
+interface FormError {
+  field: ErrorField;
+  message: string;
+}
+
 let draftEmailId = 0;
+const CONTACT_EDITOR_ERROR_ID = "contact-editor-error";
+
+function getFocusableElements(container: HTMLElement | null): HTMLElement[] {
+  if (!container) return [];
+  return Array.from(
+    container.querySelectorAll<HTMLElement>(
+      'button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])',
+    ),
+  ).filter((element) => !element.hasAttribute("disabled"));
+}
 
 function makeDraftEmail(email?: Contact["emails"][number], initialAddress = ""): DraftEmail {
   return {
@@ -41,7 +58,10 @@ export default function ContactEditorDialog({
   onSave,
 }: ContactEditorDialogProps) {
   const { t } = useTranslation();
+  const dialogRef = useRef<HTMLElement>(null);
   const nameRef = useRef<HTMLInputElement>(null);
+  const onCloseRef = useRef(onClose);
+  const isSavingRef = useRef(false);
   const [displayName, setDisplayName] = useState(
     contact?.display_name ?? initialValue?.displayName ?? "",
   );
@@ -52,24 +72,47 @@ export default function ContactEditorDialog({
       ? contact.emails.map((email) => makeDraftEmail(email))
       : [makeDraftEmail(undefined, initialValue?.address ?? "")],
   );
-  const [error, setError] = useState<string | null>(null);
+  const [error, setError] = useState<FormError | null>(null);
   const [isSaving, setIsSaving] = useState(false);
 
   const title = contact
     ? t("contacts.edit", "Edit contact")
     : t("contacts.new", "New contact");
 
-  useEffect(() => {
-    nameRef.current?.focus();
-  }, []);
+  useEffect(() => { onCloseRef.current = onClose; }, [onClose]);
+  useEffect(() => { isSavingRef.current = isSaving; }, [isSaving]);
 
   useEffect(() => {
+    const previousFocus =
+      document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    nameRef.current?.focus();
+
     const handleKeyDown = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        if (!isSavingRef.current) {
+          event.preventDefault();
+          onCloseRef.current();
+        }
+        return;
+      }
+      if (event.key !== "Tab") return;
+
+      const focusable = getFocusableElements(dialogRef.current);
+      if (focusable.length === 0) return;
+
+      const currentIndex = focusable.indexOf(document.activeElement as HTMLElement);
+      const nextIndex = event.shiftKey
+        ? (currentIndex <= 0 ? focusable.length - 1 : currentIndex - 1)
+        : (currentIndex === focusable.length - 1 ? 0 : currentIndex + 1);
+      event.preventDefault();
+      focusable[nextIndex]?.focus();
     };
     document.addEventListener("keydown", handleKeyDown);
-    return () => document.removeEventListener("keydown", handleKeyDown);
-  }, [onClose]);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, []);
 
   const updateEmail = (key: string, patch: Partial<DraftEmail>) => {
     setEmails((current) => current.map((email) => (
@@ -101,20 +144,43 @@ export default function ContactEditorDialog({
     });
   };
 
-  const validate = () => {
-    if (emails.length === 0) return t("contacts.emailRequired", "Add at least one email address");
+  const validate = (): FormError | null => {
+    if (displayName.trim().length > 512) {
+      return {
+        field: "name",
+        message: t("contacts.nameTooLong", "Name must be 512 characters or fewer"),
+      };
+    }
+    if (emails.length === 0) {
+      return {
+        field: "emails",
+        message: t("contacts.emailRequired", "Add at least one email address"),
+      };
+    }
     if (emails.some((email) => !isValidEmailAddress(email.address))) {
-      return t("contacts.invalidEmail", "Enter a valid email address");
+      return {
+        field: "emails",
+        message: t("contacts.invalidEmail", "Enter a valid email address"),
+      };
     }
     if (emails.filter((email) => email.is_primary).length !== 1) {
-      return t("contacts.primaryRequired", "Choose exactly one primary email");
+      return {
+        field: "emails",
+        message: t("contacts.primaryRequired", "Choose exactly one primary email"),
+      };
     }
     const normalized = emails.map((email) => email.address.trim().toLowerCase());
     if (new Set(normalized).size !== normalized.length) {
-      return t("contacts.duplicateEmail", "Each email address can only be added once");
+      return {
+        field: "emails",
+        message: t("contacts.duplicateEmail", "Each email address can only be added once"),
+      };
     }
     if (notes.trim().length > 2000) {
-      return t("contacts.notesTooLong", "Notes must be 2000 characters or fewer");
+      return {
+        field: "notes",
+        message: t("contacts.notesTooLong", "Notes must be 2000 characters or fewer"),
+      };
     }
     return null;
   };
@@ -143,7 +209,7 @@ export default function ContactEditorDialog({
         })),
       });
     } catch (saveError) {
-      setError(extractErrorMessage(saveError));
+      setError({ field: "form", message: extractErrorMessage(saveError) });
     } finally {
       setIsSaving(false);
     }
@@ -154,6 +220,7 @@ export default function ContactEditorDialog({
       if (event.target === event.currentTarget && !isSaving) onClose();
     }}>
       <section
+        ref={dialogRef}
         className="contact-dialog"
         role="dialog"
         aria-modal="true"
@@ -186,12 +253,19 @@ export default function ContactEditorDialog({
                 id="contact-name"
                 style={inputStyle}
                 value={displayName}
+                maxLength={512}
+                aria-invalid={error?.field === "name" || undefined}
+                aria-describedby={error?.field === "name" ? CONTACT_EDITOR_ERROR_ID : undefined}
                 onChange={(event) => setDisplayName(event.target.value)}
                 autoComplete="name"
               />
             </div>
 
-            <fieldset className="contact-email-fieldset">
+            <fieldset
+              className="contact-email-fieldset"
+              aria-invalid={error?.field === "emails" || undefined}
+              aria-describedby={error?.field === "emails" ? CONTACT_EDITOR_ERROR_ID : undefined}
+            >
               <legend>{t("contacts.emailAddress", "Email address")}</legend>
               <div className="contact-email-stack">
                 {emails.map((email, index) => {
@@ -209,6 +283,10 @@ export default function ContactEditorDialog({
                             style={inputStyle}
                             type="email"
                             value={email.address}
+                            aria-invalid={error?.field === "emails" || undefined}
+                            aria-describedby={error?.field === "emails"
+                              ? CONTACT_EDITOR_ERROR_ID
+                              : undefined}
                             onChange={(event) => updateEmail(email.key, { address: event.target.value })}
                             autoComplete="email"
                           />
@@ -271,7 +349,9 @@ export default function ContactEditorDialog({
                 id="contact-notes"
                 style={{ ...inputStyle, minHeight: 86, resize: "vertical" }}
                 value={notes}
-                maxLength={2001}
+                maxLength={2000}
+                aria-invalid={error?.field === "notes" || undefined}
+                aria-describedby={error?.field === "notes" ? CONTACT_EDITOR_ERROR_ID : undefined}
                 onChange={(event) => setNotes(event.target.value)}
               />
               <span className="contact-character-count">{notes.length}/2000</span>
@@ -286,7 +366,11 @@ export default function ContactEditorDialog({
               {t("contacts.favorite", "Favorite contact")}
             </label>
 
-            {error && <p className="contact-form-error" role="alert">{error}</p>}
+            {error && (
+              <p id={CONTACT_EDITOR_ERROR_ID} className="contact-form-error" role="alert">
+                {error.message}
+              </p>
+            )}
           </div>
 
           <footer className="contact-dialog-footer">

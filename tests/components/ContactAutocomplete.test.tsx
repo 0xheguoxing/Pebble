@@ -189,7 +189,7 @@ describe("ContactAutocomplete", () => {
     expect(onChange).not.toHaveBeenCalled();
   });
 
-  it("keeps the recent-suggestion removal action outside options and reachable from the combobox", async () => {
+  it("lets Tab leave a recent suggestion without committing it", async () => {
     vi.mocked(searchContactSuggestions).mockResolvedValue([{
       contact_id: null,
       name: "Alex",
@@ -208,5 +208,6 @@ describe("ContactAutocomplete", () => {
 
     expect(removeButton.closest('[role="option"]')).toBeNull();
     expect(fireEvent.keyDown(input, { key: "Tab" })).toBe(true);
+    expect(input.getAttribute("aria-expanded")).toBe("false");
   });
 });

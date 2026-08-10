@@ -13,6 +13,7 @@ import {
   X,
 } from "lucide-react";
 import { useTranslation } from "react-i18next";
+import { useVirtualizer } from "@tanstack/react-virtual";
 import {
   contactSuggestionsQueryRoot,
   contactsQueryRoot,
@@ -52,6 +53,7 @@ export default function ContactsView() {
   const [isImporting, setIsImporting] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const listPaneRef = useRef<HTMLDivElement>(null);
   const { data = EMPTY_CONTACTS, isLoading, error, refetch } = useContactsQuery({
     query,
     favoriteOnly,
@@ -59,6 +61,14 @@ export default function ContactsView() {
     offset: 0,
   });
   const contacts = data;
+  const contactListVirtualizer = useVirtualizer({
+    count: contacts.length,
+    getScrollElement: () => listPaneRef.current,
+    estimateSize: () => 60,
+    measureElement: (element) => element.getBoundingClientRect().height,
+    getItemKey: (index) => contacts[index]?.id ?? index,
+    overscan: 8,
+  });
   const { save, remove, setFavorite } = useContactMutations();
   const addToast = useToastStore((state) => state.addToast);
   const confirm = useConfirmStore((state) => state.confirm);
@@ -75,6 +85,12 @@ export default function ContactsView() {
       setSelectedId(null);
     }
   }, [contacts, selectedId]);
+
+  useEffect(() => {
+    if (!selectedId) return;
+    const index = contacts.findIndex((contact) => contact.id === selectedId);
+    if (index >= 0) contactListVirtualizer.scrollToIndex(index, { align: "auto" });
+  }, [contactListVirtualizer, contacts, selectedId]);
 
   useEffect(() => {
     if (!pendingContactId) return;
@@ -210,7 +226,10 @@ export default function ContactsView() {
           <span className="contacts-eyebrow">{t("sidebar.mail", "Mail")}</span>
           <div className="contacts-title-row">
             <h1 id="contacts-view-title">{t("contacts.title", "Contacts")}</h1>
-            <span className="contacts-count" aria-label={`${contacts.length} contacts`}>
+            <span
+              className="contacts-count"
+              aria-label={t("contacts.count", { count: contacts.length })}
+            >
               {contacts.length}
             </span>
           </div>
@@ -306,7 +325,7 @@ export default function ContactsView() {
       )}
 
       <div className="contacts-shell" data-has-selection={Boolean(selectedContact)}>
-        <div className="contacts-list-pane">
+        <div ref={listPaneRef} className="contacts-list-pane">
           {isLoading && (
             <div className="contacts-state">{t("common.loading", "Loading...")}</div>
           )}
@@ -330,16 +349,38 @@ export default function ContactsView() {
             </div>
           )}
           {!isLoading && !error && contacts.length > 0 && (
-            <div className="contact-list" role="list">
-              {contacts.map((contact) => (
-                <div role="listitem" key={contact.id}>
-                  <ContactListItem
-                    contact={contact}
-                    selected={selectedId === contact.id}
-                    onSelect={() => setSelectedId(contact.id)}
-                  />
-                </div>
-              ))}
+            <div
+              className="contact-list"
+              role="list"
+              style={{
+                height: contactListVirtualizer.getTotalSize() + 14,
+                position: "relative",
+              }}
+            >
+              {contactListVirtualizer.getVirtualItems().map((virtualRow) => {
+                const contact = contacts[virtualRow.index];
+                return (
+                  <div
+                    ref={contactListVirtualizer.measureElement}
+                    role="listitem"
+                    key={virtualRow.key}
+                    data-index={virtualRow.index}
+                    style={{
+                      left: 7,
+                      position: "absolute",
+                      top: 0,
+                      transform: `translateY(${virtualRow.start + 7}px)`,
+                      width: "calc(100% - 14px)",
+                    }}
+                  >
+                    <ContactListItem
+                      contact={contact}
+                      selected={selectedId === contact.id}
+                      onSelect={() => setSelectedId(contact.id)}
+                    />
+                  </div>
+                );
+              })}
             </div>
           )}
         </div>
