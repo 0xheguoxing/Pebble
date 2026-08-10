@@ -4,9 +4,11 @@ use pebble_core::{
     Contact, ContactEmail, ContactEmailInput, ContactEmailLabel, ContactInput, ContactSuggestion,
     ContactSuggestionSource, EmailAddress, KnownContact, PebbleError, Result,
 };
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction};
 
 use crate::Store;
+
+pub(crate) const MAX_CONTACT_DISPLAY_NAME_CHARS: usize = 512;
 
 fn contact_label_to_str(label: &ContactEmailLabel) -> &'static str {
     match label {
@@ -60,6 +62,11 @@ fn prepare_email(input: &ContactEmailInput) -> Result<(String, String)> {
 }
 
 fn validate_contact_input(input: &ContactInput) -> Result<Vec<(String, String)>> {
+    if input.display_name.chars().count() > MAX_CONTACT_DISPLAY_NAME_CHARS {
+        return Err(PebbleError::Validation(format!(
+            "Contact display name must not exceed {MAX_CONTACT_DISPLAY_NAME_CHARS} characters"
+        )));
+    }
     if input.emails.is_empty() {
         return Err(PebbleError::Validation(
             "A contact must have at least one email address".to_string(),
@@ -90,6 +97,20 @@ fn validate_contact_input(input: &ContactInput) -> Result<Vec<(String, String)>>
         prepared.push(values);
     }
     Ok(prepared)
+}
+
+fn map_contact_email_insert_error(error: rusqlite::Error, address: &str) -> PebbleError {
+    if let rusqlite::Error::SqliteFailure(sqlite_error, _) = &error {
+        if matches!(
+            sqlite_error.extended_code,
+            rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY | rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        ) {
+            return PebbleError::Validation(format!(
+                "Unable to save contact email {address}: {error}"
+            ));
+        }
+    }
+    PebbleError::from(error)
 }
 
 pub(crate) fn load_contact_with_conn(
@@ -296,32 +317,32 @@ pub(crate) fn save_contact_with_conn(conn: &Connection, input: &ContactInput) ->
                 now
             ],
         )
-        .map_err(|error| {
-            PebbleError::Validation(format!("Unable to save contact email {address}: {error}"))
-        })?;
+        .map_err(|error| map_contact_email_insert_error(error, address))?;
     }
 
     load_contact_with_conn(conn, &contact_id)?
         .ok_or_else(|| PebbleError::Internal("Saved contact could not be loaded".to_string()))
 }
 
-pub(crate) fn replace_contacts_with_conn(conn: &Connection, contacts: &[Contact]) -> Result<()> {
-    conn.execute("DELETE FROM contacts", [])?;
-
+pub(crate) fn replace_contacts_with_conn(
+    conn: &Transaction<'_>,
+    contacts: &[Contact],
+) -> Result<()> {
+    let mut contact_ids = HashSet::new();
+    let mut email_ids = HashSet::new();
+    let mut normalized_addresses = HashSet::new();
+    let mut prepared_contacts = Vec::with_capacity(contacts.len());
     for contact in contacts {
         if contact.id.trim().is_empty() {
             return Err(PebbleError::Validation(
                 "Restored contact id must not be empty".to_string(),
             ));
         }
-        if contact
-            .emails
-            .iter()
-            .any(|email| email.id.trim().is_empty())
-        {
-            return Err(PebbleError::Validation(
-                "Restored contact email id must not be empty".to_string(),
-            ));
+        if !contact_ids.insert(contact.id.clone()) {
+            return Err(PebbleError::Validation(format!(
+                "Duplicate restored contact id: {}",
+                contact.id
+            )));
         }
 
         let input = ContactInput {
@@ -342,6 +363,30 @@ pub(crate) fn replace_contacts_with_conn(conn: &Connection, contacts: &[Contact]
         };
         let prepared_emails = validate_contact_input(&input)?;
 
+        for (email, (_, normalized)) in contact.emails.iter().zip(&prepared_emails) {
+            if email.id.trim().is_empty() {
+                return Err(PebbleError::Validation(
+                    "Restored contact email id must not be empty".to_string(),
+                ));
+            }
+            if !email_ids.insert(email.id.clone()) {
+                return Err(PebbleError::Validation(format!(
+                    "Duplicate restored contact email id: {}",
+                    email.id
+                )));
+            }
+            if !normalized_addresses.insert(normalized.clone()) {
+                return Err(PebbleError::Validation(format!(
+                    "Duplicate restored contact email address: {normalized}"
+                )));
+            }
+        }
+        prepared_contacts.push((contact, prepared_emails));
+    }
+
+    conn.execute("DELETE FROM contacts", [])?;
+
+    for (contact, prepared_emails) in prepared_contacts {
         conn.execute(
             "INSERT INTO contacts
                 (id, display_name, notes, is_favorite, created_at, updated_at)
@@ -377,6 +422,71 @@ pub(crate) fn replace_contacts_with_conn(conn: &Connection, contacts: &[Contact]
     Ok(())
 }
 
+pub(crate) fn list_contacts_with_conn(
+    conn: &Connection,
+    query: Option<&str>,
+    favorite_only: bool,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Contact>> {
+    let query = query.unwrap_or_default().trim();
+    let escaped = query
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{escaped}%");
+    let limit = limit.clamp(1, 200);
+    let offset = offset.max(0);
+    let mut stmt = conn.prepare(
+        "SELECT c.id
+         FROM contacts c
+         WHERE (?1 = '' OR c.display_name LIKE ?2 ESCAPE '\\' COLLATE NOCASE
+                OR EXISTS (
+                    SELECT 1 FROM contact_emails ce
+                    WHERE ce.contact_id = c.id
+                      AND ce.address LIKE ?2 ESCAPE '\\' COLLATE NOCASE
+                ))
+           AND (?3 = 0 OR c.is_favorite = 1)
+         ORDER BY LOWER(CASE
+             WHEN c.display_name = '' THEN COALESCE((
+                 SELECT ce.address FROM contact_emails ce
+                 WHERE ce.contact_id = c.id
+                 ORDER BY ce.is_primary DESC, ce.created_at ASC LIMIT 1
+             ), '')
+             ELSE c.display_name
+         END) ASC, c.id ASC
+         LIMIT ?4 OFFSET ?5",
+    )?;
+    let ids = stmt
+        .query_map(
+            params![query, pattern, favorite_only, limit, offset],
+            |row| row.get::<_, String>(0),
+        )?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+
+    ids.into_iter()
+        .map(|id| {
+            load_contact_with_conn(conn, &id)?.ok_or_else(|| {
+                PebbleError::Internal(format!("Contact disappeared while listing: {id}"))
+            })
+        })
+        .collect()
+}
+
+pub(crate) fn list_all_contacts_for_backup_with_conn(
+    conn: &Transaction<'_>,
+) -> Result<Vec<Contact>> {
+    let mut contacts = Vec::new();
+    loop {
+        let page = list_contacts_with_conn(conn, None, false, 200, contacts.len() as i64)?;
+        let page_len = page.len();
+        contacts.extend(page);
+        if page_len < 200 {
+            return Ok(contacts);
+        }
+    }
+}
+
 impl Store {
     pub fn save_contact(&self, input: &ContactInput) -> Result<Contact> {
         self.with_write(|conn| {
@@ -391,6 +501,30 @@ impl Store {
         self.with_read(|conn| load_contact_with_conn(conn, contact_id))
     }
 
+    pub fn get_contact_by_email(&self, address: &str) -> Result<Option<Contact>> {
+        let (_, normalized) = prepare_email(&ContactEmailInput {
+            id: None,
+            address: address.to_string(),
+            label: ContactEmailLabel::Other,
+            is_primary: true,
+        })?;
+        self.with_read(|conn| {
+            let contact_id = conn
+                .query_row(
+                    "SELECT contact_id
+                     FROM contact_emails
+                     WHERE normalized_address = ?1 COLLATE NOCASE",
+                    params![normalized],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match contact_id {
+                Some(contact_id) => load_contact_with_conn(conn, &contact_id),
+                None => Ok(None),
+            }
+        })
+    }
+
     pub fn list_contacts(
         &self,
         query: Option<&str>,
@@ -398,51 +532,7 @@ impl Store {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<Contact>> {
-        let query = query.unwrap_or_default().trim();
-        let escaped = query
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("%{escaped}%");
-        let limit = limit.clamp(1, 200);
-        let offset = offset.max(0);
-
-        self.with_read(|conn| {
-            let mut stmt = conn.prepare(
-                "SELECT c.id
-                 FROM contacts c
-                 WHERE (?1 = '' OR c.display_name LIKE ?2 ESCAPE '\\' COLLATE NOCASE
-                        OR EXISTS (
-                            SELECT 1 FROM contact_emails ce
-                            WHERE ce.contact_id = c.id
-                              AND ce.address LIKE ?2 ESCAPE '\\' COLLATE NOCASE
-                        ))
-                   AND (?3 = 0 OR c.is_favorite = 1)
-                 ORDER BY LOWER(CASE
-                     WHEN c.display_name = '' THEN COALESCE((
-                         SELECT ce.address FROM contact_emails ce
-                         WHERE ce.contact_id = c.id
-                         ORDER BY ce.is_primary DESC, ce.created_at ASC LIMIT 1
-                     ), '')
-                     ELSE c.display_name
-                 END) ASC, c.id ASC
-                 LIMIT ?4 OFFSET ?5",
-            )?;
-            let ids = stmt
-                .query_map(
-                    params![query, pattern, favorite_only, limit, offset],
-                    |row| row.get::<_, String>(0),
-                )?
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-
-            ids.into_iter()
-                .map(|id| {
-                    load_contact_with_conn(conn, &id)?.ok_or_else(|| {
-                        PebbleError::Internal(format!("Contact disappeared while listing: {id}"))
-                    })
-                })
-                .collect()
-        })
+        self.with_read(|conn| list_contacts_with_conn(conn, query, favorite_only, limit, offset))
     }
 
     pub fn delete_contact(&self, contact_id: &str, suppress_addresses: bool) -> Result<()> {
@@ -555,10 +645,16 @@ impl Store {
                 "SELECT from_name, from_address, to_list, cc_list, bcc_list, date
                  FROM messages
                  WHERE account_id = ?1 AND is_deleted = 0
+                   AND (?2 = ''
+                        OR from_name LIKE ?3 ESCAPE '\\' COLLATE NOCASE
+                        OR from_address LIKE ?3 ESCAPE '\\' COLLATE NOCASE
+                        OR to_list LIKE ?3 ESCAPE '\\' COLLATE NOCASE
+                        OR cc_list LIKE ?3 ESCAPE '\\' COLLATE NOCASE
+                        OR bcc_list LIKE ?3 ESCAPE '\\' COLLATE NOCASE)
                  ORDER BY date DESC
                  LIMIT 1000",
             )?;
-            let history_rows = history_stmt.query_map(params![account_id], |row| {
+            let history_rows = history_stmt.query_map(params![account_id, query, pattern], |row| {
                 Ok((
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
@@ -726,49 +822,55 @@ impl Store {
                 }
             }
 
-            // Second: search inside to_list JSON for matching recipients
+            // Second: search inside recipient JSON for matching To/Cc/Bcc entries.
             if (contacts.len() as i64) < limit {
                 let remaining = limit - contacts.len() as i64;
                 let mut stmt2 = conn.prepare(
-                    "SELECT DISTINCT to_list
+                    "SELECT DISTINCT to_list, cc_list, bcc_list
                          FROM messages
                          WHERE account_id = ?1
                            AND is_deleted = 0
-                           AND to_list LIKE ?2 ESCAPE '\\'
-                         LIMIT ?3",
+                           AND (to_list LIKE ?2 ESCAPE '\\'
+                                OR cc_list LIKE ?2 ESCAPE '\\'
+                                OR bcc_list LIKE ?2 ESCAPE '\\')
+                          LIMIT ?3",
                 )?;
 
-                let to_rows = stmt2
-                    .query_map(params![account_id, pattern, remaining * 5], |row| {
-                        row.get::<_, String>(0)
+                let recipient_rows =
+                    stmt2.query_map(params![account_id, pattern, remaining * 5], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
                     })?;
 
-                for row in to_rows {
+                for row in recipient_rows {
                     if contacts.len() as i64 >= limit {
                         break;
                     }
-                    let json_str = row?;
-                    if let Ok(addrs) =
-                        serde_json::from_str::<Vec<pebble_core::EmailAddress>>(&json_str)
-                    {
-                        let lower_query = query.to_lowercase();
-                        for addr in addrs {
-                            if contacts.len() as i64 >= limit {
-                                break;
-                            }
-                            let matches = addr.address.to_lowercase().contains(&lower_query)
-                                || addr
-                                    .name
-                                    .as_ref()
-                                    .map(|n| n.to_lowercase().contains(&lower_query))
-                                    .unwrap_or(false);
-                            if matches {
-                                let key = addr.address.to_lowercase();
-                                if seen.insert(key) {
-                                    contacts.push(KnownContact {
-                                        name: addr.name,
-                                        address: addr.address,
-                                    });
+                    let (to_json, cc_json, bcc_json) = row?;
+                    for json_str in [to_json, cc_json, bcc_json] {
+                        if let Ok(addrs) = serde_json::from_str::<Vec<EmailAddress>>(&json_str) {
+                            let lower_query = query.to_lowercase();
+                            for addr in addrs {
+                                if contacts.len() as i64 >= limit {
+                                    break;
+                                }
+                                let matches = addr.address.to_lowercase().contains(&lower_query)
+                                    || addr
+                                        .name
+                                        .as_ref()
+                                        .map(|n| n.to_lowercase().contains(&lower_query))
+                                        .unwrap_or(false);
+                                if matches {
+                                    let key = addr.address.to_lowercase();
+                                    if seen.insert(key) {
+                                        contacts.push(KnownContact {
+                                            name: addr.name,
+                                            address: addr.address,
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -783,6 +885,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use super::{list_all_contacts_for_backup_with_conn, replace_contacts_with_conn};
     use crate::Store;
     use pebble_core::*;
 
@@ -1001,6 +1104,37 @@ mod tests {
     }
 
     #[test]
+    fn test_list_known_contacts_by_cc_and_bcc_lists() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        insert_suggestion_message(
+            &store,
+            &account_id,
+            &folder_id,
+            SuggestionMessage {
+                remote_id: "copy-recipients",
+                from_name: "Sender",
+                from_address: "sender@example.com",
+                to: vec![],
+                cc: vec![EmailAddress {
+                    name: Some("Copy Person".to_string()),
+                    address: "copy@example.com".to_string(),
+                }],
+                bcc: vec![EmailAddress {
+                    name: Some("Blind Person".to_string()),
+                    address: "blind@example.com".to_string(),
+                }],
+                date: 100,
+            },
+        );
+
+        let cc = store.list_known_contacts(&account_id, "copy", 10).unwrap();
+        let bcc = store.list_known_contacts(&account_id, "blind", 10).unwrap();
+
+        assert_eq!(cc[0].address, "copy@example.com");
+        assert_eq!(bcc[0].address, "blind@example.com");
+    }
+
+    #[test]
     fn test_list_known_contacts_broad_query() {
         let (store, account_id) = setup_store_with_contacts();
         let results = store
@@ -1070,6 +1204,27 @@ mod tests {
     }
 
     #[test]
+    fn contact_lookup_by_email_is_exact_and_case_insensitive() {
+        let store = Store::open_in_memory().unwrap();
+        let alice = store
+            .save_contact(&contact_input("Alice", "Alice@Example.com"))
+            .unwrap();
+        store
+            .save_contact(&contact_input("Alias", "alice+other@example.com"))
+            .unwrap();
+
+        let found = store
+            .get_contact_by_email("  alice@EXAMPLE.COM ")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, alice.id);
+        assert!(store
+            .get_contact_by_email("missing@example.com")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
     fn contact_save_requires_email() {
         let store = Store::open_in_memory().unwrap();
         let no_email = ContactInput {
@@ -1130,6 +1285,71 @@ mod tests {
             store.save_contact(&input),
             Err(PebbleError::Validation(_))
         ));
+    }
+
+    #[test]
+    fn contact_save_rejects_display_name_over_limit() {
+        let store = Store::open_in_memory().unwrap();
+        let input = ContactInput {
+            display_name: "a".repeat(513),
+            ..contact_input("unused", "long-name@example.com")
+        };
+
+        assert!(matches!(
+            store.save_contact(&input),
+            Err(PebbleError::Validation(message)) if message.contains("512")
+        ));
+    }
+
+    #[test]
+    fn contact_email_operational_errors_remain_storage_errors() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .with_write(|conn| {
+                conn.execute_batch(
+                    "CREATE TRIGGER fail_contact_email_insert
+                     BEFORE INSERT ON contact_emails
+                     BEGIN
+                         SELECT RAISE(FAIL, 'simulated contact email storage failure');
+                     END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(matches!(
+            store.save_contact(&contact_input("Alice", "alice@example.com")),
+            Err(PebbleError::Storage(message))
+                if message.contains("simulated contact email storage failure")
+        ));
+    }
+
+    #[test]
+    fn contact_restore_validates_before_deleting_existing_contacts() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .save_contact(&contact_input("Keep me", "keep@example.com"))
+            .unwrap();
+        let invalid = Contact {
+            id: String::new(),
+            display_name: "Invalid".to_string(),
+            notes: String::new(),
+            is_favorite: false,
+            emails: vec![],
+            created_at: 1,
+            updated_at: 1,
+        };
+
+        store
+            .with_write(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                assert!(replace_contacts_with_conn(&tx, &[invalid]).is_err());
+                let remaining: i64 =
+                    tx.query_row("SELECT COUNT(*) FROM contacts", [], |row| row.get(0))?;
+                assert_eq!(remaining, 1);
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1211,6 +1431,29 @@ mod tests {
         let page = store.list_contacts(None, false, 1, 1).unwrap();
         assert_eq!(page.len(), 1);
         assert_eq!(page[0].display_name, "Bob");
+    }
+
+    #[test]
+    fn backup_contact_loader_reads_all_pages_from_a_transaction() {
+        let store = Store::open_in_memory().unwrap();
+        for index in 0..201 {
+            store
+                .save_contact(&contact_input(
+                    &format!("Contact {index:03}"),
+                    &format!("contact-{index}@example.com"),
+                ))
+                .unwrap();
+        }
+
+        store
+            .with_read(|conn| {
+                let tx = conn.unchecked_transaction()?;
+                let contacts = list_all_contacts_for_backup_with_conn(&tx)?;
+                assert_eq!(contacts.len(), 201);
+                tx.commit()?;
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]
@@ -1363,6 +1606,50 @@ mod tests {
             .unwrap();
         assert_eq!(results[0].address, "newer@example.com");
         assert_eq!(results[1].address, "older@example.com");
+    }
+
+    #[test]
+    fn recent_contact_search_filters_before_applying_history_limit() {
+        let (store, account_id, folder_id) = setup_suggestion_store();
+        insert_suggestion_message(
+            &store,
+            &account_id,
+            &folder_id,
+            SuggestionMessage {
+                remote_id: "older-match",
+                from_name: "Needle Person",
+                from_address: "needle@example.com",
+                to: vec![],
+                cc: vec![],
+                bcc: vec![],
+                date: 1,
+            },
+        );
+        for index in 0..1_000 {
+            let remote_id = format!("unrelated-{index}");
+            let address = format!("unrelated-{index}@example.com");
+            insert_suggestion_message(
+                &store,
+                &account_id,
+                &folder_id,
+                SuggestionMessage {
+                    remote_id: &remote_id,
+                    from_name: "Unrelated",
+                    from_address: &address,
+                    to: vec![],
+                    cc: vec![],
+                    bcc: vec![],
+                    date: 100 + index,
+                },
+            );
+        }
+
+        let results = store
+            .search_contact_suggestions(&account_id, "needle", 20)
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].address, "needle@example.com");
     }
 
     #[test]

@@ -3,7 +3,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::Store;
+use crate::{contacts::list_all_contacts_for_backup_with_conn, Store};
 
 /// Maximum accepted size for a settings backup download.
 /// Settings backups (accounts metadata, rules, kanban cards, translate config)
@@ -336,15 +336,12 @@ impl Store {
 
         let rules = self.list_rules()?;
         let kanban_cards = self.list_kanban_cards(None)?;
-        let mut contacts = Vec::new();
-        loop {
-            let page = self.list_contacts(None, false, 200, contacts.len() as i64)?;
-            let page_len = page.len();
-            contacts.extend(page);
-            if page_len < 200 {
-                break;
-            }
-        }
+        let contacts = self.with_read(|conn| {
+            let tx = conn.unchecked_transaction()?;
+            let contacts = list_all_contacts_for_backup_with_conn(&tx)?;
+            tx.commit()?;
+            Ok(contacts)
+        })?;
         // Redact translate config — never export API keys or encrypted secrets
         let translate_config = self.get_translate_config()?.map(|mut tc| {
             tc.config = String::new();

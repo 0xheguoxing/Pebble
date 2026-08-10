@@ -7,7 +7,7 @@ use pebble_core::{
 use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::{
-    contacts::{load_contact_with_conn, save_contact_with_conn},
+    contacts::{load_contact_with_conn, save_contact_with_conn, MAX_CONTACT_DISPLAY_NAME_CHARS},
     Store,
 };
 
@@ -75,6 +75,57 @@ fn split_escaped(value: &str, separator: char) -> Vec<String> {
     parts
 }
 
+fn split_once_unquoted(value: &str, separator: char) -> Option<(&str, &str)> {
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if ch == separator && !quoted {
+            let separator_end = index + ch.len_utf8();
+            return Some((&value[..index], &value[separator_end..]));
+        }
+    }
+    None
+}
+
+fn split_unquoted(value: &str, separator: char) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut start = 0;
+    let mut quoted = false;
+    let mut escaped = false;
+    for (index, ch) in value.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            quoted = !quoted;
+            continue;
+        }
+        if ch == separator && !quoted {
+            parts.push(&value[start..index]);
+            start = index + ch.len_utf8();
+        }
+    }
+    parts.push(&value[start..]);
+    parts
+}
+
 fn name_from_n(value: &str) -> String {
     let fields = split_escaped(value, ';');
     let decoded = fields
@@ -97,12 +148,11 @@ fn name_from_n(value: &str) -> String {
 }
 
 fn parse_email_header(header: &str) -> (ContactEmailLabel, bool) {
-    let tokens = header
-        .split(';')
+    let tokens = split_unquoted(header, ';')
+        .into_iter()
         .skip(1)
         .flat_map(|part| {
-            let (name, value) = part
-                .split_once('=')
+            let (name, value) = split_once_unquoted(part, '=')
                 .map(|(name, value)| (Some(name.trim()), value.trim()))
                 .unwrap_or((None, part.trim()));
             if name.is_some_and(|name| !name.eq_ignore_ascii_case("TYPE")) {
@@ -134,11 +184,11 @@ fn parse_card(lines: &[String]) -> std::result::Result<ContactInput, String> {
     let mut parsed_emails = Vec::new();
 
     for line in lines {
-        let Some((header, raw_value)) = line.split_once(':') else {
+        let Some((header, raw_value)) = split_once_unquoted(line, ':') else {
             continue;
         };
-        let property = header
-            .split(';')
+        let property = split_unquoted(header, ';')
+            .into_iter()
             .next()
             .unwrap_or_default()
             .rsplit('.')
@@ -165,7 +215,7 @@ fn parse_card(lines: &[String]) -> std::result::Result<ContactInput, String> {
         }
     }
 
-    if version.as_deref().is_some_and(|value| value != "3.0") {
+    if version.as_deref() != Some("3.0") {
         return Err("Only vCard 3.0 is supported".to_string());
     }
     if parsed_emails.is_empty() {
@@ -189,13 +239,20 @@ fn parse_card(lines: &[String]) -> std::result::Result<ContactInput, String> {
         })
         .collect();
 
+    let display_name = if display_name.is_empty() {
+        structured_name
+    } else {
+        display_name
+    };
+    if display_name.chars().count() > MAX_CONTACT_DISPLAY_NAME_CHARS {
+        return Err(format!(
+            "Contact display name must not exceed {MAX_CONTACT_DISPLAY_NAME_CHARS} characters"
+        ));
+    }
+
     Ok(ContactInput {
         id: None,
-        display_name: if display_name.is_empty() {
-            structured_name
-        } else {
-            display_name
-        },
+        display_name,
         notes: notes.join("\n").trim().to_string(),
         is_favorite: false,
         emails,
@@ -231,24 +288,50 @@ fn parse_vcards(data: &str) -> Result<Vec<std::result::Result<ContactInput, Stri
         ));
     }
 
+    struct CardState {
+        lines: Vec<String>,
+        nested_depth: usize,
+        error: Option<String>,
+    }
+
     let mut results = Vec::with_capacity(card_count);
-    let mut current: Option<Vec<String>> = None;
+    let mut current: Option<CardState> = None;
     for line in unfolded {
         if line.eq_ignore_ascii_case("BEGIN:VCARD") {
-            if current.is_some() {
-                results.push(Err("Nested BEGIN:VCARD".to_string()));
+            if let Some(card) = current.as_mut() {
+                card.nested_depth += 1;
+                card.error
+                    .get_or_insert_with(|| "Nested BEGIN:VCARD".to_string());
+            } else {
+                current = Some(CardState {
+                    lines: Vec::new(),
+                    nested_depth: 0,
+                    error: None,
+                });
             }
-            current = Some(Vec::new());
         } else if line.eq_ignore_ascii_case("END:VCARD") {
-            if let Some(lines) = current.take() {
-                results.push(parse_card(&lines));
+            if let Some(card) = current.as_mut() {
+                if card.nested_depth > 0 {
+                    card.nested_depth -= 1;
+                    continue;
+                }
             }
-        } else if let Some(lines) = current.as_mut() {
-            lines.push(line);
+            if let Some(card) = current.take() {
+                results.push(match card.error {
+                    Some(error) => Err(error),
+                    None => parse_card(&card.lines),
+                });
+            }
+        } else if let Some(card) = current.as_mut() {
+            if card.nested_depth == 0 {
+                card.lines.push(line);
+            }
         }
     }
-    if current.is_some() {
-        results.push(Err("Missing END:VCARD".to_string()));
+    if let Some(card) = current {
+        results.push(Err(card
+            .error
+            .unwrap_or_else(|| "Missing END:VCARD".to_string())));
     }
     Ok(results)
 }
@@ -461,6 +544,7 @@ impl Store {
 
 #[cfg(test)]
 mod tests {
+    use super::parse_card;
     use pebble_core::{ContactEmailInput, ContactEmailLabel, ContactInput, PebbleError};
 
     use crate::Store;
@@ -533,6 +617,61 @@ mod tests {
         assert_eq!(contact.emails[0].label, ContactEmailLabel::Work);
         assert!(contact.emails[0].is_primary);
         assert_eq!(contact.emails[1].label, ContactEmailLabel::Personal);
+    }
+
+    #[test]
+    fn rejects_cards_without_version_three() {
+        let store = Store::open_in_memory().unwrap();
+        let data = "BEGIN:VCARD\nFN:Alice\nEMAIL:alice@example.com\nEND:VCARD\n";
+
+        let result = store.import_contacts_vcard(data).unwrap();
+
+        assert_eq!(result.created, 0);
+        assert_eq!(result.invalid, 1);
+        assert!(result.errors[0].contains("vCard 3.0"));
+    }
+
+    #[test]
+    fn nested_cards_are_rejected_without_importing_the_inner_fragment() {
+        let store = Store::open_in_memory().unwrap();
+        let data = "BEGIN:VCARD\nVERSION:3.0\nFN:Outer\n\
+                    BEGIN:VCARD\nVERSION:3.0\nFN:Inner\nEMAIL:inner@example.com\nEND:VCARD\n\
+                    EMAIL:outer@example.com\nEND:VCARD\n";
+
+        let result = store.import_contacts_vcard(data).unwrap();
+
+        assert_eq!(result.created, 0);
+        assert_eq!(result.invalid, 1);
+        assert!(result.errors[0].contains("Nested BEGIN:VCARD"));
+        assert!(store.list_contacts(None, false, 20, 0).unwrap().is_empty());
+    }
+
+    #[test]
+    fn quoted_custom_parameters_may_contain_property_delimiters() {
+        let store = Store::open_in_memory().unwrap();
+        let data = "BEGIN:VCARD\nVERSION:3.0\nFN:Alice\n\
+                    EMAIL;X-FOO=\"a:b=c;d\";TYPE=WORK:alice@example.com\nEND:VCARD\n";
+
+        let result = store.import_contacts_vcard(data).unwrap();
+
+        assert_eq!(result.created, 1);
+        assert_eq!(result.invalid, 0);
+        let contact = store.list_contacts(None, false, 20, 0).unwrap().remove(0);
+        assert_eq!(contact.emails[0].address, "alice@example.com");
+        assert_eq!(contact.emails[0].label, ContactEmailLabel::Work);
+    }
+
+    #[test]
+    fn parse_card_rejects_display_names_over_limit() {
+        let lines = vec![
+            "VERSION:3.0".to_string(),
+            format!("FN:{}", "a".repeat(513)),
+            "EMAIL:alice@example.com".to_string(),
+        ];
+
+        let error = parse_card(&lines).unwrap_err();
+
+        assert!(error.contains("512"));
     }
 
     #[test]
