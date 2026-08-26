@@ -86,6 +86,56 @@ pub async fn list_folders(
     .map_err(|e| PebbleError::Internal(format!("Task join error: {e}")))?
 }
 
+#[tauri::command]
+pub async fn delete_folder(
+    state: State<'_, AppState>,
+    folder_id: String,
+) -> std::result::Result<(), PebbleError> {
+    let store = state.store.clone();
+    let folder_id_for_log = folder_id.clone();
+    let affected_ids = tokio::task::spawn_blocking(
+        move || -> std::result::Result<Vec<String>, PebbleError> {
+            let folder = store
+                .get_folder(&folder_id)?
+                .ok_or_else(|| PebbleError::Internal(format!("Folder not found: {folder_id}")))?;
+
+            if !folder.remote_id.starts_with("__local_") {
+                return Err(PebbleError::Validation(
+                    "Only local folders can be deleted".to_string(),
+                ));
+            }
+            if folder.role.is_some() {
+                return Err(PebbleError::Validation(
+                    "System folders cannot be deleted".to_string(),
+                ));
+            }
+
+            let inbox = store
+                .find_folder_by_role(&folder.account_id, FolderRole::Inbox)?
+                .ok_or_else(|| {
+                    PebbleError::Internal(format!(
+                        "No inbox folder found for account {}",
+                        folder.account_id
+                    ))
+                })?;
+
+            store.delete_local_folder(&folder_id, &inbox.id)
+        },
+    )
+    .await
+    .map_err(|e| PebbleError::Internal(format!("Task join error: {e}")))??;
+
+    if let Err(e) =
+        crate::commands::messages::refresh_search_documents(&state, &affected_ids)
+    {
+        tracing::warn!(
+            "Failed to refresh search documents after deleting folder {folder_id_for_log}: {e}"
+        );
+    }
+
+    Ok(())
+}
+
 async fn discover_imap_folders(
     state: &AppState,
     account_id: &str,

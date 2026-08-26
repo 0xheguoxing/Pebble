@@ -35,6 +35,7 @@ export type {
   PrivacyMode,
   RenderedHtml,
   Rule,
+  RunRulesResult,
   SearchHit,
   SnoozedMessage,
   ThreadSummary,
@@ -72,6 +73,7 @@ import type {
   PrivacyMode,
   RenderedHtml,
   Rule,
+  RunRulesResult,
   SearchHit,
   SnoozedMessage,
   ThreadSummary,
@@ -259,6 +261,10 @@ export async function deleteAccount(accountId: string): Promise<void> {
 
 export async function listFolders(accountId: string): Promise<Folder[]> {
   return invoke<Folder[]>("list_folders", { accountId });
+}
+
+export async function deleteFolder(folderId: string): Promise<void> {
+  return invoke<void>("delete_folder", { folderId });
 }
 
 export async function getImapSyncFolders(accountId: string): Promise<ImapSyncFolderSettings> {
@@ -536,6 +542,10 @@ export async function updateRule(rule: Rule): Promise<void> {
 
 export async function deleteRule(ruleId: string): Promise<void> {
   return invoke<void>("delete_rule", { ruleId });
+}
+
+export async function runRulesNow(): Promise<RunRulesResult> {
+  return invoke<RunRulesResult>("run_rules_now");
 }
 
 // ─── Compose API ─────────────────────────────────────────────────────────────

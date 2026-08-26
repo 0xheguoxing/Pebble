@@ -259,6 +259,14 @@ export interface Rule {
   updated_at: number;
 }
 
+/** @rust src-tauri/src/commands/rules.rs → RunRulesResult */
+export interface RunRulesResult {
+  rules_loaded: number;
+  messages_scanned: number;
+  messages_matched: number;
+  actions_applied: number;
+}
+
 // ─── Search types ───────────────────────────────────────────────────────────────
 
 /**

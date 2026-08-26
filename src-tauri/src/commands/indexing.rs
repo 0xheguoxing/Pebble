@@ -8,7 +8,7 @@ use crate::commands::notifications;
 use crate::commands::pending_mail_ops::queue_pending_mail_op;
 use crate::events;
 use crate::state::AppState;
-use pebble_core::{FolderRole, PebbleError};
+use pebble_core::{Folder, FolderRole, FolderType, PebbleError};
 use pebble_rules::RuleEngine;
 use pebble_search::TantivySearch;
 use pebble_store::Store;
@@ -573,7 +573,7 @@ fn finalize_recovery_markers_after_commit(
 }
 
 /// Apply a single rule action to a message.
-fn apply_rule_action(
+pub(crate) fn apply_rule_action(
     store: &Store,
     account_id: &str,
     message_id: &str,
@@ -622,18 +622,12 @@ fn apply_rule_action(
                 );
                 return Ok(());
             }
-            if let Some(target_folder) = store.find_folder_by_name(account_id, folder_name)? {
-                store.move_message_to_folder(message_id, &target_folder.id)?;
-                info!(
-                    "Rule: moved message {} to folder '{}'",
-                    message_id, target_folder.name
-                );
-            } else {
-                warn!(
-                    "Rule: target folder '{}' not found for account {}",
-                    folder_name, account_id
-                );
-            }
+            let target_folder = find_or_create_local_folder(store, account_id, folder_name)?;
+            store.move_message_to_folder(message_id, &target_folder.id)?;
+            info!(
+                "Rule: moved message {} to folder '{}'",
+                message_id, target_folder.name
+            );
         }
         RuleAction::SetKanbanColumn(column) => {
             let now = pebble_core::now_timestamp();
@@ -652,6 +646,75 @@ fn apply_rule_action(
         }
     }
     Ok(())
+}
+
+/// Remote id of the parent folder that holds every rule-created local folder.
+/// Keeping them nested under a single container avoids cluttering the sidebar
+/// with rule folders that would otherwise sit at the same level as the Inbox.
+const RULES_PARENT_REMOTE_ID: &str = "__local_rules__";
+
+/// Find a folder by name, creating a local folder if it does not yet exist.
+/// Rule `MoveToFolder` targets are frequently not created ahead of time, so a
+/// missing folder must be materialized before the message can be moved.
+///
+/// Created folders are nested under a single local "Rules" parent folder so
+/// they do not clutter the top level of the sidebar.
+fn find_or_create_local_folder(
+    store: &Store,
+    account_id: &str,
+    name: &str,
+) -> pebble_core::Result<Folder> {
+    if let Some(existing) = store.find_folder_by_name(account_id, name)? {
+        return Ok(existing);
+    }
+
+    let parent_id = ensure_rules_parent_folder(store, account_id)?.id;
+
+    let mut folder = Folder {
+        id: pebble_core::new_id(),
+        account_id: account_id.to_string(),
+        remote_id: format!("__local_{name}"),
+        name: name.to_string(),
+        folder_type: FolderType::Folder,
+        role: None,
+        parent_id: Some(parent_id),
+        color: None,
+        is_system: false,
+        sort_order: 999,
+    };
+    let effective_id = store.insert_folder(&folder)?;
+    folder.id = effective_id;
+    info!("Rule: created local folder '{name}' for account {account_id}");
+    Ok(folder)
+}
+
+/// Ensure the local "Rules" parent folder exists for an account, creating it
+/// on first use. Returns the folder with its effective database id.
+fn ensure_rules_parent_folder(store: &Store, account_id: &str) -> pebble_core::Result<Folder> {
+    let folders = store.list_folders(account_id)?;
+    if let Some(existing) = folders
+        .iter()
+        .find(|folder| folder.remote_id == RULES_PARENT_REMOTE_ID)
+    {
+        return Ok(existing.clone());
+    }
+
+    let mut folder = Folder {
+        id: pebble_core::new_id(),
+        account_id: account_id.to_string(),
+        remote_id: RULES_PARENT_REMOTE_ID.to_string(),
+        name: "All Mail".to_string(),
+        folder_type: FolderType::Folder,
+        role: None,
+        parent_id: None,
+        color: None,
+        is_system: true,
+        sort_order: 4,
+    };
+    let effective_id = store.insert_folder(&folder)?;
+    folder.id = effective_id;
+    info!("Rule: created local parent folder for account {account_id}");
+    Ok(folder)
 }
 
 fn queue_remote_rule_action(

@@ -153,6 +153,80 @@ impl Store {
         })
     }
 
+    /// Fetch a folder by its local id.
+    pub fn get_folder(&self, id: &str) -> Result<Option<Folder>> {
+        self.with_read(|conn| {
+            let result = conn
+                .query_row(
+                    "SELECT id, account_id, remote_id, name, folder_type, role, parent_id, color, is_system, sort_order
+                     FROM folders WHERE id = ?1",
+                    rusqlite::params![id],
+                    |row| {
+                        let role_str: Option<String> = row.get(5)?;
+                        let is_system: i32 = row.get(8)?;
+                        Ok(Folder {
+                            id: row.get(0)?,
+                            account_id: row.get(1)?,
+                            remote_id: row.get(2)?,
+                            name: row.get(3)?,
+                            folder_type: str_to_folder_type(&row.get::<_, String>(4)?),
+                            role: role_str.and_then(|s| str_to_folder_role(&s)),
+                            parent_id: row.get(6)?,
+                            color: row.get(7)?,
+                            is_system: is_system != 0,
+                            sort_order: row.get(9)?,
+                        })
+                    },
+                )
+                .optional()?;
+            Ok(result)
+        })
+    }
+
+    /// Delete a local folder, moving every message it held back into the given
+    /// fallback folder (the account's Inbox). Returns the ids of the messages
+    /// whose folder membership changed, so callers can refresh their search
+    /// documents. Does not touch remote folders or system folders.
+    pub fn delete_local_folder(
+        &self,
+        folder_id: &str,
+        inbox_folder_id: &str,
+    ) -> Result<Vec<String>> {
+        self.with_write(|conn| {
+            let tx = conn.unchecked_transaction()?;
+
+            let affected_ids: Vec<String> = {
+                let mut stmt =
+                    tx.prepare("SELECT message_id FROM message_folders WHERE folder_id = ?1")?;
+                let rows = stmt.query_map(rusqlite::params![folder_id], |row| {
+                    row.get::<_, String>(0)
+                })?;
+                let mut ids = Vec::new();
+                for row in rows {
+                    ids.push(row?);
+                }
+                ids
+            };
+
+            tx.execute(
+                "INSERT OR IGNORE INTO message_folders (message_id, folder_id)
+                 SELECT message_id, ?1 FROM message_folders WHERE folder_id = ?2",
+                rusqlite::params![inbox_folder_id, folder_id],
+            )?;
+            tx.execute(
+                "DELETE FROM message_folders WHERE folder_id = ?1",
+                rusqlite::params![folder_id],
+            )?;
+            tx.execute(
+                "DELETE FROM folders WHERE id = ?1",
+                rusqlite::params![folder_id],
+            )?;
+
+            tx.commit()?;
+            Ok(affected_ids)
+        })
+    }
+
     pub fn list_folders(&self, account_id: &str) -> Result<Vec<Folder>> {
         self.with_read(|conn| {
             let mut stmt = conn

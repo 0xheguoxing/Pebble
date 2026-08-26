@@ -1,4 +1,5 @@
-import { useEffect, useMemo } from "react";
+import { useEffect, useMemo, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   Inbox,
   Send,
@@ -7,6 +8,9 @@ import {
   Archive,
   AlertTriangle,
   Folder,
+  FolderTree,
+  ChevronDown,
+  ChevronRight,
   LayoutGrid,
   Settings,
   Search,
@@ -23,10 +27,12 @@ import { useAccountsQuery, useFoldersForAccountsQuery } from "../hooks/queries";
 import { useFolderUnreadCountsForAccounts } from "../hooks/queries/useFolderUnreadCounts";
 import {
   ALL_ACCOUNTS_SELECT_VALUE,
+  RULES_PARENT_REMOTE_ID,
   buildAllAccountsFolders,
   sortFoldersForSidebar,
   unreadCountForFolder,
 } from "../lib/folderAggregation";
+import { deleteFolder } from "../lib/api";
 import type { Account, Folder as FolderType } from "../lib/api";
 
 const EMPTY_ACCOUNTS: Account[] = [];
@@ -68,6 +74,60 @@ export default function Sidebar() {
   const showUnread = useUIStore((s) => s.showFolderUnreadCount);
   const { data: accounts = EMPTY_ACCOUNTS } = useAccountsQuery();
   const allAccountsMode = accounts.length > 1 && !activeAccountId;
+  const [collapsedParents, setCollapsedParents] = useState<Set<string>>(() => new Set());
+  const [contextMenu, setContextMenu] = useState<{
+    x: number;
+    y: number;
+    folder: FolderType;
+  } | null>(null);
+  const queryClient = useQueryClient();
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    document.addEventListener("click", close);
+    document.addEventListener("contextmenu", close);
+    window.addEventListener("blur", close);
+    return () => {
+      document.removeEventListener("click", close);
+      document.removeEventListener("contextmenu", close);
+      window.removeEventListener("blur", close);
+    };
+  }, [contextMenu]);
+
+  function toggleParentFolder(folderId: string) {
+    setCollapsedParents((prev) => {
+      const next = new Set(prev);
+      if (next.has(folderId)) {
+        next.delete(folderId);
+      } else {
+        next.add(folderId);
+      }
+      return next;
+    });
+  }
+
+  async function handleDeleteFolder(folder: FolderType) {
+    const confirmed = await useConfirmStore.getState().confirm({
+      title: t("sidebar.deleteFolder", "Delete folder"),
+      message: t("sidebar.deleteFolderConfirm", {
+        name: folder.name,
+        defaultValue: `Delete folder "${folder.name}"? Messages inside will be moved back to the Inbox.`,
+      }),
+      destructive: true,
+    });
+    if (!confirmed) return;
+    try {
+      await deleteFolder(folder.id);
+      setActiveFolderId(null);
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      queryClient.invalidateQueries({ queryKey: ["messages"] });
+      queryClient.invalidateQueries({ queryKey: ["threads"] });
+      queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+    } catch (e) {
+      console.error("Failed to delete folder:", e);
+    }
+  }
   const folderAccountIds = useMemo(
     () => activeAccountId ? [activeAccountId] : accounts.map((account) => account.id),
     [accounts, activeAccountId],
@@ -82,7 +142,12 @@ export default function Sidebar() {
     archive: t("sidebar.archive"),
     spam: t("sidebar.spam"),
   };
-  const folderLabel = (folder: FolderType) => (folder.role && ROLE_LABELS[folder.role]) || folder.name;
+  const folderLabel = (folder: FolderType) => {
+    if (folder.remote_id === RULES_PARENT_REMOTE_ID) {
+      return t("sidebar.categoriesFolder", "Categories");
+    }
+    return (folder.role && ROLE_LABELS[folder.role]) || folder.name;
+  };
 
   const displayedFolders = useMemo(
     () => allAccountsMode ? buildAllAccountsFolders(folders) : folders,
@@ -96,6 +161,24 @@ export default function Sidebar() {
   const dedupedFolders = useMemo(() => {
     return sortFoldersForSidebar(displayedFolders).filter((f) => f.role !== "archive");
   }, [displayedFolders]);
+
+  // Split folders into top-level entries and their children so rule-created
+  // folders can be nested under the "Categories" parent instead of flattening
+  // against the Inbox.
+  const { topLevelFolders, childrenByParentId } = useMemo(() => {
+    const childrenByParentId = new Map<string, FolderType[]>();
+    const topLevelFolders: FolderType[] = [];
+    for (const folder of dedupedFolders) {
+      if (folder.parent_id && dedupedFolders.some((f) => f.id === folder.parent_id)) {
+        const list = childrenByParentId.get(folder.parent_id) ?? [];
+        list.push(folder);
+        childrenByParentId.set(folder.parent_id, list);
+      } else {
+        topLevelFolders.push(folder);
+      }
+    }
+    return { topLevelFolders, childrenByParentId };
+  }, [dedupedFolders]);
 
   // Auto-select the only account. With multiple accounts, null means the
   // combined "all accounts" mailbox.
@@ -202,6 +285,7 @@ export default function Sidebar() {
   }
 
   return (
+    <>
     <aside
       aria-label={t("sidebar.navigation", "Sidebar")}
       style={{
@@ -289,18 +373,97 @@ export default function Sidebar() {
         }}
       >
         {hasRealFolders
-          ? renderFoldersWithStarred(dedupedFolders, (folder) => (
-              <SidebarButton
-                key={folder.id}
-                icon={folderIcon(folder.role)}
-                label={folderLabel(folder)}
-                badge={showUnread ? unreadCountForFolder(folder.id, folders, unreadCounts) : undefined}
-                isActive={folder.id === activeFolderId && activeView === "inbox"}
-                collapsed={sidebarCollapsed}
-                style={buttonBase}
-                onClick={() => handleFolderClick(folder.id)}
-              />
-            ))
+          ? renderFoldersWithStarred(topLevelFolders, (folder) => {
+              const children = childrenByParentId.get(folder.id) ?? [];
+              const childButtons = children.map((child) => {
+                const deletable = child.remote_id.startsWith("__local_");
+                return (
+                  <div
+                    key={child.id}
+                    onContextMenu={(e) => {
+                      e.preventDefault();
+                      e.stopPropagation();
+                      if (!deletable) return;
+                      setContextMenu({ x: e.clientX, y: e.clientY, folder: child });
+                    }}
+                  >
+                    <SidebarButton
+                      icon={folderIcon(child.role)}
+                      label={folderLabel(child)}
+                      badge={showUnread ? unreadCountForFolder(child.id, folders, unreadCounts) : undefined}
+                      isActive={child.id === activeFolderId && activeView === "inbox"}
+                      collapsed={sidebarCollapsed}
+                      style={{ ...buttonBase, paddingLeft: sidebarCollapsed ? "7px" : "24px" }}
+                      onClick={() => handleFolderClick(child.id)}
+                    />
+                  </div>
+                );
+              });
+              if (children.length > 0) {
+                const isCollapsed = collapsedParents.has(folder.id);
+                return (
+                  <div key={folder.id}>
+                    <button
+                      type="button"
+                      onClick={() => toggleParentFolder(folder.id)}
+                      aria-expanded={!isCollapsed}
+                      title={sidebarCollapsed ? folderLabel(folder) : undefined}
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        gap: "8px",
+                        width: "100%",
+                        padding: sidebarCollapsed ? "7px" : "6px 10px",
+                        fontSize: "13px",
+                        color: "var(--color-text-primary)",
+                        background: "transparent",
+                        border: "none",
+                        borderRadius: "6px",
+                        cursor: "pointer",
+                        justifyContent: sidebarCollapsed ? "center" : "flex-start",
+                      }}
+                      onMouseEnter={(e) => {
+                        e.currentTarget.style.backgroundColor = "var(--color-sidebar-hover)";
+                      }}
+                      onMouseLeave={(e) => {
+                        e.currentTarget.style.backgroundColor = "transparent";
+                      }}
+                    >
+                      <FolderTree size={16} />
+                      {!sidebarCollapsed && (
+                        <>
+                          <span
+                            style={{
+                              flex: 1,
+                              overflow: "hidden",
+                              textOverflow: "ellipsis",
+                              whiteSpace: "nowrap",
+                              textAlign: "left",
+                            }}
+                          >
+                            {folderLabel(folder)}
+                          </span>
+                          {isCollapsed ? <ChevronRight size={14} /> : <ChevronDown size={14} />}
+                        </>
+                      )}
+                    </button>
+                    {!isCollapsed && childButtons}
+                  </div>
+                );
+              }
+              return (
+                <SidebarButton
+                  key={folder.id}
+                  icon={folderIcon(folder.role)}
+                  label={folderLabel(folder)}
+                  badge={showUnread ? unreadCountForFolder(folder.id, folders, unreadCounts) : undefined}
+                  isActive={folder.id === activeFolderId && activeView === "inbox"}
+                  collapsed={sidebarCollapsed}
+                  style={buttonBase}
+                  onClick={() => handleFolderClick(folder.id)}
+                />
+              );
+            })
           : DEFAULT_FOLDERS.flatMap((df, index) => {
               const items: React.ReactNode[] = [];
               if (df.role === "drafts") {
@@ -374,6 +537,60 @@ export default function Sidebar() {
         />
       </nav>
     </aside>
+    {contextMenu && (
+      <div
+        style={{
+          position: "fixed",
+          left: contextMenu.x,
+          top: contextMenu.y,
+          zIndex: 1000,
+          minWidth: "120px",
+          backgroundColor: "var(--color-bg)",
+          border: "1px solid var(--color-border)",
+          borderRadius: "5px",
+          boxShadow: "0 2px 8px rgba(0,0,0,0.2)",
+          padding: "3px",
+        }}
+        onClick={(e) => e.stopPropagation()}
+      >
+        <button
+          type="button"
+          onClick={() => {
+            const target = contextMenu.folder;
+            setContextMenu(null);
+            void handleDeleteFolder(target);
+          }}
+          style={{
+            display: "flex",
+            alignItems: "center",
+            gap: "6px",
+            width: "100%",
+            padding: "5px 8px",
+            border: "none",
+            background: "transparent",
+            color: "var(--color-text-primary)",
+            fontSize: "12px",
+            lineHeight: 1,
+            textAlign: "left",
+            borderRadius: "3px",
+            cursor: "pointer",
+            whiteSpace: "nowrap",
+          }}
+          onMouseEnter={(e) => {
+            e.currentTarget.style.backgroundColor = "var(--color-bg-hover)";
+            e.currentTarget.style.color = "#ef4444";
+          }}
+          onMouseLeave={(e) => {
+            e.currentTarget.style.backgroundColor = "transparent";
+            e.currentTarget.style.color = "var(--color-text-primary)";
+          }}
+        >
+          <Trash2 size={13} />
+          {t("sidebar.deleteFolder", "Delete folder")}
+        </button>
+      </div>
+    )}
+    </>
   );
 }
 

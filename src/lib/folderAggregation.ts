@@ -4,6 +4,9 @@ export const ALL_ACCOUNTS_SELECT_VALUE = "__all_accounts__";
 export const ALL_ACCOUNTS_ID = "all";
 export const ALL_ACCOUNTS_FOLDER_PREFIX = "all:";
 
+/** Remote id of the local parent folder that holds rule-created folders. */
+export const RULES_PARENT_REMOTE_ID = "__local_rules__";
+
 export type FolderRole = NonNullable<Folder["role"]>;
 
 const SYSTEM_ROLE_ORDER: FolderRole[] = ["inbox", "sent", "archive", "drafts", "trash", "spam"];

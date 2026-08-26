@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { Plus, Pencil, Trash2, ShieldCheck, X } from "lucide-react";
-import { createRule, deleteRule, listRules, updateRule, type Rule } from "@/lib/api";
+import { useQueryClient } from "@tanstack/react-query";
+import { Plus, Pencil, Trash2, ShieldCheck, X, Play } from "lucide-react";
+import { createRule, deleteRule, listRules, updateRule, runRulesNow, type Rule } from "@/lib/api";
 import ConfirmDialog from "@/components/ConfirmDialog";
 import { useToastStore } from "@/stores/toast.store";
 import { useUIStore } from "@/stores/ui.store";
@@ -84,6 +85,7 @@ function buildRuleFormFromSelection(text: string, name: string): RuleFormData {
 export default function RulesTab() {
   const { t } = useTranslation();
   const addToast = useToastStore((s) => s.addToast);
+  const queryClient = useQueryClient();
   const pendingRuleDraftText = useUIStore((s) => s.pendingRuleDraftText);
   const setPendingRuleDraftText = useUIStore((s) => s.setPendingRuleDraftText);
   const [rules, setRules] = useState<Rule[]>([]);
@@ -92,6 +94,7 @@ export default function RulesTab() {
   const [error, setError] = useState<string | null>(null);
   const [fetchError, setFetchError] = useState<string | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<{ id: string; name: string } | null>(null);
+  const [runningRules, setRunningRules] = useState(false);
 
   async function fetchRules() {
     setFetchError(null);
@@ -187,6 +190,31 @@ export default function RulesTab() {
     } catch (err) {
       addToast({ message: t("rules.deleteFailed", "Failed to delete rule"), type: "error" });
       console.error("Failed to delete rule:", err);
+    }
+  }
+
+  async function handleRunRules() {
+    setRunningRules(true);
+    try {
+      const result = await runRulesNow();
+      queryClient.invalidateQueries({ queryKey: ["folders"] });
+      queryClient.invalidateQueries({ queryKey: ["messages"] });
+      queryClient.invalidateQueries({ queryKey: ["threads"] });
+      queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
+      queryClient.invalidateQueries({ queryKey: ["starred-messages"] });
+      addToast({
+        message: t("rules.runNowDone", {
+          matched: result.messages_matched,
+          applied: result.actions_applied,
+          defaultValue: `Rules applied to ${result.messages_matched} messages (${result.actions_applied} actions)`,
+        }),
+        type: "success",
+      });
+    } catch (err) {
+      addToast({ message: t("rules.runNowFailed", "Failed to run rules"), type: "error" });
+      console.error("Failed to run rules:", err);
+    } finally {
+      setRunningRules(false);
     }
   }
 
@@ -547,26 +575,49 @@ export default function RulesTab() {
         >
           {t("rules.title")}
         </h2>
-        <button
-          onClick={startCreate}
-          disabled={editingId !== null}
-          style={{
-            display: "flex",
-            alignItems: "center",
-            gap: "6px",
-            padding: "7px 14px",
-            borderRadius: "6px",
-            border: "none",
-            backgroundColor: editingId !== null ? "var(--color-border)" : "var(--color-accent)",
-            color: "#fff",
-            fontSize: "13px",
-            fontWeight: 600,
-            cursor: editingId !== null ? "not-allowed" : "pointer",
-          }}
-        >
-          <Plus size={14} />
-          {t("rules.addRule")}
-        </button>
+        <div style={{ display: "flex", gap: "8px", alignItems: "center" }}>
+          <button
+            onClick={handleRunRules}
+            disabled={runningRules}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              padding: "7px 14px",
+              borderRadius: "6px",
+              border: "1px solid var(--color-border)",
+              backgroundColor: "transparent",
+              color: "var(--color-text-primary)",
+              fontSize: "13px",
+              fontWeight: 500,
+              cursor: runningRules ? "not-allowed" : "pointer",
+              opacity: runningRules ? 0.6 : 1,
+            }}
+          >
+            <Play size={14} />
+            {runningRules ? t("rules.running") : t("rules.runNow")}
+          </button>
+          <button
+            onClick={startCreate}
+            disabled={editingId !== null}
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: "6px",
+              padding: "7px 14px",
+              borderRadius: "6px",
+              border: "none",
+              backgroundColor: editingId !== null ? "var(--color-border)" : "var(--color-accent)",
+              color: "#fff",
+              fontSize: "13px",
+              fontWeight: 600,
+              cursor: editingId !== null ? "not-allowed" : "pointer",
+            }}
+          >
+            <Plus size={14} />
+            {t("rules.addRule")}
+          </button>
+        </div>
       </div>
 
       {/* Inline editor for new rule */}

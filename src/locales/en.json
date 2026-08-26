@@ -50,7 +50,10 @@
     "search": "Search",
     "mailFolders": "Mail folders",
     "tools": "Tools",
-    "allAccounts": "All accounts"
+    "allAccounts": "All accounts",
+    "categoriesFolder": "All Mail",
+    "deleteFolder": "Delete folder",
+    "deleteFolderConfirm": "Delete folder \"{{name}}\"? Messages inside will be moved back to the Inbox."
   },
   "inbox": {
     "searchPlaceholder": "Search messages...",
@@ -692,7 +695,11 @@
     "actionValue": "Action value",
     "kanbanColumn": "Kanban column",
     "conditionValueRequired": "Condition values cannot be empty.",
-    "contextRuleName": "Selected text rule"
+    "contextRuleName": "Selected text rule",
+    "runNow": "Run rules now",
+    "running": "Running rules…",
+    "runNowDone": "Rules applied to {{matched}} messages ({{applied}} actions)",
+    "runNowFailed": "Failed to run rules"
   },
   "translate": {
     "title": "Translation",

@@ -50,7 +50,10 @@
     "search": "搜索",
     "mailFolders": "邮件文件夹",
     "tools": "工具",
-    "allAccounts": "全部邮箱"
+    "allAccounts": "全部邮箱",
+    "categoriesFolder": "所有邮件",
+    "deleteFolder": "删除文件夹",
+    "deleteFolderConfirm": "删除文件夹「{{name}}」？其中的邮件将移回收件箱。"
   },
   "inbox": {
     "searchPlaceholder": "搜索邮件...",
@@ -692,7 +695,11 @@
     "actionValue": "动作值",
     "kanbanColumn": "看板列",
     "conditionValueRequired": "条件值不能为空。",
-    "contextRuleName": "选中文本规则"
+    "contextRuleName": "选中文本规则",
+    "runNow": "立即运行规则",
+    "running": "正在运行规则…",
+    "runNowDone": "已对 {{matched}} 封邮件应用规则（共 {{applied}} 个动作）",
+    "runNowFailed": "运行规则失败"
   },
   "translate": {
     "title": "翻译",

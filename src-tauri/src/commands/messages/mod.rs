@@ -171,27 +171,37 @@ pub(crate) fn refresh_search_documents(
     state: &AppState,
     message_ids: &[String],
 ) -> std::result::Result<(), PebbleError> {
+    refresh_search_documents_with_store(&state.store, &state.search, message_ids)
+}
+
+/// Store/search variant of [`refresh_search_documents`] that only needs the two
+/// `Arc`s, so it can run inside a `spawn_blocking` closure.
+pub(crate) fn refresh_search_documents_with_store(
+    store: &Store,
+    search: &TantivySearch,
+    message_ids: &[String],
+) -> std::result::Result<(), PebbleError> {
     if message_ids.is_empty() {
         return Ok(());
     }
-    state.store.add_search_pending(message_ids, "index")?;
+    store.add_search_pending(message_ids, "index")?;
     for message_id in message_ids {
-        match state.store.get_message(message_id)? {
+        match store.get_message(message_id)? {
             Some(message) if !message.is_deleted => {
-                let folder_ids = state.store.get_message_folder_ids(message_id)?;
+                let folder_ids = store.get_message_folder_ids(message_id)?;
                 if folder_ids.is_empty() {
-                    state.search.remove_message(message_id)?;
+                    search.remove_message(message_id)?;
                 } else {
-                    state.search.index_message(&message, &folder_ids)?;
+                    search.index_message(&message, &folder_ids)?;
                 }
             }
             Some(_) | None => {
-                state.search.remove_message(message_id)?;
+                search.remove_message(message_id)?;
             }
         }
     }
-    state.search.commit()?;
-    state.store.clear_search_pending(message_ids)?;
+    search.commit()?;
+    store.clear_search_pending(message_ids)?;
     Ok(())
 }
 
