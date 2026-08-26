@@ -23,7 +23,6 @@ const DEFAULT_BINDINGS: Record<string, string> = {
   "prev-message": "K",
   "open-message": "Enter",
   "toggle-star": "S",
-  "archive-message": "E",
   "compose-new": "C",
   "reply": "R",
   "reply-all": "A",

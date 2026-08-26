@@ -2,9 +2,9 @@ import { useRef, useMemo, useState, useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Inbox, Archive, Trash2, MailOpen, MailCheck, Star, X } from "lucide-react";
+import { Inbox, Trash2, MailOpen, MailCheck, Star, X } from "lucide-react";
 import type { MessageSummary } from "@/lib/api";
-import { getMessageLabelsBatch, batchArchive, batchDelete, batchMarkRead, batchStar } from "@/lib/api";
+import { getMessageLabelsBatch, batchDelete, batchMarkRead, batchStar } from "@/lib/api";
 import { useAccountsQuery, useFoldersForAccountsQuery } from "@/hooks/queries";
 import { useMailStore } from "@/stores/mail.store";
 import { useToastStore } from "@/stores/toast.store";
@@ -122,11 +122,11 @@ export default function MessageList({
     queryClient.invalidateQueries({ queryKey: ["starred-messages"] });
   }
 
-  function batchActionChangesUnreadCounts(action: "archive" | "delete" | "markRead" | "markUnread" | "star" | "unstar") {
+  function batchActionChangesUnreadCounts(action: "delete" | "markRead" | "markUnread" | "star" | "unstar") {
     return action !== "star" && action !== "unstar";
   }
 
-  async function handleBatchAction(action: "archive" | "delete" | "markRead" | "markUnread" | "star" | "unstar") {
+  async function handleBatchAction(action: "delete" | "markRead" | "markUnread" | "star" | "unstar") {
     const ids = [...selectedMessageIds];
     if (ids.length === 0) return;
     if (action === "delete") {
@@ -145,8 +145,7 @@ export default function MessageList({
     setBatchLoading(true);
     try {
       let count = 0;
-      if (action === "archive") count = await batchArchive(ids);
-      else if (action === "delete") count = await batchDelete(ids);
+      if (action === "delete") count = await batchDelete(ids);
       else if (action === "markRead") count = await batchMarkRead(ids, true);
       else if (action === "markUnread") count = await batchMarkRead(ids, false);
       else if (action === "star") count = await batchStar(ids, true);
@@ -189,7 +188,6 @@ export default function MessageList({
           </label>
           {selectedMessageIds.size > 0 && (
             <>
-              <BatchBtn icon={Archive} label={t("messageActions.archive")} onClick={() => handleBatchAction("archive")} disabled={batchLoading} />
               <BatchBtn icon={Trash2} label={t("common.delete")} onClick={() => handleBatchAction("delete")} disabled={batchLoading} />
               <BatchBtn icon={MailOpen} label={t("batch.markRead")} onClick={() => handleBatchAction("markRead")} disabled={batchLoading} />
               <BatchBtn icon={MailCheck} label={t("batch.markUnread")} onClick={() => handleBatchAction("markUnread")} disabled={batchLoading} />

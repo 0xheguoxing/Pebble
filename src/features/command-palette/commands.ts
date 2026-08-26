@@ -4,9 +4,9 @@ import { useComposeStore } from "@/stores/compose.store";
 import { useMailStore } from "@/stores/mail.store";
 import { useKanbanStore } from "@/stores/kanban.store";
 import { useToastStore } from "@/stores/toast.store";
-import { updateMessageFlags, archiveMessage } from "@/lib/api";
+import { updateMessageFlags } from "@/lib/api";
 import { queryClient } from "@/lib/query-client";
-import { patchMessagesCache, findCachedMessage } from "@/hooks/queries";
+import { findCachedMessage } from "@/hooks/queries";
 
 export function buildCommands(t: (key: string, defaultValue: string) => string): Command[] {
   return [
@@ -102,30 +102,6 @@ export function buildCommands(t: (key: string, defaultValue: string) => string):
       execute: () => useComposeStore.getState().openCompose("new"),
     },
     // Settings
-    {
-      id: "mail:archive",
-      name: t("commands.archiveMessage", "Archive Message"),
-      shortcut: "E",
-      category: t("commands.mail", "Mail"),
-      execute: async () => {
-        const id = useMailStore.getState().selectedMessageId;
-        if (!id) return;
-        patchMessagesCache(queryClient, (page) => page.filter((m) => m.id !== id));
-        useMailStore.getState().setSelectedMessage(null);
-        try {
-          const result = await archiveMessage(id);
-          if (result === "skipped") return;
-          queryClient.invalidateQueries({ queryKey: ["messages"] });
-          queryClient.invalidateQueries({ queryKey: ["threads"] });
-          queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
-          const msg = result === "unarchived" ? t("messageActions.unarchiveSuccess", "Message moved to inbox") : t("messageActions.archiveSuccess", "Message archived");
-          useToastStore.getState().addToast({ message: msg, type: "success" });
-        } catch {
-          queryClient.invalidateQueries({ queryKey: ["messages"] });
-          useToastStore.getState().addToast({ message: t("messageActions.archiveFailed", "Failed to archive"), type: "error" });
-        }
-      },
-    },
     {
       id: "mail:add-to-kanban",
       name: t("commands.addToKanban", "Add to Kanban"),

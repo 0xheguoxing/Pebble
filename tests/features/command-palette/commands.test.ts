@@ -113,13 +113,6 @@ describe("command palette mail commands", () => {
     expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["folder-unread-counts"] });
   });
 
-  it("refreshes folder unread counts after archive", async () => {
-    await command("mail:archive").execute();
-
-    expect(mocks.archiveMessage).toHaveBeenCalledWith("message-1");
-    expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["folder-unread-counts"] });
-  });
-
   it("does not refresh folder unread counts for star-only changes", async () => {
     await command("mail:star").execute();
 

@@ -99,43 +99,6 @@ describe("MessageItem", () => {
     mocks.moveToFolder.mockResolvedValue(undefined);
   });
 
-  it("labels the archive action as unarchive in the archive folder", () => {
-    render(
-      <MessageItem
-        message={makeMessage()}
-        isSelected={false}
-        onClick={vi.fn()}
-        {...({ folderRole: "archive" } as Record<string, unknown>)}
-      />,
-    );
-
-    fireEvent.mouseEnter(screen.getByRole("option"));
-
-    expect(screen.getByRole("button", { name: "Unarchive" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Archive" })).toBeNull();
-  });
-
-  it("restores message lists when archive optimistic update fails", async () => {
-    const snapshot = { messages: "before-archive" };
-    mocks.snapshotMessagesCache.mockReturnValueOnce(snapshot);
-    mocks.archiveMessage.mockRejectedValueOnce(new Error("archive failed"));
-
-    render(
-      <MessageItem
-        message={makeMessage()}
-        isSelected={false}
-        onClick={vi.fn()}
-      />,
-    );
-
-    fireEvent.mouseEnter(screen.getByRole("option"));
-    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
-
-    expect(mocks.snapshotMessagesCache).toHaveBeenCalledWith(mocks.queryClient);
-    expect(mocks.patchMessagesCache).toHaveBeenCalledWith(mocks.queryClient, expect.any(Function));
-    await waitFor(() => expect(mocks.restoreMessagesCache).toHaveBeenCalledWith(mocks.queryClient, snapshot));
-  });
-
   it("restores message lists when spam optimistic update fails", async () => {
     const snapshot = { messages: "before-spam" };
     mocks.snapshotMessagesCache.mockReturnValueOnce(snapshot);
@@ -156,22 +119,6 @@ describe("MessageItem", () => {
     expect(mocks.snapshotMessagesCache).toHaveBeenCalledWith(mocks.queryClient);
     expect(mocks.patchMessagesCache).toHaveBeenCalledWith(mocks.queryClient, expect.any(Function));
     await waitFor(() => expect(mocks.restoreMessagesCache).toHaveBeenCalledWith(mocks.queryClient, snapshot));
-  });
-
-  it("refreshes folder unread counts after a successful archive action", async () => {
-    render(
-      <MessageItem
-        message={makeMessage()}
-        isSelected={false}
-        onClick={vi.fn()}
-      />,
-    );
-
-    fireEvent.mouseEnter(screen.getByRole("option"));
-    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
-
-    await waitFor(() => expect(mocks.archiveMessage).toHaveBeenCalledWith("message-1"));
-    expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["folder-unread-counts"] });
   });
 
   it("refreshes folder unread counts after a successful spam action", async () => {

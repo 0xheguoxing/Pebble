@@ -105,7 +105,14 @@ pub fn resolve_profile_data_dir(
         return Ok(portable_path);
     }
 
-    Ok(fallback_app_data)
+    // Default the profile to a portable directory next to the executable so
+    // mail data lives in the installation directory. When the installation
+    // directory is not writable (e.g. a system-wide install), fall back to the
+    // per-user app data directory.
+    match std::fs::create_dir_all(&portable_path) {
+        Ok(()) => Ok(portable_path),
+        Err(_) => Ok(fallback_app_data),
+    }
 }
 
 pub fn resolve_app_profile_data_dir(
@@ -238,14 +245,14 @@ mod tests {
     }
 
     #[test]
-    fn empty_pointer_file_falls_back_to_default_app_data_dir() {
+    fn empty_pointer_file_defaults_to_portable_profile_dir() {
         let exe_dir = temp_dir("pointer-empty-exe");
         let fallback = temp_dir("pointer-empty-fallback");
         fs::write(exe_dir.join(PROFILE_POINTER_FILENAME), "\n\n").expect("pointer file writable");
 
         let resolved = resolve_profile_data_dir(&exe_dir, fallback.clone(), None).unwrap();
 
-        assert_eq!(resolved, fallback);
+        assert_eq!(resolved, exe_dir.join(PORTABLE_PROFILE_DIRNAME));
         let _ = fs::remove_dir_all(exe_dir);
         let _ = fs::remove_dir_all(fallback);
     }
@@ -265,13 +272,13 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_default_app_data_dir_when_no_override_exists() {
+    fn defaults_to_portable_profile_dir_when_no_override_exists() {
         let exe_dir = temp_dir("fallback-exe");
         let fallback = temp_dir("fallback-app-data");
 
         let resolved = resolve_profile_data_dir(&exe_dir, fallback.clone(), None).unwrap();
 
-        assert_eq!(resolved, fallback);
+        assert_eq!(resolved, exe_dir.join(PORTABLE_PROFILE_DIRNAME));
         let _ = fs::remove_dir_all(exe_dir);
         let _ = fs::remove_dir_all(resolved);
     }

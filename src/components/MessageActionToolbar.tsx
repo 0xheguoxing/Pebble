@@ -1,11 +1,11 @@
-import { Reply, ReplyAll, Forward, Star, Archive, Trash2, LayoutGrid, RotateCcw } from "lucide-react";
+import { Reply, ReplyAll, Forward, Star, Trash2, LayoutGrid, RotateCcw } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { useKanbanStore } from "@/stores/kanban.store";
 import { useToastStore } from "@/stores/toast.store";
 import { useTranslation } from "react-i18next";
 import { useUpdateFlagsMutation } from "@/hooks/mutations/useUpdateFlagsMutation";
 import { useComposeStore } from "@/stores/compose.store";
-import { archiveMessage, deleteMessage, restoreMessage } from "@/lib/api";
+import { deleteMessage, restoreMessage } from "@/lib/api";
 import type { Message } from "@/lib/api";
 import {
   patchMessagesCache,
@@ -93,41 +93,6 @@ export default function MessageActionToolbar({
         );
       },
       active: message.is_starred,
-    },
-    {
-      icon: folderRole === "archive" ? RotateCcw : Archive,
-      label: folderRole === "archive"
-        ? t("messageActions.unarchive", "Unarchive")
-        : t("messageActions.archive"),
-      action: async () => {
-        const previousLists = snapshotMessagesCache(queryClient);
-        patchMessagesCache(queryClient, (page) => page.filter((m) => m.id !== message.id));
-        try {
-          const result = await archiveMessage(message.id);
-          if (result === "skipped") return;
-          invalidateMessageViews(true);
-          if (result === "unarchived") {
-            useToastStore.getState().addToast({
-              message: t("messageActions.unarchiveSuccess", "Message moved to inbox"),
-              type: "success",
-            });
-          } else {
-            useToastStore.getState().addToast({
-              message: t("messageActions.archiveSuccess", "Message archived"),
-              type: "success",
-            });
-          }
-          onBack();
-        } catch {
-          restoreMessagesCache(queryClient, previousLists);
-          useToastStore.getState().addToast({
-            message: folderRole === "archive"
-              ? t("messageActions.unarchiveFailed", "Failed to unarchive")
-              : t("messageActions.archiveFailed", "Failed to archive message"),
-            type: "error",
-          });
-        }
-      },
     },
     ...(folderRole === "trash" ? [{
       icon: RotateCcw,

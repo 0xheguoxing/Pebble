@@ -367,6 +367,15 @@ async fn replay_remote_update_flags(
                 .ok_or_else(|| {
                     PebbleError::Internal("Pending update_flags has no IMAP folder".to_string())
                 })?;
+
+            // Local-only folders (e.g. `__local_archive__`) have no remote
+            // counterpart, so a flag update on them is already fully applied
+            // locally. Retrying against the server would always fail with
+            // "<folder> doesn't exist".
+            if folder_remote_id.starts_with("__local_") {
+                return Ok(());
+            }
+
             let uid = message
                 .remote_id
                 .parse::<u32>()

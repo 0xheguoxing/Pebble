@@ -27,7 +27,10 @@ export default function TitleBar() {
     <div
       data-tauri-drag-region
       className="flex items-center justify-between h-9 select-none"
-      style={{ backgroundColor: "var(--color-titlebar-bg)" }}
+      style={{
+        backgroundColor: "var(--color-titlebar-bg)",
+        borderBottom: "1px solid var(--color-border)",
+      }}
     >
       <div
         data-tauri-drag-region

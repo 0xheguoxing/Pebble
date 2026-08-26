@@ -5,8 +5,7 @@ import { useUIStore, type ActiveView } from "@/stores/ui.store";
 import { useComposeStore, isComposeDirty } from "@/stores/compose.store";
 import { useConfirmStore } from "@/stores/confirm.store";
 import { useMailStore } from "@/stores/mail.store";
-import { useToastStore } from "@/stores/toast.store";
-import { updateMessageFlags, archiveMessage, getMessage } from "@/lib/api";
+import { updateMessageFlags, getMessage } from "@/lib/api";
 import { queryClient } from "@/lib/query-client";
 import type { MessageSummary, ThreadSummary } from "@/lib/api";
 import { patchMessagesCache, readFirstCachedMessages } from "@/hooks/queries";
@@ -156,31 +155,6 @@ export function useKeyboard() {
                   );
                 });
             }
-          }
-          break;
-        }
-        case "archive-message": {
-          const { selectedMessageId } = useMailStore.getState();
-          if (selectedMessageId) {
-            // Optimistic removal from React Query cache
-            patchMessagesCache(queryClient, (page) =>
-              page.filter((m) => m.id !== selectedMessageId),
-            );
-            useMailStore.getState().setSelectedMessage(null);
-            archiveMessage(selectedMessageId)
-              .then((result) => {
-                if (result === "skipped") return;
-                queryClient.invalidateQueries({ queryKey: ["messages"] });
-                queryClient.invalidateQueries({ queryKey: ["threads"] });
-                queryClient.invalidateQueries({ queryKey: ["folder-unread-counts"] });
-                const msg = result === "unarchived" ? i18n.t("messageActions.unarchiveSuccess", "Message moved to inbox") : i18n.t("messageActions.archiveSuccess", "Message archived");
-                useToastStore.getState().addToast({ message: msg, type: "success" });
-              })
-              .catch(() => {
-                queryClient.invalidateQueries({ queryKey: ["messages"] });
-                useMailStore.getState().setSelectedMessage(selectedMessageId);
-                useToastStore.getState().addToast({ message: i18n.t("messageActions.archiveFailed", "Failed to archive"), type: "error" });
-              });
           }
           break;
         }

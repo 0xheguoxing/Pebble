@@ -378,6 +378,8 @@ pub fn run() {
 
             let attachments_dir = app_data.join("attachments");
             std::fs::create_dir_all(&attachments_dir)?;
+            app.asset_protocol_scope()
+                .allow_directory(&attachments_dir, true)?;
             tracing::info!("Attachments directory: {}", attachments_dir.display());
             log_startup_phase(startup_start, &mut startup_phase, "attachments directory ready");
 

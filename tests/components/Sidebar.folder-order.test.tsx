@@ -126,7 +126,6 @@ describe("Sidebar folder order", () => {
     expect(labels).toEqual([
       "Inbox",
       "Sent",
-      "Archive",
       "Starred",
       "Drafts",
       "Trash",

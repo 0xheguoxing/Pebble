@@ -127,21 +127,6 @@ describe("MessageActionToolbar", () => {
     mocks.restoreMessage.mockResolvedValue(undefined);
   });
 
-  it("refreshes folder unread counts after archive from the detail toolbar", async () => {
-    render(
-      <MessageActionToolbar
-        message={makeMessage()}
-        onBack={vi.fn()}
-        onMessageUpdate={vi.fn()}
-      />,
-    );
-
-    fireEvent.click(screen.getByRole("button", { name: "Archive" }));
-
-    await waitFor(() => expect(mocks.archiveMessage).toHaveBeenCalledWith("message-1"));
-    expect(mocks.queryClient.invalidateQueries).toHaveBeenCalledWith({ queryKey: ["folder-unread-counts"] });
-  });
-
   it("refreshes folder unread counts after restore from the detail toolbar", async () => {
     render(
       <MessageActionToolbar

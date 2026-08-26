@@ -1,9 +1,9 @@
 import { memo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useQueryClient } from "@tanstack/react-query";
-import { Star, Paperclip, Archive, LayoutGrid, ShieldAlert, RotateCcw } from "lucide-react";
+import { Star, Paperclip, LayoutGrid, ShieldAlert } from "lucide-react";
 import type { EmailAddress, Folder, Label, MessageSummary } from "@/lib/api";
-import { updateMessageFlags, archiveMessage, moveToFolder } from "@/lib/api";
+import { updateMessageFlags, moveToFolder } from "@/lib/api";
 import { useKanbanStore } from "@/stores/kanban.store";
 import { useToastStore } from "@/stores/toast.store";
 import { patchMessagesCache, restoreMessagesCache, snapshotMessagesCache } from "@/hooks/queries";
@@ -52,10 +52,6 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
   const [showActions, setShowActions] = useState(false);
   const fontWeight = message.is_read ? "normal" : "600";
   const inKanban = useKanbanStore((s) => s.cardIdSet.has(message.id));
-  const archiveActionLabel = folderRole === "archive"
-    ? t("messageActions.unarchive", "Unarchive")
-    : t("messageActions.archive", "Archive");
-  const ArchiveActionIcon = folderRole === "archive" ? RotateCcw : Archive;
   const primaryContact = folderRole === "sent" && message.to_list.length > 0
     ? recipientLabel(message.to_list)
     : message.from_name || message.from_address;
@@ -240,47 +236,6 @@ function MessageItem({ message, labels = [], isSelected, onClick, onToggleStar, 
             boxShadow: "0 1px 4px rgba(0,0,0,0.08)",
           }}
         >
-          <button
-            onClick={(e) => {
-              e.stopPropagation();
-              const previousLists = snapshotMessagesCache(queryClient);
-              patchMessagesCache(queryClient, (page) => page.filter((m) => m.id !== message.id));
-              archiveMessage(message.id)
-                .then((result) => {
-                  if (result === "skipped") {
-                    restoreMessagesCache(queryClient, previousLists);
-                    return;
-                  }
-                  invalidateMessageViews(true);
-                  const msg = result === "unarchived"
-                    ? t("messageActions.unarchiveSuccess", "Message moved to inbox")
-                    : t("messageActions.archiveSuccess", "Message archived");
-                  useToastStore.getState().addToast({ message: msg, type: "success" });
-                })
-                .catch(() => {
-                  restoreMessagesCache(queryClient, previousLists);
-                  queryClient.invalidateQueries({ queryKey: ["messages"] });
-                  const msg = folderRole === "archive"
-                    ? t("messageActions.unarchiveFailed", "Failed to unarchive")
-                    : t("messageActions.archiveFailed", "Failed to archive");
-                  useToastStore.getState().addToast({ message: msg, type: "error" });
-                });
-            }}
-            aria-label={archiveActionLabel}
-            title={archiveActionLabel}
-            style={{
-              padding: "4px",
-              border: "none",
-              background: "transparent",
-              borderRadius: "4px",
-              cursor: "pointer",
-              display: "flex",
-              alignItems: "center",
-              color: "var(--color-text-secondary)",
-            }}
-          >
-            <ArchiveActionIcon size={14} />
-          </button>
           {spamFolderId && (
             <button
               onClick={(e) => {

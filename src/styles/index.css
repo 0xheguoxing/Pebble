@@ -688,7 +688,7 @@ textarea:focus-visible {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 12px 18px;
+  padding: 5px 14px;
   border-bottom: 1px solid var(--color-border);
   background: color-mix(in srgb, var(--color-bg) 94%, var(--color-bg-secondary));
 }
@@ -696,11 +696,11 @@ textarea:focus-visible {
 .search-input-shell {
   flex: 1;
   min-width: 0;
-  height: 42px;
+  height: 30px;
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 0 14px;
+  padding: 0 12px;
   border: 1px solid var(--color-border);
   border-radius: 8px;
   background: var(--color-bg);

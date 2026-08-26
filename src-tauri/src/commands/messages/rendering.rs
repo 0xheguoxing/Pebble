@@ -1,7 +1,9 @@
 use crate::state::AppState;
 use pebble_core::{Message, PebbleError, PrivacyMode, RenderedHtml, TrustType};
-use pebble_privacy::PrivacyGuard;
+use pebble_privacy::{normalize_cid, PrivacyGuard};
 use pebble_store::Store;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use tauri::State;
 
 #[tauri::command]
@@ -11,14 +13,21 @@ pub async fn get_rendered_html(
     privacy_mode: PrivacyMode,
 ) -> std::result::Result<RenderedHtml, PebbleError> {
     let store = state.store.clone();
+    let attachments_dir = state.attachments_dir.clone();
     tokio::task::spawn_blocking(move || {
         let message = store
             .get_message(&message_id)?
             .ok_or_else(|| PebbleError::Internal(format!("Message not found: {message_id}")))?;
 
         let effective_mode = resolve_privacy_mode(&store, &message, privacy_mode)?;
+        let cid_images = build_cid_image_map(&store, &attachments_dir, &message_id)?;
         let guard = PrivacyGuard::new();
-        Ok(guard.render_message_html(&message.body_html_raw, &message.body_text, &effective_mode))
+        Ok(guard.render_message_html_with_cid_images(
+            &message.body_html_raw,
+            &message.body_text,
+            &effective_mode,
+            &cid_images,
+        ))
     })
     .await
     .map_err(|e| PebbleError::Internal(format!("Task join error: {e}")))?
@@ -31,6 +40,7 @@ pub async fn get_message_with_html(
     privacy_mode: PrivacyMode,
 ) -> std::result::Result<Option<(Message, RenderedHtml)>, PebbleError> {
     let store = state.store.clone();
+    let attachments_dir = state.attachments_dir.clone();
     tokio::task::spawn_blocking(move || {
         let message = match store.get_message(&message_id)? {
             Some(m) => m,
@@ -38,9 +48,14 @@ pub async fn get_message_with_html(
         };
 
         let effective_mode = resolve_privacy_mode(&store, &message, privacy_mode)?;
+        let cid_images = build_cid_image_map(&store, &attachments_dir, &message_id)?;
         let guard = PrivacyGuard::new();
-        let rendered =
-            guard.render_message_html(&message.body_html_raw, &message.body_text, &effective_mode);
+        let rendered = guard.render_message_html_with_cid_images(
+            &message.body_html_raw,
+            &message.body_text,
+            &effective_mode,
+            &cid_images,
+        );
         Ok(Some((message, rendered)))
     })
     .await
@@ -82,6 +97,91 @@ fn resolve_privacy_mode(
         PrivacyMode::TrustSender(_) => Ok(PrivacyMode::Strict),
         PrivacyMode::Off => Ok(PrivacyMode::Off),
     }
+}
+
+/// Builds a map from normalized content id to a loadable asset URL for a
+/// message's inline attachments. Attachment files may have been recorded under
+/// an older profile directory, so their paths are re-rooted to the current
+/// attachments directory before being turned into URLs.
+fn build_cid_image_map(
+    store: &Store,
+    attachments_dir: &Path,
+    message_id: &str,
+) -> std::result::Result<HashMap<String, String>, PebbleError> {
+    let mut map = HashMap::new();
+    for attachment in store.list_attachments_by_message(message_id)? {
+        if !attachment.is_inline {
+            continue;
+        }
+        let Some(content_id) = attachment.content_id else {
+            continue;
+        };
+        let Some(cid) = normalize_cid(&content_id) else {
+            continue;
+        };
+        let Some(local_path) = attachment.local_path else {
+            continue;
+        };
+        let resolved = resolve_attachment_path(attachments_dir, &attachment.message_id, &local_path);
+        map.insert(cid, asset_url(&resolved));
+    }
+    Ok(map)
+}
+
+/// Re-roots an attachment path that was recorded under a previous profile
+/// directory to the current attachments directory. The stored path is expected
+/// to contain the message id as a path segment; everything from that segment on
+/// is preserved.
+fn resolve_attachment_path(attachments_dir: &Path, message_id: &str, local_path: &str) -> PathBuf {
+    let local = Path::new(local_path);
+    if local.starts_with(attachments_dir) {
+        return local.to_path_buf();
+    }
+
+    let mut resolved = attachments_dir.to_path_buf();
+    let mut found = false;
+    for component in local.components() {
+        if !found {
+            if component.as_os_str() == std::ffi::OsStr::new(message_id) {
+                found = true;
+            } else {
+                continue;
+            }
+        }
+        resolved.push(component.as_os_str());
+    }
+
+    if found {
+        resolved
+    } else {
+        local.to_path_buf()
+    }
+}
+
+/// Builds the asset-protocol URL Tauri uses to serve a local file to the
+/// WebView (mirrors `convertFileSrc` on Windows).
+fn asset_url(path: &Path) -> String {
+    format!(
+        "http://asset.localhost/{}",
+        encode_uri_component(&path.to_string_lossy())
+    )
+}
+
+/// Percent-encodes a path the same way `encodeURIComponent` does, so Tauri's
+/// asset protocol can decode it back to the original filesystem path.
+fn encode_uri_component(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for byte in input.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'!' | b'~'
+            | b'*' | b'\'' | b'(' | b')' => out.push(byte as char),
+            _ => {
+                out.push('%');
+                out.push_str(&format!("{byte:02X}"));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]

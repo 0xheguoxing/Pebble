@@ -91,8 +91,10 @@ export default function Sidebar() {
   const hasRealFolders = displayedFolders.length > 0;
 
   // Keep system folders stable across all-account and single-account views.
+  // Archive is intentionally hidden: this app doesn't expose an archive
+  // workflow, and local-only archive folders have no remote counterpart.
   const dedupedFolders = useMemo(() => {
-    return sortFoldersForSidebar(displayedFolders);
+    return sortFoldersForSidebar(displayedFolders).filter((f) => f.role !== "archive");
   }, [displayedFolders]);
 
   // Auto-select the only account. With multiple accounts, null means the
@@ -165,6 +167,39 @@ export default function Sidebar() {
     textAlign: "left",
     justifyContent: sidebarCollapsed ? "center" : "flex-start",
   };
+
+  const starredButton = (
+    <SidebarButton
+      key="__starred__"
+      icon={<Star size={16} />}
+      label={t("sidebar.starred", "Starred")}
+      isActive={activeView === "starred"}
+      collapsed={sidebarCollapsed}
+      style={buttonBase}
+      onClick={() => safeSetActiveView("starred")}
+    />
+  );
+
+  // Insert a Starred entry right after the inbox/sent folders, independent of
+  // whether the account actually has a drafts folder (where it used to live).
+  function renderFoldersWithStarred(
+    folders: FolderType[],
+    renderFolder: (folder: FolderType) => React.ReactNode,
+  ): React.ReactNode[] {
+    const items: React.ReactNode[] = [];
+    let starredInserted = false;
+    for (const folder of folders) {
+      if (!starredInserted && folder.role !== "inbox" && folder.role !== "sent") {
+        items.push(starredButton);
+        starredInserted = true;
+      }
+      items.push(renderFolder(folder));
+    }
+    if (!starredInserted) {
+      items.push(starredButton);
+    }
+    return items;
+  }
 
   return (
     <aside
@@ -254,50 +289,22 @@ export default function Sidebar() {
         }}
       >
         {hasRealFolders
-          ? dedupedFolders.flatMap((folder) => {
-              const items: React.ReactNode[] = [];
-              if (folder.role === "drafts") {
-                items.push(
-                  <SidebarButton
-                    key="__starred__"
-                    icon={<Star size={16} />}
-                    label={t("sidebar.starred", "Starred")}
-                    isActive={activeView === "starred"}
-                    collapsed={sidebarCollapsed}
-                    style={buttonBase}
-                    onClick={() => safeSetActiveView("starred")}
-                  />
-                );
-              }
-              const isActive = folder.id === activeFolderId && activeView === "inbox";
-              items.push(
-                <SidebarButton
-                  key={folder.id}
-                  icon={folderIcon(folder.role)}
-                  label={folderLabel(folder)}
-                  badge={showUnread ? unreadCountForFolder(folder.id, folders, unreadCounts) : undefined}
-                  isActive={isActive}
-                  collapsed={sidebarCollapsed}
-                  style={buttonBase}
-                  onClick={() => handleFolderClick(folder.id)}
-                />
-              );
-              return items;
-            })
+          ? renderFoldersWithStarred(dedupedFolders, (folder) => (
+              <SidebarButton
+                key={folder.id}
+                icon={folderIcon(folder.role)}
+                label={folderLabel(folder)}
+                badge={showUnread ? unreadCountForFolder(folder.id, folders, unreadCounts) : undefined}
+                isActive={folder.id === activeFolderId && activeView === "inbox"}
+                collapsed={sidebarCollapsed}
+                style={buttonBase}
+                onClick={() => handleFolderClick(folder.id)}
+              />
+            ))
           : DEFAULT_FOLDERS.flatMap((df, index) => {
               const items: React.ReactNode[] = [];
               if (df.role === "drafts") {
-                items.push(
-                  <SidebarButton
-                    key="__starred__"
-                    icon={<Star size={16} />}
-                    label={t("sidebar.starred", "Starred")}
-                    isActive={activeView === "starred"}
-                    collapsed={sidebarCollapsed}
-                    style={buttonBase}
-                    onClick={() => safeSetActiveView("starred")}
-                  />
-                );
+                items.push(starredButton);
               }
               items.push(
                 <SidebarButton

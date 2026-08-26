@@ -1,0 +1,6 @@
+# Limit Cargo's build parallelism so a full desktop build (e.g.
+# `pnpm build:windows`) doesn't peg every CPU core / all available RAM.
+# Bump this on machines with more cores if builds feel slow. The
+# CARGO_BUILD_JOBS environment variable overrides this per invocation.
+[build]
+jobs = 4

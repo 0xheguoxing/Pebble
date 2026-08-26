@@ -11,7 +11,6 @@ const ACTION_I18N_MAP: Record<string, string> = {
   "prev-message": "shortcuts.prevMessage",
   "open-message": "shortcuts.openMessage",
   "toggle-star": "shortcuts.toggleStar",
-  "archive-message": "shortcuts.archiveMessage",
   "toggle-view-inbox": "shortcuts.toggleView",
   "toggle-view-kanban": "shortcuts.moveToKanban",
   "compose-new": "shortcuts.composeNew",
@@ -29,7 +28,7 @@ const ACTION_I18N_MAP: Record<string, string> = {
 const SHORTCUT_GROUPS = [
   { categoryKey: "shortcuts.general", actions: ["command-palette", "close-modal", "open-cloud-settings", "toggle-notifications"] },
   { categoryKey: "shortcuts.navigation", actions: ["next-message", "prev-message", "open-message", "open-search", "focus-search"] },
-  { categoryKey: "shortcuts.mailActions", actions: ["compose-new", "reply", "reply-all", "forward", "toggle-star", "archive-message", "toggle-view-inbox", "toggle-view-kanban"] },
+  { categoryKey: "shortcuts.mailActions", actions: ["compose-new", "reply", "reply-all", "forward", "toggle-star", "toggle-view-inbox", "toggle-view-kanban"] },
   { categoryKey: "shortcuts.translate", actions: ["translate-selection", "toggle-bilingual"] },
 ];
 

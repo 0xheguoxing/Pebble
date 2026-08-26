@@ -72,11 +72,13 @@ pub async fn update_message_flags(
                         load_imap_config(&store, &crypto, &msg.account_id).ok();
 
                     match (folder, imap_config) {
-                        (Some(f), Some(cfg)) => Ok(WritebackInfo::Imap {
-                            msg,
-                            folder_remote_id: f.remote_id.clone(),
-                            imap_config: cfg,
-                        }),
+                        (Some(f), Some(cfg)) if !f.remote_id.starts_with("__local_") => {
+                            Ok(WritebackInfo::Imap {
+                                msg,
+                                folder_remote_id: f.remote_id.clone(),
+                                imap_config: cfg,
+                            })
+                        }
                         _ => Ok(WritebackInfo::None),
                     }
                 }

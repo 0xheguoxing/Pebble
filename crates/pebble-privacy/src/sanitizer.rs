@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use ammonia::Builder;
 use pebble_core::{PrivacyMode, RenderedHtml, TrackerInfo};
@@ -18,6 +18,18 @@ impl PrivacyGuard {
         body_text: &str,
         mode: &PrivacyMode,
     ) -> RenderedHtml {
+        self.render_message_html_with_cid_images(raw_html, body_text, mode, &HashMap::new())
+    }
+
+    /// Renders a message while resolving inline `cid:` image references to
+    /// caller-provided URLs (keyed by normalized content id).
+    pub fn render_message_html_with_cid_images(
+        &self,
+        raw_html: &str,
+        body_text: &str,
+        mode: &PrivacyMode,
+        cid_images: &HashMap<String, String>,
+    ) -> RenderedHtml {
         let source_html = if raw_html.trim().is_empty() && !body_text.is_empty() {
             format!(
                 r#"<pre class="pebble-plain-text-email">{}</pre>"#,
@@ -27,12 +39,21 @@ impl PrivacyGuard {
             raw_html.to_string()
         };
 
-        let mut rendered = self.render_safe_html(&source_html, mode);
+        let mut rendered = self.render_safe_html_with_cid_images(&source_html, mode, cid_images);
         rendered.html = linkify_html_text_nodes(&rendered.html);
         rendered
     }
 
     pub fn render_safe_html(&self, raw_html: &str, mode: &PrivacyMode) -> RenderedHtml {
+        self.render_safe_html_with_cid_images(raw_html, mode, &HashMap::new())
+    }
+
+    pub fn render_safe_html_with_cid_images(
+        &self,
+        raw_html: &str,
+        mode: &PrivacyMode,
+        cid_images: &HashMap<String, String>,
+    ) -> RenderedHtml {
         let mut trackers_blocked: Vec<TrackerInfo> = Vec::new();
         let mut images_blocked: u32 = 0;
         let body_html = extract_renderable_fragment(raw_html, mode);
@@ -43,6 +64,7 @@ impl PrivacyGuard {
         let preprocessed = preprocess_images(
             &style_preprocessed,
             mode,
+            cid_images,
             &mut trackers_blocked,
             &mut images_blocked,
         );
@@ -62,6 +84,29 @@ impl PrivacyGuard {
 impl Default for PrivacyGuard {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Normalize a `cid:` image reference to its bare content id, matching the
+/// way content ids are stored on attachments (optionally wrapped in `<...>`).
+pub fn normalize_cid(src: &str) -> Option<String> {
+    let trimmed = src
+        .trim()
+        .trim_start_matches('<')
+        .trim_end_matches('>')
+        .trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let without_prefix = match trimmed.get(..4) {
+        Some(prefix) if prefix.eq_ignore_ascii_case("cid:") => &trimmed[4..],
+        _ => trimmed,
+    };
+    let cleaned = without_prefix.trim();
+    if cleaned.is_empty() {
+        None
+    } else {
+        Some(cleaned.to_string())
     }
 }
 
@@ -822,6 +867,7 @@ fn rewrite_style_tag_contents(html: &str, rewrite: fn(&str) -> String) -> String
 fn preprocess_images(
     html: &str,
     mode: &PrivacyMode,
+    cid_images: &HashMap<String, String>,
     trackers_blocked: &mut Vec<TrackerInfo>,
     images_blocked: &mut u32,
 ) -> String {
@@ -838,6 +884,19 @@ fn preprocess_images(
         lol_html::RewriteStrSettings {
             element_content_handlers: vec![lol_html::element!("img", |el| {
                 let src = el.get_attribute("src");
+
+                // Resolve inline content-id images first. These reference an
+                // attachment the app already downloaded, so they are replaced
+                // with a loadable URL before any tracker/privacy filtering.
+                if let Some(src_val) = src.as_deref() {
+                    if let Some(cid) = normalize_cid(src_val) {
+                        if let Some(resolved) = cid_images.get(&cid) {
+                            el.set_attribute("src", resolved)?;
+                            return Ok(());
+                        }
+                    }
+                }
+
                 let width = el.get_attribute("width");
                 let height = el.get_attribute("height");
 
@@ -1194,6 +1253,34 @@ fn next_char_index(text: &str, index: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn normalize_cid_strips_prefix_and_angle_brackets() {
+        assert_eq!(normalize_cid("cid:logo123"), Some("logo123".to_string()));
+        assert_eq!(normalize_cid("CID:logo123"), Some("logo123".to_string()));
+        assert_eq!(normalize_cid("<cid:logo123>"), Some("logo123".to_string()));
+        assert_eq!(normalize_cid("<logo123>"), Some("logo123".to_string()));
+        assert_eq!(normalize_cid("logo123"), Some("logo123".to_string()));
+        assert_eq!(normalize_cid("   "), None);
+        assert_eq!(normalize_cid(""), None);
+    }
+
+    #[test]
+    fn render_message_html_with_cid_images_resolves_inline_images() {
+        let guard = PrivacyGuard::new();
+        let html = r#"<p>Hi</p><img src="cid:logo123" alt="logo"><p>Bye</p>"#;
+        let mut cid_images = HashMap::new();
+        cid_images.insert(
+            "logo123".to_string(),
+            "http://asset.localhost/logo.png".to_string(),
+        );
+
+        let result =
+            guard.render_message_html_with_cid_images(html, "", &PrivacyMode::Strict, &cid_images);
+
+        assert!(result.html.contains("http://asset.localhost/logo.png"));
+        assert!(!result.html.contains("cid:logo123"));
+    }
 
     #[test]
     fn test_removes_script_tags() {
